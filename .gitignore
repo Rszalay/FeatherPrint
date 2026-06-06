@@ -75,3 +75,9 @@ conanbuildinfo.txt
 conaninfo.txt
 graph_info.json
 build/*
+
+## CuraFeather build artifacts and local files
+*_output.txt
+installer_output/
+*.code-workspace
+CuraEngine_*.md
