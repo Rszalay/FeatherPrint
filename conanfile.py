@@ -92,7 +92,7 @@ class CuraEngineConan(ConanFile):
         if self.options.enable_arcus or self.options.enable_plugins:
             self.options["protobuf"].shared = False
         if self.options.enable_arcus:
-            self.options["arcus"].shared = True
+            self.options["arcus"].shared = False  # Static to avoid conflict with Cura's Arcus.dll
         # Force all libraries to be static for Emscripten builds
         if self.settings.os == "Emscripten":
             self.options["*"].shared = False
