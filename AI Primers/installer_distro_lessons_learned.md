@@ -16,22 +16,24 @@ ImportError: DLL load failed while importing pyArcus: The specified procedure co
 ```
 Cura's frontend then fails to start entirely. These two files must be excluded from every deploy script and every installer `[Files]` section permanently.
 
-The workaround is to build Arcus as a static library, baking it into `CuraEngine.exe`. This eliminates any runtime dependency on `Arcus.dll` from the engine side. See `build_lessons_learned.md §3`.
+When engine and frontend are the same version (e.g. both 5.13), the Arcus ABI matches natively and static linking is not required. Keep the static Arcus option in `conanfile.py` as a precaution regardless.
 
 ---
 
-## 2. DLLs That Must Be Deployed (5.14 build)
+## 2. DLLs That Must Be Deployed (5.13 build)
 
 | File | Reason |
 |---|---|
-| `CuraEngine.exe` | The engine itself |
-| `cura-formulae-engine.dll` | 5.14 requires v1.1.0; Cura 5.13 ships an incompatible older version |
+| `CuraEngine.exe` | The engine itself (~4.7 MB on 5.13, ~10 MB on 5.14 with static Arcus) |
+| `cura-formulae-engine.dll` | Deploy if present in build output; skip if not built |
 | `tbb12.dll` | Intel TBB threading library |
 | `tbbbind_2_5.dll` | TBB CPU binding |
 | `tbbmalloc.dll` | TBB memory allocator |
 | `tbbmalloc_proxy.dll` | TBB malloc proxy |
 
-`Arcus.dll` and `polyclipping.dll` are explicitly excluded.
+`Arcus.dll` and `polyclipping.dll` are explicitly excluded permanently.
+
+Binary size is a useful sanity check: 5.13 without static Arcus is ~4.7 MB; 5.14 with static Arcus was ~10.1 MB. A size regression after a conan change may mean static linking was accidentally dropped or gained.
 
 ---
 
@@ -50,6 +52,8 @@ This file is large (~10,000 lines). The safe workflow:
 
 Cura reads this file at startup. Changes take effect on next Cura launch (no hot-reload).
 
+On a 5.13 engine base, do NOT include the extra settings that were patched for 5.14 compatibility (`top_bottom_skin_merge_distance`, `minimum_infill_line_length`, `material_density`, `material_spool_cost`, `material_spool_weight`). These are harmless if present but add unnecessary noise.
+
 ---
 
 ## 4. All Writes to Program Files Require UAC Elevation
@@ -66,17 +70,18 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 ```
 
-The `-Restore` switch pattern (passing parameters through elevation) is necessary if the script accepts arguments.
+**Critical:** `$PSCommandPath` is only set when the script is invoked with a path. If the script is run from the wrong directory or without a path, `$PSCommandPath` is empty and the elevated window opens and immediately closes with no error visible to the user. Always invoke from the repo root:
+
+```powershell
+cd C:\Users\ricsz\source\repos\CuraFeather
+.\scripts\deploy-test.ps1
+```
 
 ---
 
 ## 5. Check for Running Cura Before Deploying
 
-Cura holds file locks on `CuraEngine.exe` and the DLLs while it is running. Attempting to overwrite them produces:
-
-```
-The process cannot access the file because it is being used by another process.
-```
+Cura holds file locks on `CuraEngine.exe` and the DLLs while it is running. Attempting to overwrite them produces silent failures — the copy may succeed for some files but fail for locked ones, leaving a mixed state (old engine, new DLLs or vice versa). The user sees no error unless the script explicitly checks.
 
 Add a guard at the top of deploy scripts:
 
@@ -103,7 +108,19 @@ A `-Restore` switch re-copies all `.bak` files back. Keep the restore path in th
 
 ---
 
-## 7. Inno Setup 6 — Specific Pitfalls Found
+## 7. deploy-test.ps1 Version Drift
+
+The script was cherry-picked from the main branch onto `curafeather-5.13`, but the cherry-picked version was an older draft that:
+- Still included `Arcus.dll` and `polyclipping.dll` in the deploy list (breaking pyArcus)
+- Had no self-elevation
+- Had no fdmprinter.def.json deployment
+- Used a smart-quote em-dash in a comment that caused `AmpersandNotAllowed` parse errors in PowerShell 5.1
+
+**Rule:** After any branch switch or cherry-pick, verify `deploy-test.ps1` matches the known-good version before running it. The authoritative version is documented in this repo's `scripts/` directory on the `curafeather-5.13` branch after the fix commit.
+
+---
+
+## 8. Inno Setup 6 — Specific Pitfalls Found
 
 Working on `packaging/CuraFeather.iss`:
 
@@ -117,7 +134,7 @@ Working on `packaging/CuraFeather.iss`:
 
 ---
 
-## 8. Batch File Gotchas for Automated Builds
+## 9. Batch File Gotchas for Automated Builds
 
 When driving `VsDevCmd.bat` + Conan + CMake from a `.bat` file:
 
@@ -127,7 +144,7 @@ When driving `VsDevCmd.bat` + Conan + CMake from a `.bat` file:
 
 ---
 
-## 9. Current deploy-test.ps1 Capabilities
+## 10. Current deploy-test.ps1 Capabilities
 
 Location: `scripts/deploy-test.ps1`
 
@@ -137,20 +154,28 @@ Location: `scripts/deploy-test.ps1`
 - Deploys: `CuraEngine.exe`, `cura-formulae-engine.dll`, `tbb12.dll`, `tbbbind_2_5.dll`, `tbbmalloc.dll`, `tbbmalloc_proxy.dll`, `fdmprinter.def.json`
 - `-Restore` switch restores all `.bak` files
 - Excludes `Arcus.dll` and `polyclipping.dll` (with inline comment explaining why)
-
-A separate `scripts/restore-dlls.ps1` exists as a standalone restore tool for the DLL subset only.
+- Must be run from the repo root for `$PSCommandPath` to resolve correctly
 
 ---
 
-## 10. Inno Setup Installer Status
+## 11. Engine Version Confirmation
+
+After deploying, verify the correct binary is in place before testing:
+
+```powershell
+Get-Item "C:\Program Files\UltiMaker Cura 5.13.0\CuraEngine.exe" | Select-Object Length, LastWriteTime
+```
+
+Expected for a 5.13 build: ~4.7 MB. If the file is ~10 MB, the old 5.14 static-Arcus build is still deployed.
+
+The Cura log also prints the engine version banner on every launch:
+```
+Cura_SteamEngine version 5.13.0
+```
+If this shows 5.14.0-alpha.0, the wrong binary is deployed.
+
+---
+
+## 12. Inno Setup Installer Status
 
 `packaging/CuraFeather.iss` exists and compiles. It stages files to `{tmp}\CuraFeatherStaged`, backs up originals, and copies in the new files. `Arcus.dll` and `polyclipping.dll` are excluded with an explanatory comment. The installer has not been fully end-to-end tested — it was set aside once the deploy script proved sufficient for development iteration.
-
----
-
-## 11. Recommended Workflow for Next Session
-
-1. Rebuild against CuraEngine 5.13 base
-2. Re-run `deploy-test.ps1` — the DLL list may change (some TBB DLLs may no longer be needed, or Arcus may not need static linking)
-3. Re-verify `fdmprinter.def.json` — the new settings we added (`top_bottom_skin_merge_distance`, `minimum_infill_line_length`, `material_density`) will be unnecessary on a 5.13 base and should be removed to keep the file clean
-4. Complete the Inno Setup installer end-to-end test once the engine works correctly

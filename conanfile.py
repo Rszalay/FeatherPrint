@@ -38,7 +38,7 @@ class CuraEngineConan(ConanFile):
         "enable_arcus": True,
         "enable_benchmarks": False,
         "enable_extensive_warnings": False,
-        "enable_plugins": True,
+        "enable_plugins": False,  # Disabled: protobuf version conflict between grpc_definitions and grpc
         "enable_remote_plugins": False,
         "with_cura_resources": False,
     }
