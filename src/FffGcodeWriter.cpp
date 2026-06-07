@@ -1951,7 +1951,8 @@ bool FffGcodeWriter::processMultiLayerInfill(
         return false;
     }
     const coord_t infill_line_distance = mesh.settings.get<coord_t>("infill_line_distance");
-    if (infill_line_distance <= 0)
+    const bool fuselage_active_multi = mesh.settings.get<bool>("fuselage_enable");
+    if (infill_line_distance <= 0 && !fuselage_active_multi)
     {
         return false;
     }
@@ -2138,7 +2139,9 @@ bool FffGcodeWriter::processSingleLayerInfill(
         return false;
     }
     const auto infill_line_distance = mesh.settings.get<coord_t>("infill_line_distance");
-    if (infill_line_distance == 0 || part.infill_area_per_combine_per_density[0].empty())
+    const bool fuselage_active = mesh.settings.get<bool>("fuselage_enable");
+    // Allow 0% infill density through when fuselage stringer is active (it doesn't use line_distance).
+    if (part.infill_area_per_combine_per_density[0].empty() || (!fuselage_active && infill_line_distance == 0))
     {
         return false;
     }

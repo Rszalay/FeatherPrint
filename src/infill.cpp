@@ -16,6 +16,7 @@
 #include "geometry/OpenPolyline.h"
 #include "geometry/Point2D.h"
 #include "geometry/PointMatrix.h"
+#include "infill/FuselageStringerInfill.h"
 #include "infill/GyroidInfill.h"
 #include "infill/ImageBasedDensityProvider.h"
 #include "infill/LightningGenerator.h"
@@ -262,6 +263,18 @@ void Infill::_generate(
 {
     if (inner_contour_.empty())
         return;
+
+    // Fuselage geodesic stringer intercept.
+    // Must be before the line_distance_ == 0 guard so 0% infill density still works.
+    // Pattern guard: only fires for regular infill passes, not skin/roofing/flooring.
+    if (settings.get<bool>("fuselage_enable")
+        && pattern_ == settings.get<EFillMethod>("infill_pattern"))
+    {
+        FuselageStringerInfill fuselage(inner_contour_, z_, settings);
+        fuselage.generate(result_lines);
+        return;
+    }
+
     if (line_distance_ == 0)
         return;
 

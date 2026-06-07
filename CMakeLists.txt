@@ -127,6 +127,7 @@ set(engine_SRCS # Except main.cpp.
         src/infill/SierpinskiFill.cpp
         src/infill/SierpinskiFillProvider.cpp
         src/infill/SubDivCube.cpp
+        src/infill/FuselageStringerInfill.cpp
         src/infill/GyroidInfill.cpp
 
         src/pathPlanning/Comb.cpp
