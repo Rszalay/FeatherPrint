@@ -449,7 +449,8 @@ void InfillOrderOptimizer::addInfillLinesToLayer(
     }
     else
     {
-        space_fill_type = (infill_pattern == EFillMethod::ZIG_ZAG) ? SpaceFillType::PolyLines : SpaceFillType::Lines;
+        space_fill_type = (infill_pattern == EFillMethod::ZIG_ZAG || settings.get<bool>("fuselage_enable"))
+            ? SpaceFillType::PolyLines : SpaceFillType::Lines;
         wipe_dist = 0;
     }
 

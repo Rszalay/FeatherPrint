@@ -10008,6 +10008,24 @@
                     "enabled": "fuselage_enable",
                     "settable_per_mesh": true
                 },
+                "fuselage_strip_outer_wall":
+                {
+                    "label": "Strip Outer Wall",
+                    "description": "Remove the outer perimeter wall and shift stringer trough arcs outward to occupy its position. The stringer becomes the outer skin contact line.",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "fuselage_enable",
+                    "settable_per_mesh": true
+                },
+                "fuselage_strip_inner_wall":
+                {
+                    "label": "Strip Inner Wall",
+                    "description": "Remove the inner cavity wall and shift stringer peak arcs inward to occupy its position. The stringer becomes the inner cavity contact line.",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "fuselage_enable",
+                    "settable_per_mesh": true
+                },
                 "fuselage_phase_anchor_angle":
                 {
                     "label": "Phase Anchor Angle (°)",

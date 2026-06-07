@@ -38,6 +38,11 @@ WallsComputation::WallsComputation(const Settings& settings, const LayerIndex la
 void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_type)
 {
     size_t wall_count = settings_.get<size_t>("wall_line_count");
+    if (settings_.get<bool>("fuselage_enable"))
+    {
+        if (settings_.get<bool>("fuselage_strip_outer_wall") && wall_count > 0) --wall_count;
+        if (settings_.get<bool>("fuselage_strip_inner_wall") && wall_count > 0) --wall_count;
+    }
     if (wall_count == 0) // Early out if no walls are to be generated
     {
         part->print_outline = part->outline;
