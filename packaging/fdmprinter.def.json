@@ -10026,6 +10026,15 @@
                     "enabled": "fuselage_enable",
                     "settable_per_mesh": true
                 },
+                "fuselage_invert_stringer":
+                {
+                    "label": "Invert Stringer Contact",
+                    "description": "Swap which skin the stringer contacts. When enabled, trough arcs ride the inner cavity wall and peak arcs touch the outer skin — the mirror image of the default corrugation.",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "fuselage_enable",
+                    "settable_per_mesh": true
+                },
                 "fuselage_phase_anchor_angle":
                 {
                     "label": "Phase Anchor Angle (°)",

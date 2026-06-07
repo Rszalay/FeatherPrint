@@ -38,11 +38,6 @@ WallsComputation::WallsComputation(const Settings& settings, const LayerIndex la
 void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_type)
 {
     size_t wall_count = settings_.get<size_t>("wall_line_count");
-    if (settings_.get<bool>("fuselage_enable"))
-    {
-        if (settings_.get<bool>("fuselage_strip_outer_wall") && wall_count > 0) --wall_count;
-        if (settings_.get<bool>("fuselage_strip_inner_wall") && wall_count > 0) --wall_count;
-    }
     if (wall_count == 0) // Early out if no walls are to be generated
     {
         part->print_outline = part->outline;
@@ -109,7 +104,8 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
 
     // Remove the parts which did not generate a wall. As these parts are too small to print,
     //  and later code can now assume that there is always minimal 1 wall line.
-    bool check_wall_and_spiral = settings_.get<size_t>("wall_line_count") >= 1 && ! settings_.get<bool>("fill_outline_gaps");
+    bool check_wall_and_spiral = settings_.get<size_t>("wall_line_count") >= 1
+        && ! settings_.get<bool>("fill_outline_gaps");
     auto iterator_remove = std::remove_if(
         layer->parts.begin(),
         layer->parts.end(),

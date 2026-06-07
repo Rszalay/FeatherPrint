@@ -35,6 +35,7 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
     const bool   use_or_mode       = settings_.get<std::string>("fuselage_arc_mode") == "or";
     const bool   strip_outer_wall  = settings_.get<bool>("fuselage_strip_outer_wall");
     const bool   strip_inner_wall  = settings_.get<bool>("fuselage_strip_inner_wall");
+    const bool   invert_stringer   = settings_.get<bool>("fuselage_invert_stringer");
 
     // Phase for this layer.
     // CW family rotates +helix_pitch per mm of height.
@@ -80,12 +81,15 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
     // asymmetric lofted cross-sections, causing rays to miss the hole entirely.
     const Point2LL clip_target = inner_poly ? computeCentroid(*inner_poly) : centroid;
 
-    // trough_offset: trough arcs run this far inboard of the outer polygon, and peak arcs
-    // this far outboard of the inner polygon, to avoid double-extrusion over wall toolpaths.
-    // When a wall is stripped the offset is zeroed — the stringer runs at the polygon itself.
+    // Walls are always generated (so inner_area / skin / infill geometry is correct), but
+    // when a strip flag is set FffGcodeWriter clears wall_toolpaths before printing.
+    // inner_area is therefore still inset by wall_line_width_0 from the actual skin.
+    // The stringer must shift outward by wall_line_width_0 to sit on the wall centerline.
+    // nudge_pt: positive dist = toward centroid (inward); negative = outward.
     const coord_t nozzle_d   = static_cast<coord_t>(settings_.get<double>("machine_nozzle_size") * 1000.0);
-    const coord_t trough_off = strip_outer_wall ? 0 : nozzle_d;
-    const coord_t peak_off   = strip_inner_wall ? 0 : nozzle_d;
+    const coord_t wall_lw    = settings_.get<coord_t>("wall_line_width_0");
+    const coord_t trough_off = strip_outer_wall ? -(wall_lw - nozzle_d) : nozzle_d;
+    const coord_t peak_off   = strip_inner_wall  ? -(wall_lw - nozzle_d) : nozzle_d;
 
     // Nudge a point toward a reference point by dist microns.
     auto nudge_pt = [](const Point2LL& pt, const Point2LL& toward, coord_t dist) -> Point2LL
@@ -144,31 +148,62 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
         OpenPolyline path;
         path.reserve(spoke_count * 8);
 
-        path.push_back(nudge_pt(outer_pts[0].pt, centroid, trough_off));
-
-        for (int k = 0; k + 1 < spoke_count; k += 2)
+        if (!invert_stringer)
         {
-            path.push_back(inner_pts[k].pt);
+            path.push_back(nudge_pt(outer_pts[0].pt, centroid, trough_off));
 
-            if (inner_poly)
-                appendArc(path, *inner_poly, inner_pts[k], inner_pts[k + 1],
-                          centroid, -peak_off);
-            else
-                path.push_back(inner_pts[k + 1].pt);
+            for (int k = 0; k + 1 < spoke_count; k += 2)
+            {
+                path.push_back(inner_pts[k].pt);
 
-            path.push_back(nudge_pt(outer_pts[k + 1].pt, centroid, trough_off));
+                if (inner_poly)
+                    appendArc(path, *inner_poly, inner_pts[k], inner_pts[k + 1],
+                              centroid, -peak_off);
+                else
+                    path.push_back(inner_pts[k + 1].pt);
 
-            if (k + 2 < spoke_count)
-                appendArc(path, *outer_poly, outer_pts[k + 1], outer_pts[k + 2],
+                path.push_back(nudge_pt(outer_pts[k + 1].pt, centroid, trough_off));
+
+                if (k + 2 < spoke_count)
+                    appendArc(path, *outer_poly, outer_pts[k + 1], outer_pts[k + 2],
+                              centroid, trough_off);
+            }
+
+            if (spoke_count % 2 == 1)
+                path.push_back(inner_pts[spoke_count - 1].pt);
+
+            if (spoke_count >= 2 && spoke_count % 2 == 0)
+                appendArc(path, *outer_poly, outer_pts[spoke_count - 1], outer_pts[0],
                           centroid, trough_off);
         }
+        else
+        {
+            // Inverted: trough arcs on inner polygon, peak walls touch outer polygon.
+            if (!inner_poly) return;
 
-        if (spoke_count % 2 == 1)
-            path.push_back(inner_pts[spoke_count - 1].pt);
+            path.push_back(inner_pts[0].pt);
 
-        if (spoke_count >= 2 && spoke_count % 2 == 0)
-            appendArc(path, *outer_poly, outer_pts[spoke_count - 1], outer_pts[0],
-                      centroid, trough_off);
+            for (int k = 0; k + 1 < spoke_count; k += 2)
+            {
+                path.push_back(nudge_pt(outer_pts[k].pt, centroid, trough_off));
+
+                appendArc(path, *outer_poly, outer_pts[k], outer_pts[k + 1],
+                          centroid, trough_off);
+
+                path.push_back(inner_pts[k + 1].pt);
+
+                if (k + 2 < spoke_count)
+                    appendArc(path, *inner_poly, inner_pts[k + 1], inner_pts[k + 2],
+                              centroid, -peak_off);
+            }
+
+            if (spoke_count % 2 == 1)
+                path.push_back(nudge_pt(outer_pts[spoke_count - 1].pt, centroid, trough_off));
+
+            if (spoke_count >= 2 && spoke_count % 2 == 0)
+                appendArc(path, *inner_poly, inner_pts[spoke_count - 1], inner_pts[0],
+                          centroid, -peak_off);
+        }
 
         if (path.size() >= 2)
             result_lines.push_back(std::move(path));
@@ -299,6 +334,8 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
                                              : (h1_truth ^ h2_truth);
             }
         }
+        if (invert_stringer)
+            for (size_t i = 0; i < zone_trough.size(); ++i) zone_trough[i] = !zone_trough[i];
 
         // Build the corrugated path zone by zone.
         // Invariant: the path ends each zone at merged[k+1]'s trough or peak level,

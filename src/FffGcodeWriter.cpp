@@ -1873,6 +1873,84 @@ void FffGcodeWriter::addMeshPartToGCode(
     const bool end_infill_close_to_seam
         = infill_before_walls && mesh.settings.get<InfillStartEndPreference>("infill_start_end_preference") == InfillStartEndPreference::END_CLOSE_TO_SEAM;
 
+    // Fuselage strip-wall: clear wall toolpaths so the stringer occupies the wall position.
+    // Walls are generated normally so inner_area / skin / infill areas are computed correctly;
+    // only the print step is suppressed here.
+    if (mesh.settings.get<bool>("fuselage_enable"))
+    {
+        const bool strip_outer = mesh.settings.get<bool>("fuselage_strip_outer_wall");
+        const bool strip_inner = mesh.settings.get<bool>("fuselage_strip_inner_wall");
+        if (strip_outer && strip_inner)
+        {
+            part.wall_toolpaths.clear();
+        }
+        else if (strip_outer || strip_inner)
+        {
+            // Compute centroid from the outer polygon of this part.
+            double cx = 0.0, cy = 0.0;
+            if (!part.outline.empty() && !part.outline[0].empty())
+            {
+                for (const Point2LL& p : part.outline[0])
+                {
+                    cx += p.X;
+                    cy += p.Y;
+                }
+                cx /= static_cast<double>(part.outline[0].size());
+                cy /= static_cast<double>(part.outline[0].size());
+            }
+
+            // Average squared distance of an ExtrusionLine's junctions from the centroid.
+            // Outer perimeter wall has larger avg distance than inner cavity wall.
+            auto avg_sq_dist = [&](const ExtrusionLine& line) -> double
+            {
+                if (line.junctions_.empty()) return 0.0;
+                double sum = 0.0;
+                for (const auto& j : line.junctions_)
+                {
+                    const double dx = static_cast<double>(j.p_.X) - cx;
+                    const double dy = static_cast<double>(j.p_.Y) - cy;
+                    sum += dx * dx + dy * dy;
+                }
+                return sum / static_cast<double>(line.junctions_.size());
+            };
+
+            for (VariableWidthLines& vwl : part.wall_toolpaths)
+            {
+                if (vwl.empty()) continue;
+
+                // Find max and min avg_sq_dist across all lines in this bin.
+                double max_d = 0.0, min_d = std::numeric_limits<double>::max();
+                for (const ExtrusionLine& line : vwl)
+                {
+                    const double d = avg_sq_dist(line);
+                    if (d > max_d) max_d = d;
+                    if (d < min_d) min_d = d;
+                }
+
+                // If all lines are at essentially the same radius (solid cross-section, no hole),
+                // skip inner filtering — there is no cavity wall to strip.
+                const double spread = (max_d > 0.0) ? (max_d - min_d) / max_d : 0.0;
+                if (strip_inner && spread < 0.05)
+                    continue;
+
+                const double threshold = (max_d + min_d) * 0.5;
+
+                vwl.erase(
+                    std::remove_if(vwl.begin(), vwl.end(),
+                        [&](const ExtrusionLine& line)
+                        {
+                            const bool is_outer = avg_sq_dist(line) >= threshold;
+                            return (strip_outer && is_outer) || (strip_inner && !is_outer);
+                        }),
+                    vwl.end());
+            }
+            part.wall_toolpaths.erase(
+                std::remove_if(part.wall_toolpaths.begin(), part.wall_toolpaths.end(),
+                    [](const VariableWidthLines& vwl) { return vwl.empty(); }),
+                part.wall_toolpaths.end());
+        }
+    }
+
     // Pre-process the insets without actually adding them, so that we know where they are going to start printing
     InsetsPreprocessResult insets_preprocess_result = preProcessInsets(storage, gcode_layer, mesh, extruder_nr, mesh_config, part, end_infill_close_to_seam);
     bool infill_added = false;
