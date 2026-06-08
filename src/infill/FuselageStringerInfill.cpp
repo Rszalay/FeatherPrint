@@ -36,6 +36,7 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
     const bool   strip_outer_wall  = settings_.get<bool>("fuselage_strip_outer_wall");
     const bool   strip_inner_wall  = settings_.get<bool>("fuselage_strip_inner_wall");
     const bool   invert_stringer   = settings_.get<bool>("fuselage_invert_stringer");
+    const double seam_scarf_mm     = settings_.get<double>("fuselage_seam_scarf_mm");
 
     // Phase for this layer.
     // CW family rotates +helix_pitch per mm of height.
@@ -47,6 +48,10 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
     const double z_mm          = static_cast<double>(z_) / 1000.0;
     const double phase_cw_deg  = anchor_deg + z_mm * helix_pitch;
     const double phase_ccw_deg = (anchor_deg + 180.0 / spoke_count) - z_mm * helix_pitch;
+
+    // Layer number — used for seam scatter.
+    const coord_t layer_height_um = settings_.get<coord_t>("layer_height");
+    const int layer_nr = (layer_height_um > 0) ? static_cast<int>(z_ / layer_height_um) : 0;
 
     // Identify outer polygon (largest absolute area) and inner polygon (hole, if present).
     const Polygon* outer_poly = nullptr;
@@ -205,6 +210,22 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
                           centroid, -peak_off);
         }
 
+        // Scarf overlap: retrace the first seam_scarf_mm of the path to bond the seam.
+        if (path.size() >= 2 && seam_scarf_mm > 0.0)
+        {
+            const double scarf_um = seam_scarf_mm * 1000.0;
+            const size_t orig_sz = path.size();
+            double accumulated = 0.0;
+            for (size_t i = 1; i < orig_sz && accumulated < scarf_um; ++i)
+            {
+                const Point2LL pt = path[i];
+                const double dx = pt.X - static_cast<double>(path[i - 1].X);
+                const double dy = pt.Y - static_cast<double>(path[i - 1].Y);
+                accumulated += std::sqrt(dx * dx + dy * dy);
+                path.push_back(pt);
+            }
+        }
+
         if (path.size() >= 2)
             result_lines.push_back(std::move(path));
     };
@@ -337,6 +358,21 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
         if (invert_stringer)
             for (size_t i = 0; i < zone_trough.size(); ++i) zone_trough[i] = !zone_trough[i];
 
+        // Seam scatter: rotate the starting zone by a layer-dependent step so the
+        // open-polyline seam cycles through all spoke positions instead of drifting
+        // slowly with the helix phase.  Both arrays rotate together so zone_trough[k]
+        // still correctly describes the arc between the new merged[k] and merged[k+1].
+        // Step of 2 per layer advances by one H1 spoke; completes a full cycle in
+        // spoke_count layers (which is also one full CCW circuit of seam positions).
+        {
+            const int scatter = (layer_nr * 2) % mn;
+            if (scatter > 0)
+            {
+                std::rotate(merged.begin(),     merged.begin()     + scatter, merged.end());
+                std::rotate(zone_trough.begin(), zone_trough.begin() + scatter, zone_trough.end());
+            }
+        }
+
         // Build the corrugated path zone by zone.
         // Invariant: the path ends each zone at merged[k+1]'s trough or peak level,
         // matching zone_trough[k].  Walls are only emitted when the level changes.
@@ -367,6 +403,22 @@ void FuselageStringerInfill::generate(OpenLinesSet& result_lines)
                           centroid, -peak_off);
             else
                 path.push_back(merged[nxt].inner.pt);
+        }
+
+        // Scarf overlap: retrace the first seam_scarf_mm of the path to bond the seam.
+        if (path.size() >= 2 && seam_scarf_mm > 0.0)
+        {
+            const double scarf_um = seam_scarf_mm * 1000.0;
+            const size_t orig_sz = path.size();
+            double accumulated = 0.0;
+            for (size_t i = 1; i < orig_sz && accumulated < scarf_um; ++i)
+            {
+                const Point2LL pt = path[i];
+                const double dx = pt.X - static_cast<double>(path[i - 1].X);
+                const double dy = pt.Y - static_cast<double>(path[i - 1].Y);
+                accumulated += std::sqrt(dx * dx + dy * dy);
+                path.push_back(pt);
+            }
         }
 
         if (path.size() >= 2)

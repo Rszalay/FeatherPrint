@@ -10026,6 +10026,18 @@
                     "enabled": "fuselage_enable",
                     "settable_per_mesh": true
                 },
+                "fuselage_seam_scarf_mm":
+                {
+                    "label": "Seam Scarf Distance (mm)",
+                    "description": "Retrace this many millimeters at the end of the stringer path to overlap the start. Bonds the open-polyline seam and prevents a growing tear at the start/end junction.",
+                    "type": "float",
+                    "default_value": 0.2,
+                    "minimum_value": 0,
+                    "maximum_value": 5,
+                    "unit": "mm",
+                    "enabled": "fuselage_enable",
+                    "settable_per_mesh": true
+                },
                 "fuselage_invert_stringer":
                 {
                     "label": "Invert Stringer Contact",
