@@ -1,84 +1,78 @@
+# FeatherPrint
 
-<br>
+FeatherPrint is a modification of UltiMaker Cura that generates conformal geodetic skin structures for ultralight aerodynamic 3D prints — drones, model aircraft, wind turbines, and similar structures.
 
-<div align = center>
+Instead of conventional infill, FeatherPrint produces a single-wall skin reinforced by a helical geodetic net of structural stringers, inspired by Barnes Wallis's Wellington bomber airframe. The result is a hollow, lightweight shell with excellent torsional stiffness.
 
-[![Badge Issues]][Issues]   
-[![Badge PullRequests]][PullRequests]   
-[![Badge Closed]][Closed]
+![FeatherPrint preview](AI%20Primers/preview.webp)
 
-[![Badge Size]][#]   
-[![Badge License]][License]   
-[![Badge Contributors]][Contributors]
+---
 
-[![Badge Test]][Test]   
-[![Badge Conan]][Conan]   
+## Requirements
 
-<br>
-<br>
+- Windows 10 or later
+- [UltiMaker Cura 5.13.x](https://ultimaker.com/software/ultimaker-cura) installed
 
-<img
-    src = 'CuraEngine.ico'
-    width = 200
-/>
+---
 
-# CuraEngine
+## Installation
 
+1. Download **FeatherPrint-0.1.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
+2. Run the installer as Administrator
+3. The installer will detect your Cura 5.13.x installation, back up the original engine files, and deploy FeatherPrint
 
-*C++ console application for 3D printing GCode generation.*
+To uninstall, run **Uninstall FeatherPrint** from Windows Add/Remove Programs. All original Cura files are restored from backup automatically.
 
-<br>
-<br>
+---
 
-[![Button Install]][Install]   
-[![Button Internals]][Internals]
+## Usage
 
-<br>
-<br>
+1. Open Cura and set up your printer as normal
+2. Load your model — FeatherPrint works best with manifold (watertight) STL files
+3. Under **Infill**, set **Infill Pattern** to **FeatherPrint**
+4. Wall Line Count, Top Layers, and Bottom Layers will adjust automatically
+5. Slice and preview — the geodetic stringer pattern should be visible in the layer view
 
+### Recommended settings
 
-Designed as a better and faster alternative to the old <br>
-**Skeinforge Engine** and is an integral part of **[Cura]**.
+| Setting | Value |
+|---|---|
+| Wall Line Count | 1 (auto) |
+| Top Layers | 0 (auto) |
+| Bottom Layers | 0 (auto) |
+| Z Seam Alignment | Sharpest Corner (auto) |
+| Layer Height | 0.2 mm |
+| Material | LW-PLA (lightest) or PETG (toughest) |
 
-You can use CuraEngine separately, in other <br>
-applications and integrate it into your own app.
+---
 
-<br>
+## Status
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/Ultimaker/CuraEngine/badge)](https://api.securityscorecards.dev/projects/github.com/Ultimaker/CuraEngine)
+FeatherPrint is an early work-in-progress. The following features are currently functional:
 
-<br>
+- **Skin** — single-wall perimeter extrusion
+- **Stringer** — counter-rotating helical geodetic tubes
+- **Lacing** — S-link collision feature where CCW and CW stringers meet
 
-<!----------------------------------------------------------------------------->
+The following features are planned but not yet implemented:
 
-[Contributors]: https://github.com/Ultimaker/CuraEngine/graphs/contributors
-[PullRequests]: https://github.com/Ultimaker/CuraEngine/pulls
-[Internals]: https://github.com/Ultimaker/CuraEngine/wiki/Internals
-[Install]: https://github.com/Ultimaker/CuraEngine/wiki/Building-CuraEngine-From-Source
-[Closed]: https://github.com/Ultimaker/CuraEngine/issues?q=is%3Aissue+is%3Aclosed
-[Issues]: https://github.com/Ultimaker/CuraEngine/issues
-[Conan]: https://github.com/Ultimaker/CuraEngine/actions/workflows/conan-package.yml
-[Test]: https://github.com/Ultimaker/CuraEngine/actions/workflows/unit-test.yml
-[Cura]: https://github.com/Ultimaker/Cura
+- Former (transverse bracing bands at stringer crossings)
+- Whip (termination at open mesh boundary edges)
+- Gusset, Splay, Cuff (collision features)
 
-[License]: LICENSE
-[#]: #
+---
 
+## For Developers
 
-<!---------------------------------[ Badges ]---------------------------------->
+The full technical specification is in the [`FeatherPrint Spec/`](FeatherPrint%20Spec/) folder:
 
-[Badge Contributors]: https://img.shields.io/github/contributors/ultimaker/CuraEngine?style=for-the-badge&logoColor=white&labelColor=db5e8a&color=ab4a6c&logo=GitHub
-[Badge PullRequests]: https://img.shields.io/github/issues-pr/ultimaker/CuraEngine?style=for-the-badge&logoColor=white&labelColor=bb9f3e&color=937d31&logo=GitExtensions
-[Badge License]: https://img.shields.io/badge/License-AGPL3-336887.svg?style=for-the-badge&labelColor=458cb5&logoColor=white&logo=GNU
-[Badge Closed]: https://img.shields.io/github/issues-closed/ultimaker/CuraEngine?style=for-the-badge&logoColor=white&labelColor=629944&color=446a30&logo=AddThis
-[Badge Issues]: https://img.shields.io/github/issues/ultimaker/CuraEngine?style=for-the-badge&logoColor=white&labelColor=c34360&color=933349&logo=AdBlock
-[Badge Conan]: https://img.shields.io/github/workflow/status/Ultimaker/CuraEngine/conan-package?style=for-the-badge&logoColor=white&labelColor=6185aa&color=4c6987&logo=Conan&label=Conan%20Package
-[Badge Test]: https://img.shields.io/github/workflow/status/Ultimaker/CuraEngine/unit-test?style=for-the-badge&logoColor=white&labelColor=4a999d&color=346c6e&logo=Codacy&label=Unit%20Test
-[Badge Size]: https://img.shields.io/github/repo-size/ultimaker/CuraEngine?style=for-the-badge&logoColor=white&labelColor=715a97&color=584674&logo=GoogleAnalytics
+- [`FeatherPrint_Spec_Jun28_2026.md`](FeatherPrint%20Spec/FeatherPrint_Spec_Jun28_2026.md) — main feature and geometry specification
+- [`FeatherPrint_ConformalPlacement_Spec.md`](FeatherPrint%20Spec/FeatherPrint_ConformalPlacement_Spec.md) — Conformal Placement Transform detail
 
+The active development branch is [`featherprint-5.13`](https://github.com/Rszalay/FeatherPrint/tree/featherprint-5.13).
 
-<!---------------------------------[ Buttons ]--------------------------------->
+---
 
-[Button Internals]: https://img.shields.io/badge/Internals-00979D?style=for-the-badge&logoColor=white&logo=CodeReview
-[Button Install]: https://img.shields.io/badge/Installation-e23345?style=for-the-badge&logoColor=white&logo=DocuSign
+## License
 
+CuraEngine is released under the [AGPLv3](LICENSE). FeatherPrint modifications are released under the same license.
