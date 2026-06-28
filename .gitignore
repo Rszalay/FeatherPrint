@@ -81,3 +81,5 @@ build/*
 installer_output/
 *.code-workspace
 CuraEngine_*.md
+BUILD_LOG
+installer_output/
