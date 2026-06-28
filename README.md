@@ -4,7 +4,6 @@ FeatherPrint is a modification of UltiMaker Cura that generates conformal geodet
 
 Instead of conventional infill, FeatherPrint produces a single-wall skin reinforced by a helical geodetic net of structural stringers, inspired by Barnes Wallis's Wellington bomber airframe. The result is a hollow, lightweight shell with excellent torsional stiffness.
 
-
 ---
 
 ## Requirements
