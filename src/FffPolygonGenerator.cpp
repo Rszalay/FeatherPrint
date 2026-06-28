@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <fstream> // ifstream.good()
 #include <map> // multimap (ordered map allowing duplicate keys)
+#include <numbers>
 #include <numeric>
 
 #include <spdlog/spdlog.h>
@@ -34,6 +36,7 @@
 #include "TopSurface.h"
 #include "TreeSupport.h"
 #include "WallsComputation.h"
+#include "settings/EnumSettings.h"
 #include "infill/DensityProvider.h"
 #include "infill/ImageBasedDensityProvider.h"
 #include "infill/LightningGenerator.h"
@@ -502,6 +505,52 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
         }
     } guarded_progress = { inset_skin_progress_estimate };
 
+    // FeatherPrint pre-pass: accumulate helix phase sequentially so each layer has
+    // the exact integral of dz/arc_total rather than the instantaneous approximation.
+    // Must run before the parallel wall loop; only populated when the pattern is active.
+    if (mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT)
+    {
+        const double alpha_rad = mesh.settings.get<double>("featherprint_helix_angle") * std::numbers::pi / 180.0;
+        const double tan_alpha = std::tan(alpha_rad);
+        mesh.fp_helix_phase.resize(mesh_layer_count, 0.0);
+        double phase = 0.0;
+        for (size_t layer_nr = 0; layer_nr < mesh_layer_count; layer_nr++)
+        {
+            mesh.fp_helix_phase[layer_nr] = std::fmod(phase, 1.0);
+            const SliceLayer& layer = mesh.layers[layer_nr];
+            if (layer.parts.empty()) continue;
+            // Use the largest part's outline as the perimeter reference
+            double best_area = 0.0;
+            double arc_total_mm = 0.0;
+            for (const SliceLayerPart& part : layer.parts)
+            {
+                for (const Polygon& poly : part.outline)
+                {
+                    double a = std::abs(poly.area());
+                    if (a > best_area)
+                    {
+                        best_area = a;
+                        double len = 0.0;
+                        for (size_t i = 0; i < poly.size(); i++)
+                        {
+                            const Point2LL& p0 = poly[i];
+                            const Point2LL& p1 = poly[(i + 1) % poly.size()];
+                            double dx = p1.X - p0.X, dy = p1.Y - p0.Y;
+                            len += std::sqrt(dx * dx + dy * dy);
+                        }
+                        arc_total_mm = len / 1000.0;
+                    }
+                }
+            }
+            if (arc_total_mm > 1e-6)
+            {
+                const double layer_height_mm = static_cast<double>(layer.printZ) / 1000.0
+                    - (layer_nr > 0 ? static_cast<double>(mesh.layers[layer_nr - 1].printZ) / 1000.0 : 0.0);
+                phase += layer_height_mm / (arc_total_mm * tan_alpha);
+            }
+        }
+    }
+
     // walls
     cura::parallel_for<size_t>(
         0,
@@ -740,7 +789,8 @@ void FffPolygonGenerator::processDerivedWallsSkinInfill(SliceMeshStorage& mesh)
 void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
 {
     SliceLayer* layer = &mesh.layers[layer_nr];
-    WallsComputation walls_computation(mesh.settings, layer_nr);
+    const double fp_phase = (layer_nr < mesh.fp_helix_phase.size()) ? mesh.fp_helix_phase[layer_nr] : 0.0;
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

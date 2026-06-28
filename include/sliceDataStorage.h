@@ -309,6 +309,12 @@ public:
 
     LayerIndex layer_nr_max_filled_layer; //!< the layer number of the uppermost layer with content (modified while infill meshes are processed)
 
+    // FeatherPrint: cumulative helix phase per layer (running integral of dz/arc_total).
+    // Pre-computed sequentially before the parallel wall generation pass so that
+    // each layer's generator can use the exact accumulated phase rather than the
+    // instantaneous approximation, giving constant intersection angle on tapered tubes.
+    std::vector<double> fp_helix_phase;
+
     std::vector<AngleDegrees> infill_angles; //!< a list of angle values which is cycled through to determine the infill angle of each layer
     std::vector<AngleDegrees> roofing_angles; //!< a list of angle values which is cycled through to determine the roofing angle of each layer
     std::vector<AngleDegrees> flooring_angles; //!< a list of angle values which is cycled through to determine the flooring angle of each layer

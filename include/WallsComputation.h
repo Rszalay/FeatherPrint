@@ -28,7 +28,7 @@ public:
      * \param settings The per-mesh settings object to get setting values from.
      * \param layer_nr The layer index that these walls are generated for.
      */
-    WallsComputation(const Settings& settings, const LayerIndex layer_nr);
+    WallsComputation(const Settings& settings, const LayerIndex layer_nr, double fp_helix_phase = 0.0);
 
     /*!
      * \brief Generates the walls / inner area for all parts in a layer.
@@ -51,13 +51,14 @@ private:
      * \brief The layer that these walls are generated for.
      */
     const LayerIndex layer_nr_;
+    const double fp_helix_phase_;
 
     /*!
      * Generates the walls / inner area for a single layer part.
      *
      * \param part The part for which to generate the insets.
      */
-    void generateWalls(SliceLayerPart* part, SectionType section);
+    void generateWalls(SliceLayerPart* part, SectionType section, coord_t print_z = 0);
 
     /*!
      * Generates the outer inset / perimeter used in spiralize mode for a single layer part. The spiral inset is

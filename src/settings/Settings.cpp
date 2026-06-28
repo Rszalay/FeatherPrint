@@ -446,6 +446,8 @@ EFillMethod Settings::get<EFillMethod>(const std::string& key) const
         return EFillMethod::OCTAGON;
     case "plugin"_sw:
         return EFillMethod::PLUGIN;
+    case "featherprint"_sw:
+        return EFillMethod::FEATHERPRINT;
     default:
         return EFillMethod::NONE;
     }

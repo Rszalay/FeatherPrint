@@ -2244,7 +2244,8 @@
                         "octagon": "Octagon",
                         "grid": "Grid",
                         "cubic": "Cubic",
-                        "triangles": "Triangles"
+                        "triangles": "Triangles",
+                        "featherprint": "FeatherPrint"
                     },
                     "default_value": "grid",
                     "enabled": "infill_line_distance > 0",
@@ -2306,6 +2307,44 @@
                     "enabled": "infill_pattern != 'lightning' and (infill_pattern == 'grid' or infill_pattern == 'lines' or infill_pattern == 'triangles' or infill_pattern == 'cubic' or infill_pattern == 'tetrahedral' or infill_pattern == 'quarter_cubic' or infill_pattern == 'zigzag')",
                     "limit_to_extruder": "infill_extruder_nr",
                     "settable_per_mesh": true
+                },
+                "featherprint_line_width":
+                {
+                    "label": "FeatherPrint Line Width",
+                    "description": "Extrusion line width used for the FeatherPrint stringer and skin paths. Should match the nozzle diameter.",
+                    "type": "float",
+                    "unit": "mm",
+                    "default_value": 0.4,
+                    "minimum_value": "0.1",
+                    "maximum_value": "2.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_stringer_count":
+                {
+                    "label": "FeatherPrint Stringer Count",
+                    "description": "Number of stringer helices running around the perimeter. Stringers are evenly spaced at equal arc-length intervals on the perimeter.",
+                    "type": "int",
+                    "default_value": 4,
+                    "minimum_value": "1",
+                    "maximum_value": "32",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_helix_angle":
+                {
+                    "label": "FeatherPrint Helix Angle",
+                    "description": "Half-angle of the geodesic diamond pattern in degrees. Controls how steeply the helices rise; 45° gives square diamonds. Pitch is computed per-layer from this angle and the instantaneous perimeter so the intersection angle stays constant across tapers.",
+                    "type": "float",
+                    "unit": "°",
+                    "default_value": 45.0,
+                    "minimum_value": "1.0",
+                    "maximum_value": "89.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
                 },
                 "infill_multiplier":
                 {
@@ -2741,7 +2780,7 @@
                 {
                     "label": "Density",
                     "description": "Density of the material. This is used to calculate the weight of material used.",
-                    "unit": "g/cm³",
+                    "unit": "g/cmÂ³",
                     "type": "float",
                     "default_value": 1.24,
                     "minimum_value": "0.001",
@@ -9943,126 +9982,6 @@
                     "type": "str",
                     "default_value": "[[1,0,0], [0,1,0], [0,0,1]]",
                     "enabled": false
-                }
-            }
-        },
-        "fuselage_slicer":
-        {
-            "label": "Fuselage Slicer",
-            "icon": "PrintSetupCustom",
-            "description": "CuraFeather: geodetic helical stringer for RC aircraft and UAV fuselages.",
-            "type": "category",
-            "children":
-            {
-                "fuselage_enable":
-                {
-                    "label": "Enable Fuselage Slicer",
-                    "description": "Replace infill with a helical corrugated geodetic stringer. Designed for hollow fuselage shells with an explicit inner cavity wall in the STL.",
-                    "type": "bool",
-                    "default_value": false,
-                    "settable_per_mesh": true
-                },
-                "fuselage_spoke_count":
-                {
-                    "label": "Spoke Count",
-                    "description": "Number of radial walls per full corrugation cycle. Controls corrugation density around the circumference.",
-                    "type": "int",
-                    "default_value": 16,
-                    "minimum_value": 4,
-                    "maximum_value": 64,
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_helix_pitch":
-                {
-                    "label": "Helix Pitch (°/mm)",
-                    "description": "Rotation of the corrugation pattern per mm of Z height. Higher values produce more crossings per unit length.",
-                    "type": "float",
-                    "unit": "°/mm",
-                    "default_value": 2.0,
-                    "minimum_value": 0.1,
-                    "maximum_value": 45.0,
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_dual_helix":
-                {
-                    "label": "Dual Helix",
-                    "description": "Generate both clockwise and counter-clockwise stringer families. Creates crossing nodes for torsion resistance. Disable for single-helix (lighter, no torsion network).",
-                    "type": "bool",
-                    "default_value": true,
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_arc_mode":
-                {
-                    "label": "Arc Assignment Mode",
-                    "description": "XOR: alternating basket-weave — lightest, true geodetic character. OR: dense coverage — heavier, maximum skin adhesion.",
-                    "type": "enum",
-                    "options":
-                    {
-                        "xor": "XOR — Alternating (default)",
-                        "or": "OR — Dense Coverage"
-                    },
-                    "default_value": "xor",
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_phase_anchor_angle":
-                {
-                    "label": "Phase Anchor Angle (°)",
-                    "description": "Reference ray angle for perimeter walk phase anchoring. 0° = +X axis.",
-                    "type": "float",
-                    "unit": "°",
-                    "default_value": 0.0,
-                    "minimum_value": 0.0,
-                    "maximum_value": 360.0,
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_skin_offset":
-                {
-                    "label": "Skin Offset",
-                    "description": "Inboard offset of the trough segment from the outer skin wall. Should equal nozzle diameter so the stringer welds to the skin without overlapping it.",
-                    "type": "float",
-                    "unit": "mm",
-                    "default_value": 0.4,
-                    "minimum_value": 0.1,
-                    "maximum_value": 2.0,
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_bulkhead_positions":
-                {
-                    "label": "Bulkhead Z Positions",
-                    "description": "Comma-separated Z heights (mm) where a near-solid ring replaces the helical stringer. Use at wing tube sockets, battery bay ends, and landing gear attach points.",
-                    "type": "str",
-                    "default_value": "",
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_bulkhead_density":
-                {
-                    "label": "Bulkhead Density (%)",
-                    "description": "Infill density at bulkhead layers.",
-                    "type": "int",
-                    "unit": "%",
-                    "default_value": 95,
-                    "minimum_value": 50,
-                    "maximum_value": 100,
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
-                },
-                "fuselage_adhesion_factor":
-                {
-                    "label": "Adhesion Factor",
-                    "description": "Fusion threshold multiplier (k) for the pitch adhesion check. Adjacent extruded lines must overlap by at least k × nozzle_diameter. Advanced — leave at 1.5 unless you know your printer's bridging behaviour.",
-                    "type": "float",
-                    "default_value": 1.5,
-                    "minimum_value": 1.0,
-                    "maximum_value": 3.0,
-                    "enabled": "fuselage_enable",
-                    "settable_per_mesh": true
                 }
             }
         }

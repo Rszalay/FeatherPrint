@@ -128,6 +128,7 @@ set(engine_SRCS # Except main.cpp.
         src/infill/SierpinskiFillProvider.cpp
         src/infill/SubDivCube.cpp
         src/infill/GyroidInfill.cpp
+        src/featherprint/FeatherPrintGenerator.cpp
 
         src/pathPlanning/Comb.cpp
         src/pathPlanning/GCodePath.cpp

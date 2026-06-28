@@ -16,6 +16,8 @@
 #include "ExtruderTrain.h"
 #include "Slice.h"
 #include "WallToolPaths.h"
+#include "featherprint/FeatherPrintGenerator.h"
+#include "settings/EnumSettings.h"
 #include "settings/types/Ratio.h"
 #include "sliceDataStorage.h"
 #include "utils/Simplify.h" // We're simplifying the spiralized insets.
@@ -23,9 +25,10 @@
 namespace cura
 {
 
-WallsComputation::WallsComputation(const Settings& settings, const LayerIndex layer_nr)
+WallsComputation::WallsComputation(const Settings& settings, const LayerIndex layer_nr, double fp_helix_phase)
     : settings_(settings)
     , layer_nr_(layer_nr)
+    , fp_helix_phase_(fp_helix_phase)
 {
 }
 
@@ -35,8 +38,24 @@ WallsComputation::WallsComputation(const Settings& settings, const LayerIndex la
  *
  * generateWalls only reads and writes data for the current layer
  */
-void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_type)
+void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_type, coord_t print_z)
 {
+    // FeatherPrint: replace Arachne entirely with the conformal stringer generator.
+    // wall_line_count must be >= 1 so the pipeline guards don't early-out, but Arachne
+    // is never called — the stringer path populates wall_toolpaths directly.
+    if (settings_.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT)
+    {
+        const coord_t z_coord = print_z;
+        FeatherPrintGenerator fp;
+        part->wall_toolpaths = { fp.generate(part->outline, z_coord, settings_, fp_helix_phase_) };
+        part->inner_area     = part->outline;
+        part->print_outline  = part->outline;
+
+        part->outline = SingleShape{ Simplify(settings_).polygon(part->outline) };
+        part->print_outline = part->outline;
+        return;
+    }
+
     size_t wall_count = settings_.get<size_t>("wall_line_count");
     if (wall_count == 0) // Early out if no walls are to be generated
     {
@@ -99,7 +118,7 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
 {
     for (SliceLayerPart& part : layer->parts)
     {
-        generateWalls(&part, section);
+        generateWalls(&part, section, layer->printZ);
     }
 
     // Remove the parts which did not generate a wall. As these parts are too small to print,
