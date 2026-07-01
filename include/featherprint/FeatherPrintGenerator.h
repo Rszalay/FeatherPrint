@@ -4,7 +4,9 @@
 
 #include <vector>
 
+#include "geometry/OpenPolyline.h"
 #include "geometry/Polygon.h"
+#include "geometry/Polyline.h"
 #include "geometry/Shape.h"
 #include "settings/Settings.h"
 #include "utils/Coord_t.h"
@@ -43,6 +45,24 @@ public:
      */
     VariableWidthLines generate(const Shape& outline, coord_t z, const Settings& settings, double helix_phase = 0.0);
 
+    // Parameters shared across all open-polyline arcs on the same layer.
+    // Computed once from the full virtual ring (all arcs + gap chords) so that
+    // every arc uses a consistent perimeter length, reference angle, and centroid.
+    struct OpenLayerParams
+    {
+        Point2LL centroid;
+        double full_ring_total{};    // perimeter of the full virtual ring
+        double full_ring_arc_ref{};  // arc-length position of the +X reference ray intersection
+        double arc_start_in_ring{};  // start position of this specific arc within the full ring
+    };
+
+    /*!
+     * Generate the wall toolpath for one open-manifold layer (open polyline input).
+     * open_poly must already be oriented CCW in math coordinates (caller's responsibility).
+     * params carries the full-ring geometry shared across all arcs on this layer.
+     */
+    VariableWidthLines generateOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, double helix_phase, const OpenLayerParams& params);
+
     /*!
      * Returns the world-space position of the seam (helix 0 departure) for this layer.
      * Valid only after generate() has been called for the same z / settings combination.
@@ -51,13 +71,14 @@ public:
     Point2LL seamPoint() const { return seam_pt_; }
 
 private:
-    // ---- Arc-length parameterization of a closed polygon --------------------
+    // ---- Arc-length parameterization of a closed or open polyline -----------
 
     struct ArcParam
     {
         std::vector<double> cum_len;
         double total{};
-        const Polygon* poly{};
+        const Polyline* poly{};  // base-class pointer; works for Polygon and OpenPolyline
+        bool is_open{ false };   // true for OpenPolyline: no closing segment, pointAt clamps
 
         Point2LL pointAt(double s) const;
         Point2LL tangentAt(double s) const;
@@ -68,6 +89,7 @@ private:
     };
 
     static ArcParam buildArcParam(const Polygon& poly);
+    static ArcParam buildArcParamOpen(const OpenPolyline& poly);
     static Point2LL centroidBbox(const Polygon& poly);
     static const Polygon* largestPoly(const Shape& shape);
 
@@ -97,6 +119,22 @@ private:
                             double theta_anchor, double R_a,
                             const Point2LL& centroid, const ArcParam& arc,
                             bool is_cw, coord_t w, bool skip_first = false);
+
+    // Terminal loop at one open endpoint of an open polyline.
+    // Canonical profile: same arc radii as Stringer Trace, but the departure and return
+    // both land at the anchor (x=0). The loop extends 2w in the -x_sign direction from
+    // the anchor, dipping 2.5w inward. Followed by a closing perimeter segment that
+    // retraces the loop back to the anchor (the crossover bond).
+    // s_anchor: arc-length position of the open endpoint.
+    // x_sign  : +1 to extend forward (CCW, for the start endpoint), -1 to extend backward (CW, for the end endpoint).
+    // splay_L > 0 inserts a horizontal segment of length L·w at the loop bottom,
+    // widening the terminal to cover the deleted Stringer Trace footprint (Splay feature).
+    static void appendTerminal(ExtrusionLine& line,
+                               double s_anchor, double x_sign,
+                               const ArcParam& arc, const Point2LL& centroid,
+                               coord_t w,
+                               bool reversed = false,
+                               double splay_L = 0.0);
 
     // Lacing Trace canonical profile (w-units, anchor at midpoint between two colliding stringers):
     //   Departure : (-0.75, 0)   Return : (+0.75, 0)

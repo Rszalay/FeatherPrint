@@ -8,6 +8,7 @@
 #include <numbers>
 
 #include "utils/AABB.h"
+#include <spdlog/spdlog.h>
 
 namespace cura
 {
@@ -19,7 +20,8 @@ namespace cura
 FeatherPrintGenerator::ArcParam FeatherPrintGenerator::buildArcParam(const Polygon& poly)
 {
     ArcParam ap;
-    ap.poly = &poly;
+    ap.poly    = &poly;
+    ap.is_open = false;
     int n = static_cast<int>(poly.size());
     ap.cum_len.resize(n, 0.0);
 
@@ -39,15 +41,40 @@ FeatherPrintGenerator::ArcParam FeatherPrintGenerator::buildArcParam(const Polyg
     return ap;
 }
 
+FeatherPrintGenerator::ArcParam FeatherPrintGenerator::buildArcParamOpen(const OpenPolyline& poly)
+{
+    ArcParam ap;
+    ap.poly    = &poly;
+    ap.is_open = true;
+    int n = static_cast<int>(poly.size());
+    ap.cum_len.resize(n, 0.0);
+
+    for (int i = 1; i < n; i++)
+    {
+        const Point2LL& a = poly[i - 1];
+        const Point2LL& b = poly[i];
+        double dx = b.X - a.X, dy = b.Y - a.Y;
+        ap.cum_len[i] = ap.cum_len[i - 1] + std::sqrt(dx * dx + dy * dy);
+    }
+    ap.total = ap.cum_len[n - 1]; // No closing segment
+    return ap;
+}
+
 Point2LL FeatherPrintGenerator::ArcParam::pointAt(double s) const
 {
-    s = std::fmod(s, total);
-    if (s < 0.0) s += total;
+    if (is_open)
+        s = std::max(0.0, std::min(total, s));
+    else
+    {
+        s = std::fmod(s, total);
+        if (s < 0.0) s += total;
+    }
 
-    int n = static_cast<int>(poly->size());
+    const int n = static_cast<int>(poly->size());
     for (int i = 0; i < n; i++)
     {
         int j = (i + 1) % n;
+        if (is_open && j == 0) break; // skip nonexistent closing segment
         double seg_end = (j == 0) ? total : cum_len[j];
         double seg_start = cum_len[i];
         if (s <= seg_end + 1e-6)
@@ -62,18 +89,24 @@ Point2LL FeatherPrintGenerator::ArcParam::pointAt(double s) const
                 a.Y + static_cast<coord_t>((b.Y - a.Y) * t));
         }
     }
-    return (*poly)[0];
+    return is_open ? (*poly)[n - 1] : (*poly)[0];
 }
 
 Point2LL FeatherPrintGenerator::ArcParam::tangentAt(double s) const
 {
-    s = std::fmod(s, total);
-    if (s < 0.0) s += total;
+    if (is_open)
+        s = std::max(0.0, std::min(total, s));
+    else
+    {
+        s = std::fmod(s, total);
+        if (s < 0.0) s += total;
+    }
 
-    int n = static_cast<int>(poly->size());
+    const int n = static_cast<int>(poly->size());
     for (int i = 0; i < n; i++)
     {
         int j = (i + 1) % n;
+        if (is_open && j == 0) break;
         double seg_end = (j == 0) ? total : cum_len[j];
         if (s <= seg_end + 1e-6)
         {
@@ -82,7 +115,7 @@ Point2LL FeatherPrintGenerator::ArcParam::tangentAt(double s) const
             return b - a;
         }
     }
-    return (*poly)[1] - (*poly)[0];
+    return is_open ? ((*poly)[n - 1] - (*poly)[n - 2]) : ((*poly)[1] - (*poly)[0]);
 }
 
 double FeatherPrintGenerator::ArcParam::referenceArcPos(const Point2LL& centroid) const
@@ -91,6 +124,7 @@ double FeatherPrintGenerator::ArcParam::referenceArcPos(const Point2LL& centroid
     for (int i = 0; i < n; i++)
     {
         int j = (i + 1) % n;
+        if (is_open && j == 0) continue; // no closing segment for open polylines
         const Point2LL& a = (*poly)[i];
         const Point2LL& b = (*poly)[j];
         double ay = static_cast<double>(a.Y - centroid.Y);
@@ -108,7 +142,7 @@ double FeatherPrintGenerator::ArcParam::referenceArcPos(const Point2LL& centroid
             }
         }
     }
-    return 0.0; // fallback: no crossing found (degenerate polygon)
+    return 0.0; // fallback: no crossing found
 }
 
 Point2LL FeatherPrintGenerator::centroidBbox(const Polygon& poly)
@@ -168,6 +202,7 @@ double FeatherPrintGenerator::ArcParam::radiusAt(const Point2LL& centroid, doubl
     for (int i = 0; i < n; i++)
     {
         int j = (i + 1) % n;
+        if (is_open && j == 0) continue; // no closing segment for open polylines
         double ax = (*poly)[i].X - centroid.X, ay = (*poly)[i].Y - centroid.Y;
         double bx = (*poly)[j].X - centroid.X, by = (*poly)[j].Y - centroid.Y;
         double ex = bx - ax, ey = by - ay;
@@ -178,8 +213,9 @@ double FeatherPrintGenerator::ArcParam::radiusAt(const Point2LL& centroid, doubl
         if (t_val > 1e-6 && s_val >= -1e-9 && s_val <= 1.0 + 1e-9)
             return t_val;
     }
-    // Fallback: return Euclidean distance from centroid to poly[0]
-    double fx = (*poly)[0].X - centroid.X, fy = (*poly)[0].Y - centroid.Y;
+    // Fallback: return Euclidean distance from centroid to nearest endpoint
+    const Point2LL& fp = is_open ? (*poly)[n - 1] : (*poly)[0];
+    double fx = fp.X - centroid.X, fy = fp.Y - centroid.Y;
     return std::sqrt(fx * fx + fy * fy);
 }
 
@@ -237,13 +273,13 @@ void FeatherPrintGenerator::appendCanonicalArc(
 // Stringer Trace
 // ============================================================================
 //
-// Canonical teardrop profile (w-units, anchor at origin, y negative = inward):
-//   Departure  : (−1,  0)   Return : (+1, 0)   Bottom : (0, −2.5)
-//   Left upper arc  : centre (−1, −1.5), R=1.5, CW from  90° to −41.4°
-//   Lower arc       : centre ( 0, −1.5), R=1.0, CW from −82.8° to −97.2°
-//   Right upper arc : centre (+1, −1.5), R=1.5, CW from 221.4° to  90°
+// Canonical stringer trace (w-units, anchor at origin, y negative = inward):
+//   Departure  : (−0.5, 0)   Return : (+0.5, 0)   Bottom : (0, −2.5)
+//   Arc 1: CW, centre (−0.5, −1.5), R=1.5, 90°→  0°   → (−0.5,0) to ( 1.0,−1.5)
+//   Arc 2: CW, centre (  0,  −1.5), R=1.0,  0°→180°   → ( 1.0,−1.5) to (−1.0,−1.5) via (0,−2.5)
+//   Arc 3: CW, centre (+0.5, −1.5), R=1.5, 180°→ 90°  → (−1.0,−1.5) to ( 0.5, 0)
 //
-// For CW helix traces x_sign = -1 mirrors the profile about x=0.
+// For CW helix traces x_sign=-1 mirrors about x=0, arcs drawn in reverse order/direction.
 
 void FeatherPrintGenerator::appendTrace(
     ExtrusionLine& line,
@@ -253,20 +289,18 @@ void FeatherPrintGenerator::appendTrace(
 {
     if (! is_cw)
     {
-        // CCW: departure at lx=-1 (s_anchor-w), return at lx=+1 (s_anchor+w).
-        appendCanonicalArc(line, -1.0, -1.5, 1.5,  90.0,  -41.4, true,  8,  1.0, theta_anchor, R_a, centroid, arc, w, skip_first);
-        appendCanonicalArc(line,  0.0, -1.5, 1.0, -82.8,  -97.2, true,  3,  1.0, theta_anchor, R_a, centroid, arc, w, true);
-        appendCanonicalArc(line,  1.0, -1.5, 1.5, 221.4,   90.0, true,  8,  1.0, theta_anchor, R_a, centroid, arc, w, true);
+        // CCW helix: departure at lx=−0.5, return at lx=+0.5.
+        appendCanonicalArc(line, -0.5, -1.5, 1.5,  90.0,   0.0, true,  8,  1.0, theta_anchor, R_a, centroid, arc, w, skip_first);
+        appendCanonicalArc(line,  0.0, -1.5, 1.0,   0.0, 180.0, true,  10, 1.0, theta_anchor, R_a, centroid, arc, w, true);
+        appendCanonicalArc(line,  0.5, -1.5, 1.5, 180.0,  90.0, true,  8,  1.0, theta_anchor, R_a, centroid, arc, w, true);
     }
     else
     {
-        // CW: arcs reversed in order and direction, x_sign=-1 mirrors the profile.
-        // First point of reversed right arc: lx_canon=+1, x_sign=-1 → theta_anchor-w/R_a = s_anchor-w ✓
-        // Last point of reversed left arc:   lx_canon=-1, x_sign=-1 → theta_anchor+w/R_a = s_anchor+w ✓
-        // Same perimeter cutout as CCW, loop leans forward (CW direction).
-        appendCanonicalArc(line,  1.0, -1.5, 1.5,  90.0, 221.4, false, 8, -1.0, theta_anchor, R_a, centroid, arc, w, skip_first);
-        appendCanonicalArc(line,  0.0, -1.5, 1.0, -97.2, -82.8, false, 3, -1.0, theta_anchor, R_a, centroid, arc, w, true);
-        appendCanonicalArc(line, -1.0, -1.5, 1.5, -41.4,  90.0, false, 8, -1.0, theta_anchor, R_a, centroid, arc, w, true);
+        // CW helix: arcs reversed in order and direction, x_sign=-1 mirrors about x=0.
+        // Departure lx=+0.5 (canon 0.5 × −1 = −0.5 in world → +0.5 on arc), return lx=−0.5.
+        appendCanonicalArc(line,  0.5, -1.5, 1.5,  90.0, 180.0, false, 8,  -1.0, theta_anchor, R_a, centroid, arc, w, skip_first);
+        appendCanonicalArc(line,  0.0, -1.5, 1.0, 180.0, 360.0, false, 10, -1.0, theta_anchor, R_a, centroid, arc, w, true);
+        appendCanonicalArc(line, -0.5, -1.5, 1.5,   0.0,  90.0, false, 8,  -1.0, theta_anchor, R_a, centroid, arc, w, true);
     }
 }
 
@@ -465,6 +499,261 @@ VariableWidthLines FeatherPrintGenerator::generate(
     // Close: repeat the first junction to form a closed loop
     if (! fp_line.empty())
         fp_line.junctions_.push_back(fp_line.junctions_.front());
+
+    if (fp_line.size() < 2)
+        return {};
+
+    VariableWidthLines result;
+    result.push_back(std::move(fp_line));
+    return result;
+}
+
+// ============================================================================
+// Terminal loop — Whip feature for open-manifold boundary edges
+// ============================================================================
+//
+// Canonical profile (w-units, anchor at lx=0):
+//   Arc 1 : CCW 90°→180°, centre (1.5,-1.5), R=1.5 → (1.5,0) to (0,-1.5)
+//   Arc 2a: CCW 180°→270°, centre (1.0,-1.5), R=1.0 → (0,-1.5) to (1.0,-2.5)
+//   [Ins]  : horizontal at y=-2.5 from (1.0,-2.5) to (1.0+L,-2.5)  [Splay only, L>0]
+//   Arc 2b: CCW 270°→360°, centre (1.0+L,-1.5), R=1.0 → (1.0+L,-2.5) to (2.0+L,-1.5)
+//   Line 1: (2.0+L,-1.5) → (2.0+L,0)
+// At L=0 Arc2a+Arc2b = standard Arc2 (CCW 180°→360°) and profile is the standard Terminal.
+// x_sign=+1 for start endpoint (reversed=true path), -1 for end endpoint (reversed=false).
+
+void FeatherPrintGenerator::appendTerminal(
+    ExtrusionLine& line,
+    double s_anchor, double x_sign,
+    const ArcParam& arc, const Point2LL& centroid,
+    coord_t w,
+    bool reversed,
+    double splay_L)
+{
+    Point2LL anchor_pt = arc.pointAt(s_anchor);
+    double dcx = static_cast<double>(anchor_pt.X - centroid.X);
+    double dcy = static_cast<double>(anchor_pt.Y - centroid.Y);
+    double R_a = std::sqrt(dcx * dcx + dcy * dcy);
+    if (R_a < 1.0)
+        return;
+    double theta_anchor = std::atan2(dcy, dcx);
+
+    // Number of tessellation steps for the Insertion segment (straight line).
+    const int n_ins = (splay_L > 1e-6) ? std::max(2, static_cast<int>(splay_L * 4.0 + 0.5)) : 0;
+
+    auto cp = [&](double lx, double ly) -> Point2LL {
+        return conformPlace(lx, ly, x_sign, theta_anchor, R_a, centroid, arc, w);
+    };
+
+    if (reversed)
+    {
+        // "Begins at terminal": Line1_rev → Arc2b_rev → Ins_rev → Arc2a_rev → Arc1_rev
+        // Path starts at (2+L,0) on skin, ends at (1.5,0) for skin walk continuation.
+        for (int k = 0; k <= 6; ++k)
+            line.emplace_back(cp(2.0 + splay_L, -1.5 * k / 6.0), w, 0);
+        // Arc 2b reversed: CW 360°→270°, centre (1.0+L,-1.5)
+        appendCanonicalArc(line, 1.0 + splay_L, -1.5, 1.0, 360.0, 270.0, true, 5, x_sign,
+                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
+        // Insertion reversed: (1.0+L,-2.5) → (1.0,-2.5)
+        for (int k = 1; k <= n_ins; ++k)
+            line.emplace_back(cp(1.0 + splay_L * (1.0 - static_cast<double>(k) / n_ins), -2.5), w, 0);
+        // Arc 2a reversed: CW 270°→180°, centre (1.0,-1.5)
+        appendCanonicalArc(line, 1.0, -1.5, 1.0, 270.0, 180.0, true, 5, x_sign,
+                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
+        // Arc 1 reversed: CW 180°→90°, centre (1.5,-1.5)
+        appendCanonicalArc(line, 1.5, -1.5, 1.5, 180.0, 90.0, true, 8, x_sign,
+                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
+    }
+    else
+    {
+        // "Ends at terminal": Arc1 → Arc2a → Ins → Arc2b → Line1
+        // Path starts at (1.5,0) where skin walk stopped (s_anchor−1.5w).
+        // Arc 1: CCW 90°→180°, centre (1.5,-1.5)
+        appendCanonicalArc(line, 1.5, -1.5, 1.5, 90.0, 180.0, false, 8, x_sign,
+                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/false);
+        // Arc 2a: CCW 180°→270°, centre (1.0,-1.5) → reaches bottom (1.0,-2.5)
+        appendCanonicalArc(line, 1.0, -1.5, 1.0, 180.0, 270.0, false, 5, x_sign,
+                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
+        // Insertion: (1.0,-2.5) → (1.0+L,-2.5) at maximum depth
+        for (int k = 1; k <= n_ins; ++k)
+            line.emplace_back(cp(1.0 + splay_L * static_cast<double>(k) / n_ins, -2.5), w, 0);
+        // Arc 2b: CCW 270°→360°, centre (1.0+L,-1.5) → arrives at (2.0+L,-1.5)
+        appendCanonicalArc(line, 1.0 + splay_L, -1.5, 1.0, 270.0, 360.0, false, 5, x_sign,
+                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
+        // Line 1: (2.0+L,-1.5) → (2.0+L,0)
+        for (int k = 1; k <= 6; ++k)
+            line.emplace_back(cp(2.0 + splay_L, -1.5 + 1.5 * k / 6.0), w, 0);
+    }
+}
+
+// ============================================================================
+// generateOpen — wall toolpath for an open-manifold layer
+// ============================================================================
+
+VariableWidthLines FeatherPrintGenerator::generateOpen(
+    const OpenPolyline& open_poly,
+    coord_t z,
+    const Settings& settings,
+    double helix_phase,
+    const OpenLayerParams& params)
+{
+    // open_poly is already oriented CCW in math coordinates by the caller.
+    if (open_poly.size() < 2)
+        return {};
+
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+    if (w <= 0)
+        return {};
+
+    const int N = settings.get<int>("featherprint_stringer_count");
+    if (N < 1)
+        return {};
+
+    ArcParam arc_open = buildArcParamOpen(open_poly);
+    const double s_end = arc_open.total;
+    const double w_d   = static_cast<double>(w);
+
+    if (s_end < 2.0 * w_d)
+        return {};
+
+    const Point2LL& centroid = params.centroid;
+
+    // Anchor placement uses the full virtual ring shared across all arcs on this layer.
+    // Anchors are computed in full-ring coordinates then shifted to arc-local coordinates.
+    const double helix_frac  = std::fmod(helix_phase, 1.0);
+    const double ccw_adv_abs = std::fmod(helix_frac * params.full_ring_total + params.full_ring_arc_ref, params.full_ring_total);
+    const double cw_adv_abs  = std::fmod(params.full_ring_arc_ref - helix_frac * params.full_ring_total + params.full_ring_total, params.full_ring_total);
+
+    std::vector<Anchor> anchors;
+    anchors.reserve(2 * N);
+    for (int i = 0; i < N; i++)
+    {
+        double s_abs   = std::fmod(static_cast<double>(i) / N * params.full_ring_total + ccw_adv_abs, params.full_ring_total);
+        double s_local = s_abs - params.arc_start_in_ring;
+        if (s_local > w_d && s_local < s_end - w_d)
+            anchors.push_back({ s_local, false });
+    }
+    for (int i = 0; i < N; i++)
+    {
+        double s_abs   = std::fmod(static_cast<double>(i) / N * params.full_ring_total + cw_adv_abs, params.full_ring_total);
+        double s_local = s_abs - params.arc_start_in_ring;
+        if (s_local > w_d && s_local < s_end - w_d)
+            anchors.push_back({ s_local, true });
+    }
+    std::sort(anchors.begin(), anchors.end(), [](const Anchor& a, const Anchor& b) { return a.s < b.s; });
+
+    spdlog::debug("[FP-Open] s_end={:.2f}mm ring_total={:.2f}mm arc_start={:.2f}mm anchors={} ccw_abs={:.2f} cw_abs={:.2f}",
+        s_end / 1000.0, params.full_ring_total / 1000.0, params.arc_start_in_ring / 1000.0,
+        anchors.size(), ccw_adv_abs / 1000.0, cw_adv_abs / 1000.0);
+
+    // Collision detection — same logic as generate(), using arc_open for world positions
+    const int total_anchors = static_cast<int>(anchors.size());
+    for (int i = 0; i < total_anchors; i++)
+    {
+        for (int j = i + 1; j < total_anchors; j++)
+        {
+            if (anchors[j].s - anchors[i].s > 2.0 * w_d) break;
+            if (anchors[j].is_cw == anchors[i].is_cw) continue;
+            Point2LL pi = arc_open.pointAt(anchors[i].s);
+            Point2LL pj = arc_open.pointAt(anchors[j].s);
+            double dx = static_cast<double>(pi.X - pj.X);
+            double dy = static_cast<double>(pi.Y - pj.Y);
+            if (std::sqrt(dx * dx + dy * dy) < w_d)
+            {
+                anchors[i].skip     = true;
+                anchors[j].skip     = true;
+                anchors[i].pair_idx = j;
+                anchors[j].pair_idx = i;
+            }
+        }
+    }
+
+    // Terminal–stringer collision detection (Splay feature).
+    // Any stringer within 4w of an endpoint is too close for the standard Terminal loop
+    // to fit. Rather than suppressing the terminal, we widen it with the Splay insertion
+    // (a horizontal segment of length L·w at the loop bottom, L = max(0, d/w - 2)).
+    // The stringer trace itself is still suppressed (skip=true) because it is geometrically
+    // subsumed by the widened terminal.
+    bool draw_start_terminal = (s_end >= 2.0 * w_d);
+    bool draw_end_terminal   = (s_end >= 2.0 * w_d);
+    double start_splay_L = 0.0;
+    double end_splay_L   = 0.0;
+    for (auto& anc : anchors)
+    {
+        if (anc.skip) continue; // already handled by lacing
+        if (anc.s < 3.0 * w_d)
+        {
+            // d/w = anc.s / w_d; L = max(0, d/w - 1)
+            start_splay_L = std::max(start_splay_L, std::max(0.0, anc.s / w_d - 1.0));
+            anc.skip = true;
+        }
+        if (anc.s > s_end - 3.0 * w_d)
+        {
+            end_splay_L = std::max(end_splay_L, std::max(0.0, (s_end - anc.s) / w_d - 1.0));
+            anc.skip = true;
+        }
+    }
+
+    // Open ExtrusionLine: walk from s=0 to s=s_end with embedded Traces/Lacings.
+    // Uses arc_open throughout — arc_v was only needed for anchor placement.
+    ExtrusionLine fp_line(/*inset_idx=*/0, /*is_odd=*/false, /*is_closed=*/false);
+
+    double current_s = 0.0;
+    if (draw_start_terminal)
+    {
+        // Start terminal: "begins at terminal" — draw reversed (Line→Arc2rev→Arc1rev).
+        // Path starts at (2w,0) on skin, ends at (1.5w,0). Walk picks up from 1.5w.
+        appendTerminal(fp_line, 0.0, +1.0, arc_open, centroid, w, /*reversed=*/true, start_splay_L);
+        current_s = (2.0 + start_splay_L) * w_d;
+    }
+    int i = 0;
+    while (i < total_anchors)
+    {
+        const Anchor& anc = anchors[i];
+        if (anc.skip)
+        {
+            if (anc.pair_idx > i)
+            {
+                const double s_mid = (anc.s + anchors[anc.pair_idx].s) * 0.5;
+                double s_depart = s_mid - 0.75 * w_d;
+                if (s_depart < current_s) s_depart = current_s;
+
+                appendPolySegment(fp_line, arc_open, current_s, s_depart, w, fp_line.empty());
+
+                Point2LL mid_pt = arc_open.pointAt(s_mid);
+                double dcx = static_cast<double>(mid_pt.X - centroid.X);
+                double dcy = static_cast<double>(mid_pt.Y - centroid.Y);
+                double R_a = std::sqrt(dcx * dcx + dcy * dcy);
+                if (R_a > 1.0)
+                    appendLacingTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, w);
+
+                current_s = s_mid + 0.75 * w_d;
+            }
+            ++i;
+            continue;
+        }
+
+        const double s_anchor = anc.s;
+        double s_depart = s_anchor - w_d;
+        if (s_depart < current_s) s_depart = current_s;
+
+        Point2LL anchor_pt = arc_open.pointAt(s_anchor);
+        double dcx = static_cast<double>(anchor_pt.X - centroid.X);
+        double dcy = static_cast<double>(anchor_pt.Y - centroid.Y);
+        double R_a = std::sqrt(dcx * dcx + dcy * dcy);
+        if (R_a < 1.0) { ++i; continue; }
+
+        appendPolySegment(fp_line, arc_open, current_s, s_depart, w, fp_line.empty());
+        appendTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, anc.is_cw, w, false);
+        current_s = s_anchor + w_d;
+        ++i;
+    }
+
+    // End terminal: Arc1 departs from s_end - 1.5w (standard) or s_end - (1.5+L)w (splay).
+    const double end_walk_stop = draw_end_terminal ? s_end - (1.5 + end_splay_L) * w_d : s_end;
+    appendPolySegment(fp_line, arc_open, current_s, end_walk_stop, w, fp_line.empty());
+
+    if (draw_end_terminal)
+        appendTerminal(fp_line, s_end, -1.0, arc_open, centroid, w, /*reversed=*/false, end_splay_L);
 
     if (fp_line.size() < 2)
         return {};

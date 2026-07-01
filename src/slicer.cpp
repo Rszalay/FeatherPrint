@@ -747,13 +747,20 @@ void SlicerLayer::makePolygons(const Mesh* mesh)
     // TODO: (?) for mesh surface mode: connect open polygons. Maybe the above algorithm can create two open polygons which are actually connected when the starting segment is in
     // the middle between the two open polygons.
 
-    if (mesh->settings_.get<ESurfaceMode>("magic_mesh_surface_mode") == ESurfaceMode::NORMAL)
+    // FeatherPrint: skip stitch() and stitch_extensive() so open-boundary layers remain as
+    // open_polylines and are handled by generateOpen().  connectOpenPolylines (≤0.02mm threshold)
+    // is kept so that mesh-precision edge fragments get joined into one continuous open polyline.
+    // stitch() bridges gaps up to 10mm — exactly what closes the cutout on narrow layers,
+    // turning them into closed polygons that generate() then processes incorrectly.
+    const bool is_featherprint = mesh->settings_.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT;
+
+    if (!is_featherprint && mesh->settings_.get<ESurfaceMode>("magic_mesh_surface_mode") == ESurfaceMode::NORMAL)
     { // don't stitch when using (any) mesh surface mode, i.e. also don't stitch when using mixed mesh surface and closed polygons, because then polylines which are supposed to be
       // open will be closed
         stitch(open_polylines);
     }
 
-    if (mesh->settings_.get<bool>("meshfix_extensive_stitching"))
+    if (!is_featherprint && mesh->settings_.get<bool>("meshfix_extensive_stitching"))
     {
         stitch_extensive(open_polylines);
     }

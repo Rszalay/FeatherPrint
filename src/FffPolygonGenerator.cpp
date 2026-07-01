@@ -518,9 +518,9 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
         {
             mesh.fp_helix_phase[layer_nr] = std::fmod(phase, 1.0);
             const SliceLayer& layer = mesh.layers[layer_nr];
-            if (layer.parts.empty()) continue;
-            // Use the largest part's outline as the perimeter reference
-            double best_area = 0.0;
+
+            // Compute perimeter reference from the largest closed polygon part.
+            double best_area    = 0.0;
             double arc_total_mm = 0.0;
             for (const SliceLayerPart& part : layer.parts)
             {
@@ -542,6 +542,79 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                     }
                 }
             }
+
+            // Open-manifold layers: build the same full virtual ring that WallsComputation
+            // and generateOpen use so the helix phase advances by the correct perimeter.
+            // All arc fragments are concatenated in angular order (sorted by start angle from
+            // the layer centroid); gap chords between consecutive arcs and the closing chord
+            // are implicit polygon segments, matching the full_ring_total in generateOpen.
+            if (arc_total_mm < 1e-6 && ! layer.open_polylines.empty())
+            {
+                // Centroid from bounding box of all open polylines
+                coord_t bbx0{}, bbx1{}, bby0{}, bby1{};
+                bool first = true;
+                for (const OpenPolyline& poly : layer.open_polylines)
+                    for (const Point2LL& p : poly)
+                    {
+                        if (first) { bbx0 = bbx1 = p.X; bby0 = bby1 = p.Y; first = false; }
+                        if (p.X < bbx0) bbx0 = p.X; if (p.X > bbx1) bbx1 = p.X;
+                        if (p.Y < bby0) bby0 = p.Y; if (p.Y > bby1) bby1 = p.Y;
+                    }
+                const Point2LL cx((bbx0 + bbx1) / 2, (bby0 + bby1) / 2);
+
+                // Orient each arc (CCW in math = positive virtual-closed area) so that
+                // poly[0] is the correct start point for angle-sorting and chord measurement.
+                // Without this, reversed arcs sort by the wrong endpoint, producing wrong
+                // inter-arc chord lengths and an inflated full_ring_total.
+                struct OrientedRef
+                {
+                    std::vector<Point2LL> pts; // oriented points (may be reversed copy)
+                    double angle{};
+                };
+                std::vector<OrientedRef> refs;
+                for (const OpenPolyline& poly : layer.open_polylines)
+                {
+                    if (poly.size() < 2) continue;
+                    // Build virtual closed polygon to check winding
+                    double area2 = 0.0;
+                    for (size_t k = 0; k < poly.size(); k++)
+                    {
+                        size_t j = (k + 1) % poly.size();
+                        area2 += static_cast<double>(poly[k].X) * poly[j].Y
+                               - static_cast<double>(poly[j].X) * poly[k].Y;
+                    }
+                    OrientedRef ref;
+                    ref.pts.resize(poly.size());
+                    if (area2 < 0.0)
+                        std::reverse_copy(poly.begin(), poly.end(), ref.pts.begin());
+                    else
+                        std::copy(poly.begin(), poly.end(), ref.pts.begin());
+                    double dx = ref.pts[0].X - cx.X, dy = ref.pts[0].Y - cx.Y;
+                    ref.angle = std::atan2(dy, dx);
+                    refs.push_back(std::move(ref));
+                }
+                std::sort(refs.begin(), refs.end(), [](const OrientedRef& a, const OrientedRef& b){ return a.angle < b.angle; });
+
+                // Sum all arc segment lengths; inter-arc and closing chords are added via
+                // the last-to-next-first distances, matching the implicit polygon edges.
+                double total = 0.0;
+                for (size_t i = 0; i < refs.size(); i++)
+                {
+                    const auto& pts = refs[i].pts;
+                    for (size_t k = 0; k + 1 < pts.size(); k++)
+                    {
+                        double dx = pts[k + 1].X - pts[k].X, dy = pts[k + 1].Y - pts[k].Y;
+                        total += std::sqrt(dx * dx + dy * dy);
+                    }
+                    // chord to next arc's start (or back to first arc's start for the last)
+                    const auto& next_pts = refs[(i + 1) % refs.size()].pts;
+                    double cdx = next_pts[0].X - pts.back().X;
+                    double cdy = next_pts[0].Y - pts.back().Y;
+                    total += std::sqrt(cdx * cdx + cdy * cdy);
+                }
+                arc_total_mm = total / 1000.0;
+            }
+
             if (arc_total_mm > 1e-6)
             {
                 const double layer_height_mm = static_cast<double>(layer.printZ) / 1000.0
