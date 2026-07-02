@@ -510,6 +510,19 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
     // Must run before the parallel wall loop; only populated when the pattern is active.
     if (mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT)
     {
+        // Force deterministic, strictly inner-to-outer wall printing order for this mesh.
+        // The Miter weld structurally requires the OML (outer Wall, inset_idx 0) to print
+        // strictly last so its Terminal sweeps over the already-placed inner Walls' open
+        // ends — this can't be left to a user/profile preference. A `value` formula in
+        // fdmprinter.def.json isn't enough: any quality/material/user profile that stores an
+        // explicit value for these settings (optimize_wall_printing_order defaults to true in
+        // virtually every stock quality profile) sits above the definition's own computed
+        // value in Cura's settings resolution stack. Settings::add() inserts directly into
+        // this mesh's own container, which is checked first, so it reliably wins.
+        mesh.settings.add("optimize_wall_printing_order", "false");
+        mesh.settings.add("inset_direction", "inside_out");
+        mesh.settings.add("initial_layer_inset_direction", "inside_out");
+
         const double alpha_rad = mesh.settings.get<double>("featherprint_helix_angle") * std::numbers::pi / 180.0;
         const double tan_alpha = std::tan(alpha_rad);
         mesh.fp_helix_phase.resize(mesh_layer_count, 0.0);
@@ -620,6 +633,35 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 const double layer_height_mm = static_cast<double>(layer.printZ) / 1000.0
                     - (layer_nr > 0 ? static_cast<double>(mesh.layers[layer_nr - 1].printZ) / 1000.0 : 0.0);
                 phase += layer_height_mm / (arc_total_mm * tan_alpha);
+            }
+        }
+
+        // Flange: unconditionally spans featherprint_flange_ramp_layers layers down from the
+        // topmost layer with any boundary geometry (closed parts OR open_polylines — a
+        // boundary loop interrupted by a slot/hole reaching the open top is represented
+        // entirely as open_polylines at those layers, the same container the ordinary
+        // single-slot Whip case already uses). No attempt is made to distinguish an open top
+        // from a closed apex/taper here — that heuristic proved unreliable (it either misses
+        // an open top interrupted by slots, since those top layers have no `parts` to measure
+        // an area from, or misfires on an ordinary closed taper). Models with a genuinely
+        // closed top (e.g. a nose cone) must instead disable the Flange explicitly via
+        // featherprint_flange_enabled.
+        if (mesh.settings.get<bool>("featherprint_flange_enabled"))
+        {
+            const size_t n_flange = mesh.settings.get<size_t>("featherprint_flange_ramp_layers");
+            LayerIndex last_geom = -1;
+            for (int li = static_cast<int>(mesh_layer_count) - 1; li >= 0; li--)
+            {
+                if (! mesh.layers[li].parts.empty() || ! mesh.layers[li].open_polylines.empty())
+                {
+                    last_geom = static_cast<LayerIndex>(li);
+                    break;
+                }
+            }
+            if (last_geom >= 0)
+            {
+                mesh.fp_flange_start_layer = static_cast<LayerIndex>(
+                    std::max(LayerIndex(0), last_geom - static_cast<LayerIndex>(n_flange) + 1));
             }
         }
     }
@@ -863,7 +905,7 @@ void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
 {
     SliceLayer* layer = &mesh.layers[layer_nr];
     const double fp_phase = (layer_nr < mesh.fp_helix_phase.size()) ? mesh.fp_helix_phase[layer_nr] : 0.0;
-    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase);
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

@@ -99,7 +99,17 @@ void createLayerParts(SliceMeshStorage& mesh, Slicer* slicer)
     for (LayerIndex layer_nr = total_layers - 1; layer_nr >= 0; layer_nr--)
     {
         SliceLayer& layer_storage = mesh.layers[layer_nr];
-        if (layer_storage.parts.size() > 0 || (mesh.settings.get<ESurfaceMode>("magic_mesh_surface_mode") != ESurfaceMode::NORMAL && layer_storage.open_polylines.size() > 0))
+        // FeatherPrint prints open_polylines as real geometry (the Whip/slot boundary-edge
+        // case) even in NORMAL surface mode, unlike stock Cura where an open polyline only
+        // becomes printable geometry in a non-NORMAL magic_mesh_surface_mode. Without this,
+        // a boundary loop interrupted by a slot reaching the model's top/bottom — where the
+        // topmost layers have no closed `parts` at all, only open_polylines — silently caps
+        // layer_nr_max_filled_layer at the last closed-part layer, truncating gcode output
+        // for every layer above it even though WallsComputation generated valid toolpaths.
+        const bool fp_open_polylines_count = mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT && layer_storage.open_polylines.size() > 0;
+        if (layer_storage.parts.size() > 0
+            || (mesh.settings.get<ESurfaceMode>("magic_mesh_surface_mode") != ESurfaceMode::NORMAL && layer_storage.open_polylines.size() > 0)
+            || fp_open_polylines_count)
         {
             mesh.layer_nr_max_filled_layer = layer_nr; // last set by the highest non-empty layer
             break;

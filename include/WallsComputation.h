@@ -28,7 +28,7 @@ public:
      * \param settings The per-mesh settings object to get setting values from.
      * \param layer_nr The layer index that these walls are generated for.
      */
-    WallsComputation(const Settings& settings, const LayerIndex layer_nr, double fp_helix_phase = 0.0);
+    WallsComputation(const Settings& settings, const LayerIndex layer_nr, double fp_helix_phase = 0.0, LayerIndex fp_flange_start_layer = -1);
 
     /*!
      * \brief Generates the walls / inner area for all parts in a layer.
@@ -52,6 +52,7 @@ private:
      */
     const LayerIndex layer_nr_;
     const double fp_helix_phase_;
+    const LayerIndex fp_flange_start_layer_;
 
     /*!
      * Generates the walls / inner area for a single layer part.

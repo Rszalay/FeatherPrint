@@ -45,6 +45,13 @@ public:
      */
     VariableWidthLines generate(const Shape& outline, coord_t z, const Settings& settings, double helix_phase = 0.0);
 
+    /*!
+     * Generate the Flange wall stack for one closed-boundary-loop layer.
+     * ramp_index: 0 = innermost (first) Flange layer, n-1 = topmost brim layer.
+     * Returns multiple closed ExtrusionLines (one per Wall), innermost first, outermost last.
+     */
+    VariableWidthLines generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase = 0.0);
+
     // Parameters shared across all open-polyline arcs on the same layer.
     // Computed once from the full virtual ring (all arcs + gap chords) so that
     // every arc uses a consistent perimeter length, reference angle, and centroid.
@@ -62,6 +69,21 @@ public:
      * params carries the full-ring geometry shared across all arcs on this layer.
      */
     VariableWidthLines generateOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, double helix_phase, const OpenLayerParams& params);
+
+    /*!
+     * Generate the Flange wall stack for one Layer where the boundary loop is interrupted
+     * by a boundary edge (a slot/hole reaching the open top) — the Miter case. open_poly is
+     * the single open arc for this Layer (same input generateOpen takes). The outer Wall is
+     * closed with an ordinary Whip Terminal at each end, continuing the same Terminal column
+     * as ordinary Whip layers below the Flange. Inner Walls (including the innermost, which
+     * also carries Flare Rim insertion) are left open at both ends per the Miter rule — no
+     * distinct Miter geometry is generated; the outer Wall's Terminal is relied on to weld
+     * the inner Walls' open ends as a side effect of print-order (inner Walls first, outer
+     * Wall last — the caller must reverse the usual Flange print order for this Layer).
+     * Does not yet insert Flare Rims (first pass: get the wall-stack + Miter terminal
+     * behaviour generating correctly before layering in Stringer/Lacing integration).
+     */
+    VariableWidthLines generateFlangeOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_index, double helix_phase, const OpenLayerParams& params);
 
     /*!
      * Returns the world-space position of the seam (helix 0 departure) for this layer.
@@ -93,6 +115,39 @@ private:
     static Point2LL centroidBbox(const Polygon& poly);
     static const Polygon* largestPoly(const Shape& shape);
 
+    // One Wall of a Flange's wall stack: offset = inward distance from the OML to the
+    // Wall's own toolpath centreline (µm); width = the Wall's own extrusion width (µm).
+    struct FlangeWallDesc
+    {
+        coord_t offset;
+        coord_t width;
+    };
+
+    // Shared by generateFlange() and generateFlangeOpen(): the Flange build-up rule from
+    // the spec (1.5w at ramp 0, +0.5w total thickness per ramp layer thereafter), returned
+    // outer-first (index 0 = outer Wall, back() = innermost Wall).
+    static std::vector<FlangeWallDesc> buildFlangeWallStack(int ramp_index, coord_t w);
+
+    // Maps a Wall's position in the outer-first wall-stack array (wi: 0=outer..n_walls-1=
+    // inner) to the inset_idx that controls its actual print order (ascending inset_idx =
+    // later in print order, per InsetOrderOptimizer's inside_out convention — see
+    // FffPolygonGenerator's forced optimize_wall_printing_order=false/inset_direction=
+    // inside_out override for FeatherPrint meshes). The OML (wi=0) always gets inset_idx 0
+    // (prints last, required for the Miter weld). The IML (wi=n_walls-1) gets inset_idx 1
+    // (prints second-to-last, not first) — it's the Wall most likely to be printing over an
+    // overhang and benefits from having the other inner/middle Walls already laid down for
+    // adhesion. Any buried middle Walls fill inset_idx 2..n_walls-1 (printed earliest, order
+    // among themselves doesn't matter). Degenerates to the plain outer-then-inner-last order
+    // when there are 2 or fewer Walls (no middle Walls to reorder around).
+    static int flangePrintInsetIdx(int wi, int n_walls);
+
+    // Approximates a perpendicular polygon offset by moving each point radially toward/away
+    // from the centroid by `offset` (inward positive) — consistent with the same
+    // radial-from-centroid approximation the Conformal Placement Transform already uses
+    // everywhere else, and the only practical option for offsetting an OPEN polyline (Clipper
+    // offsetting is only defined for closed Shapes).
+    static OpenPolyline radialOffsetOpen(const OpenPolyline& poly, const Point2LL& centroid, coord_t offset);
+
     static void appendPolySegment(ExtrusionLine& line, const ArcParam& arc,
                                   double s0, double s1, coord_t w, bool add_start);
 
@@ -114,6 +169,9 @@ private:
                                    double theta_anchor, double R_a,
                                    const Point2LL& centroid, const ArcParam& arc,
                                    coord_t w, bool skip_first = false);
+
+    // Ray from centroid at angle theta; returns arc-length of first polygon intersection, or -1.
+    static double arcLengthAtAngle(const ArcParam& arc, const Point2LL& centroid, double theta);
 
     static void appendTrace(ExtrusionLine& line,
                             double theta_anchor, double R_a,
@@ -146,6 +204,25 @@ private:
                                   double theta_anchor, double R_a,
                                   const Point2LL& centroid, const ArcParam& arc,
                                   coord_t w);
+
+    // Flare Rim (Stringer/Lacing × Flange) — flat-bottomed filleted channel anchored at
+    // (0,0) on the true OML (the outer wall's own toolpath centreline), so the channel
+    // bottom stays pinned at a fixed 2.5w below the true OML regardless of the Flange's
+    // current wall-stack thickness:
+    //   T       = toolpath-centreline-to-toolpath-centreline OML-to-IML distance (w-units)
+    //   D = 2.5 - T (channel depth below the true OML), R = 0.75 * (D / 2.5)
+    //   W       = 2.0 for a Stringer anchor, 3.0 for a Lacing anchor (flat span at y=-T)
+    //   oml_shift = the gap (w-units) between oml_arc's own ly=0 reference (the raw slice
+    //               polygon) and the true OML — 0 except at the first Flange ramp layer,
+    //               where the outer wall is a half-width wall offset outward of the raw
+    //               polygon. Every canonical y-value is placed at (y - oml_shift) in
+    //               oml_arc's own frame so the profile still anchors to the true OML.
+    // theta_anchor/R_a must be evaluated against the OML (oml_arc), not the innermost wall,
+    // and oml_arc must also be passed as the `arc` used for the profile's radial reference.
+    static void appendFlareRim(ExtrusionLine& line,
+                               double theta_anchor, double R_a, double x_sign,
+                               const Point2LL& centroid, const ArcParam& oml_arc,
+                               double T, double oml_shift, double W, coord_t w, bool skip_first = false);
 
     struct Anchor
     {

@@ -1211,9 +1211,10 @@
                 "optimize_wall_printing_order":
                 {
                     "label": "Optimize Wall Printing Order",
-                    "description": "Optimize the order in which walls are printed so as to reduce the number of retractions and the distance travelled. Most parts will benefit from this being enabled but some may actually take longer so please compare the print time estimates with and without optimization. First layer is not optimized when choosing brim as build plate adhesion type.",
+                    "description": "Optimize the order in which walls are printed so as to reduce the number of retractions and the distance travelled. Most parts will benefit from this being enabled but some may actually take longer so please compare the print time estimates with and without optimization. First layer is not optimized when choosing brim as build plate adhesion type. Forced off for FeatherPrint meshes: the geometric-containment-based ordering this enables ('middle walls first') doesn't reliably recognize the nesting of FeatherPrint's Flange/Miter walls, and the Miter weld structurally requires the OML (outer Wall) to print strictly last, which only the simple inset-order path (this setting off) guarantees.",
                     "type": "bool",
                     "default_value": true,
+                    "value": "False if infill_pattern == 'featherprint' else True",
                     "settable_per_mesh": true
                 },
                 "inset_direction":
@@ -2308,44 +2309,6 @@
                     "limit_to_extruder": "infill_extruder_nr",
                     "settable_per_mesh": true
                 },
-                "featherprint_line_width":
-                {
-                    "label": "FeatherPrint Line Width",
-                    "description": "Extrusion line width used for the FeatherPrint stringer and skin paths. Should match the nozzle diameter.",
-                    "type": "float",
-                    "unit": "mm",
-                    "default_value": 0.4,
-                    "minimum_value": "0.1",
-                    "maximum_value": "2.0",
-                    "enabled": "infill_pattern == 'featherprint'",
-                    "settable_per_mesh": true,
-                    "settable_globally": true
-                },
-                "featherprint_stringer_count":
-                {
-                    "label": "FeatherPrint Stringer Count",
-                    "description": "Number of stringer helices running around the perimeter. Stringers are evenly spaced at equal arc-length intervals on the perimeter.",
-                    "type": "int",
-                    "default_value": 4,
-                    "minimum_value": "1",
-                    "maximum_value": "32",
-                    "enabled": "infill_pattern == 'featherprint'",
-                    "settable_per_mesh": true,
-                    "settable_globally": true
-                },
-                "featherprint_helix_angle":
-                {
-                    "label": "FeatherPrint Helix Angle",
-                    "description": "Half-angle of the geodesic diamond pattern in degrees. Controls how steeply the helices rise; 45° gives square diamonds. Pitch is computed per-layer from this angle and the instantaneous perimeter so the intersection angle stays constant across tapers.",
-                    "type": "float",
-                    "unit": "°",
-                    "default_value": 45.0,
-                    "minimum_value": "1.0",
-                    "maximum_value": "89.0",
-                    "enabled": "infill_pattern == 'featherprint'",
-                    "settable_per_mesh": true,
-                    "settable_globally": true
-                },
                 "infill_multiplier":
                 {
                     "label": "Infill Line Multiplier",
@@ -2735,6 +2698,76 @@
                     "default_value": "start_closest",
                     "limit_to_extruder": "infill_extruder_nr",
                     "settable_per_mesh": true
+                }
+            }
+        },
+        "featherprint":
+        {
+            "label": "FeatherPrint",
+            "icon": "Experiment",
+            "description": "Settings for FeatherPrint, a conformal geodetic-net infill pattern activated via Infill Pattern. Select 'FeatherPrint' under Infill > Infill Pattern to enable it; the settings below then control the resulting Stringer, Flange, and helix geometry.",
+            "type": "category",
+            "children":
+            {
+                "featherprint_line_width":
+                {
+                    "label": "FeatherPrint Line Width",
+                    "description": "Extrusion line width used for the FeatherPrint stringer and skin paths. Should match the nozzle diameter.",
+                    "type": "float",
+                    "unit": "mm",
+                    "default_value": 0.4,
+                    "minimum_value": "0.1",
+                    "maximum_value": "2.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_stringer_count":
+                {
+                    "label": "FeatherPrint Stringer Count",
+                    "description": "Number of stringer helices running around the perimeter. Stringers are evenly spaced at equal arc-length intervals on the perimeter.",
+                    "type": "int",
+                    "default_value": 4,
+                    "minimum_value": "1",
+                    "maximum_value": "32",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_helix_angle":
+                {
+                    "label": "FeatherPrint Helix Angle",
+                    "description": "Half-angle of the geodesic diamond pattern in degrees. Controls how steeply the helices rise; 45° gives square diamonds. Pitch is computed per-layer from this angle and the instantaneous perimeter so the intersection angle stays constant across tapers.",
+                    "type": "float",
+                    "unit": "°",
+                    "default_value": 45.0,
+                    "minimum_value": "1.0",
+                    "maximum_value": "89.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_flange_enabled":
+                {
+                    "label": "FeatherPrint Flange Enabled",
+                    "description": "Generate a Flange (multi-wall gluing brim) over the top featherprint_flange_ramp_layers layers of the model. Always applies unconditionally when enabled, regardless of whether the top is actually open — disable this for models with a genuinely closed top (e.g. a nose cone), where no Flange should be generated.",
+                    "type": "bool",
+                    "default_value": true,
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_flange_ramp_layers":
+                {
+                    "label": "FeatherPrint Flange Ramp Layers",
+                    "description": "Number of layers over which the Flange builds up at the top of the model. Each layer adds w/2 of inward wall thickness. The topmost layer is the gluing brim.",
+                    "type": "int",
+                    "default_value": 4,
+                    "minimum_value": "1",
+                    "maximum_value": "20",
+                    "enabled": "infill_pattern == 'featherprint' and featherprint_flange_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
                 }
             }
         },

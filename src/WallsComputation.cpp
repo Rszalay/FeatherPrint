@@ -7,6 +7,7 @@
 #include <iostream>
 
 #include <fmt/format.h>
+#include <spdlog/spdlog.h>
 #include <range/v3/to_container.hpp>
 #include <range/v3/view/c_str.hpp>
 #include <range/v3/view/join.hpp>
@@ -32,10 +33,11 @@
 namespace cura
 {
 
-WallsComputation::WallsComputation(const Settings& settings, const LayerIndex layer_nr, double fp_helix_phase)
+WallsComputation::WallsComputation(const Settings& settings, const LayerIndex layer_nr, double fp_helix_phase, LayerIndex fp_flange_start_layer)
     : settings_(settings)
     , layer_nr_(layer_nr)
     , fp_helix_phase_(fp_helix_phase)
+    , fp_flange_start_layer_(fp_flange_start_layer)
 {
 }
 
@@ -66,7 +68,19 @@ void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_t
                 gen_outline = Shape(part->outline);
 
             FeatherPrintGenerator fp;
-            part->wall_toolpaths = { fp.generate(gen_outline, z_coord, settings_, fp_helix_phase_) };
+            const bool is_flange_layer = (fp_flange_start_layer_ >= 0
+                                          && layer_nr_ >= fp_flange_start_layer_);
+            VariableWidthLines wl;
+            if (is_flange_layer)
+            {
+                const int ramp_index = static_cast<int>(layer_nr_ - fp_flange_start_layer_);
+                wl = fp.generateFlange(gen_outline, settings_, ramp_index, fp_helix_phase_);
+            }
+            else
+            {
+                wl = fp.generate(gen_outline, z_coord, settings_, fp_helix_phase_);
+            }
+            part->wall_toolpaths = { std::move(wl) };
             part->inner_area    = Shape{};
             part->print_outline = part->outline;
 
@@ -204,6 +218,7 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             oa.start_angle = std::atan2(dy, dx);
             arcs.push_back(std::move(oa));
         }
+        spdlog::info("FP-DIAG WallsComputation layer z={}: open_polylines={} arcs_built={}", layer->printZ, layer->open_polylines.size(), arcs.size());
         if (arcs.empty()) return;
         std::sort(arcs.begin(), arcs.end(),
             [](const OrientedArc& a, const OrientedArc& b) { return a.start_angle < b.start_angle; });
@@ -271,7 +286,18 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             params.full_ring_arc_ref  = full_ring_arc_ref;
             params.arc_start_in_ring  = cum_len[arc_vertex_start[ai]];
 
-            VariableWidthLines wl = fp.generateOpen(arcs[ai].poly, layer->printZ, settings_, fp_helix_phase_, params);
+            const bool is_flange_layer = (fp_flange_start_layer_ >= 0 && layer_nr_ >= fp_flange_start_layer_);
+            VariableWidthLines wl;
+            if (is_flange_layer)
+            {
+                const int ramp_index = static_cast<int>(layer_nr_ - fp_flange_start_layer_);
+                wl = fp.generateFlangeOpen(arcs[ai].poly, layer->printZ, settings_, ramp_index, fp_helix_phase_, params);
+            }
+            else
+            {
+                wl = fp.generateOpen(arcs[ai].poly, layer->printZ, settings_, fp_helix_phase_, params);
+            }
+            spdlog::info("FP-DIAG   arc {}/{} z={} poly_pts={} flange={} -> wl_lines={}", ai, arcs.size(), layer->printZ, arcs[ai].poly.size(), is_flange_layer, wl.size());
             if (wl.empty()) continue;
 
             coord_t min_x = arcs[ai].poly[0].X, max_x = arcs[ai].poly[0].X;

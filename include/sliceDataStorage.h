@@ -315,6 +315,11 @@ public:
     // instantaneous approximation, giving constant intersection angle on tapered tubes.
     std::vector<double> fp_helix_phase;
 
+    // FeatherPrint: first layer index of the Flange zone (-1 = no Flange detected).
+    // Layers [fp_flange_start_layer, layer_nr_max_filled_layer] are Flange layers.
+    // Set during the helix pre-pass in FffPolygonGenerator.
+    LayerIndex fp_flange_start_layer{ -1 };
+
     std::vector<AngleDegrees> infill_angles; //!< a list of angle values which is cycled through to determine the infill angle of each layer
     std::vector<AngleDegrees> roofing_angles; //!< a list of angle values which is cycled through to determine the roofing angle of each layer
     std::vector<AngleDegrees> flooring_angles; //!< a list of angle values which is cycled through to determine the flooring angle of each layer

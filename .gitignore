@@ -83,3 +83,6 @@ installer_output/
 CuraEngine_*.md
 BUILD_LOG
 installer_output/
+
+## Claude Code local settings (machine-specific, not shared project config)
+.claude/
