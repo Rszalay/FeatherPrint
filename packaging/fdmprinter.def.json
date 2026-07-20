@@ -2768,6 +2768,71 @@
                     "enabled": "infill_pattern == 'featherprint' and featherprint_flange_enabled",
                     "settable_per_mesh": true,
                     "settable_globally": true
+                },
+                "featherprint_stringer_depth":
+                {
+                    "label": "FeatherPrint Stringer Depth",
+                    "description": "Inward depth of the Stringer Trace loop, in multiples of the FeatherPrint line width (the Parametric Canonical Toolpaths Point Table's D).",
+                    "type": "float",
+                    "unit": "x line width",
+                    "default_value": 2.5,
+                    "minimum_value": "0.5",
+                    "maximum_value": "10.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_stringer_width":
+                {
+                    "label": "FeatherPrint Stringer Width",
+                    "description": "Total width of the Stringer Trace's perimeter cutout, in multiples of the FeatherPrint line width (Spec REV 2.0's Point Table: R2 = W/2, R1 = R2 + Gap — R1 cannot degenerate to zero or negative for any positive Width). Also sets the Whip Terminal's radii (R1, R2 \"match to Stringer\") and the Flare Rim's Width wherever a Stringer anchor collides with a Flange. featherprint_stringer_depth must be at least Width + Gap (0.5) or the profile's connecting segments invert.",
+                    "type": "float",
+                    "unit": "x line width",
+                    "default_value": 1.5,
+                    "minimum_value": "0.2",
+                    "maximum_value": "5.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_lacing_depth":
+                {
+                    "label": "FeatherPrint Lacing Depth",
+                    "description": "Inward depth of the Lacing Trace (the S-link substituted where CCW and CW Stringer helices meet), in multiples of the FeatherPrint line width.",
+                    "type": "float",
+                    "unit": "x line width",
+                    "default_value": 2.5,
+                    "minimum_value": "0.5",
+                    "maximum_value": "10.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_lacing_width":
+                {
+                    "label": "FeatherPrint Lacing Width",
+                    "description": "Total lateral span of the Lacing Trace, in multiples of the FeatherPrint line width.",
+                    "type": "float",
+                    "unit": "x line width",
+                    "default_value": 3.0,
+                    "minimum_value": "0.5",
+                    "maximum_value": "8.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_flare_depth":
+                {
+                    "label": "FeatherPrint Flare Depth",
+                    "description": "Depth parameter (D) of the Flare Rim channel embedded in a Flange layer's innermost Wall wherever a Stringer or Lacing anchor collides with the Flange. The channel's actual fillet radius is D minus the current layer's Wall count, so the channel shallows out as the Flange thickens.",
+                    "type": "float",
+                    "unit": "x line width",
+                    "default_value": 2.5,
+                    "minimum_value": "0.5",
+                    "maximum_value": "10.0",
+                    "enabled": "infill_pattern == 'featherprint' and featherprint_flange_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
                 }
             }
         },

@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <numbers>
 
 #include "utils/AABB.h"
@@ -12,6 +15,22 @@
 
 namespace cura
 {
+
+// TEMPORARY diagnostic logging for the Whip Terminal malformed-loop investigation — writes to
+// %TEMP%\FeatherPrint_debug.log (unelevated-safe, unlike C:\ root). Remove once resolved.
+static void fpDebugLog(const std::string& msg)
+{
+    const char* tmp = std::getenv("TEMP");
+    if (! tmp) return;
+    std::string path = std::string(tmp) + "\\FeatherPrint_debug.log";
+    if (FILE* f = std::fopen(path.c_str(), "a"))
+    {
+        std::fwrite(msg.data(), 1, msg.size(), f);
+        std::fputc('\n', f);
+        std::fclose(f);
+    }
+}
+static coord_t g_fp_debug_z = 0; // set by generateOpen/generateFlangeOpen before Terminal calls, for logging only
 
 // ============================================================================
 // ArcParam helpers
@@ -107,13 +126,27 @@ Point2LL FeatherPrintGenerator::ArcParam::tangentAt(double s) const
     {
         int j = (i + 1) % n;
         if (is_open && j == 0) break;
+        double seg_start = cum_len[i];
         double seg_end = (j == 0) ? total : cum_len[j];
+        // Skip degenerate (near-zero-length, duplicate-vertex) segments — a coincident vertex
+        // pair from slicing yields a zero tangent here, and resolveFrame's fallback for that
+        // substitutes an arbitrary (1,0) direction unrelated to the real local skin, producing
+        // an isolated, layer-specific malformed Terminal loop. Falling through to the next real
+        // segment gives the true local direction instead.
+        if (seg_end - seg_start <= 1e-6) continue;
         if (s <= seg_end + 1e-6)
         {
             const Point2LL& a = (*poly)[i];
             const Point2LL& b = (*poly)[j];
             return b - a;
         }
+    }
+    // All remaining segments were degenerate (or s is past the last real one) — walk backward
+    // from the end for the last non-degenerate segment instead of returning a zero vector.
+    for (int i = n - 2; i >= 0; i--)
+    {
+        Point2LL d = (*poly)[i + 1] - (*poly)[i];
+        if (std::abs(d.X) > 0 || std::abs(d.Y) > 0) return d;
     }
     return is_open ? ((*poly)[n - 1] - (*poly)[n - 2]) : ((*poly)[1] - (*poly)[0]);
 }
@@ -203,52 +236,126 @@ void FeatherPrintGenerator::appendPolySegment(
 }
 
 // ============================================================================
-// Conformal Placement Transform (spec: FeatherPrint_ConformalPlacement_Spec.md)
+// Skin-Normal Tangent-Blend Placement (Self-Reference/03-conformal-placement-transform.md
+// "Skin-Normal Variant" — replaces the earlier centroid-radial transform)
 // ============================================================================
 
-double FeatherPrintGenerator::ArcParam::radiusAt(const Point2LL& centroid, double theta) const
+FeatherPrintGenerator::TangentFrame FeatherPrintGenerator::resolveFrame(
+    const ArcParam& arc, const Point2LL& centroid, double s)
 {
-    const double cos_t = std::cos(theta), sin_t = std::sin(theta);
-    const int n = static_cast<int>(poly->size());
-    for (int i = 0; i < n; i++)
+    // s is resolved directly from the real perimeter's own arc-length parametrization (by the
+    // caller, from the anchor's arc-length +/- a physical offset) — no angle/ray-cast involved,
+    // so there is no distortion from local curvature or the point's angle relative to centroid.
+    // pointAt/tangentAt are total (clamped for open polylines, wrapped for closed ones), so
+    // there's no ray-cast-miss case to fall back from either.
+    Point2LL S = arc.pointAt(s);
+
+    // Tangent is sampled over a small arc-length WINDOW (pointAt(s-w)..pointAt(s+w)) rather
+    // than read off the single polyline segment straddling s. A raw single-segment tangent
+    // is sensitive to sub-millimeter mesh-slicing discretization noise: consecutive slice
+    // layers land their boundary-edge vertices at slightly different spots along a curved
+    // (e.g. hole) edge, so a real but tiny (5-25 degree) vertex kink can sit right next to a
+    // Terminal/Trace anchor on some layers and not others, even though the underlying model
+    // geometry is unchanged layer-to-layer. Averaging over a window smooths that out while
+    // still tracking genuine, larger-scale skin curvature.
+    constexpr double kTangentWindowHalf = 300.0; // 0.3mm each side
+    Point2LL Plo = arc.pointAt(s - kTangentWindowHalf);
+    Point2LL Phi = arc.pointAt(s + kTangentWindowHalf);
+    Point2LL Tv = Phi - Plo;
+    double tx = static_cast<double>(Tv.X), ty = static_cast<double>(Tv.Y);
+    double tlen = std::sqrt(tx * tx + ty * ty);
+    if (tlen < 1e-6)
     {
-        int j = (i + 1) % n;
-        if (is_open && j == 0) continue; // no closing segment for open polylines
-        double ax = (*poly)[i].X - centroid.X, ay = (*poly)[i].Y - centroid.Y;
-        double bx = (*poly)[j].X - centroid.X, by = (*poly)[j].Y - centroid.Y;
-        double ex = bx - ax, ey = by - ay;
-        double denom = sin_t * ex - cos_t * ey;
-        if (std::abs(denom) < 1e-6) continue;
-        double t_val = (ay * ex - ax * ey) / denom;
-        double s_val = (ay * cos_t - ax * sin_t) / denom;
-        if (t_val > 1e-6 && s_val >= -1e-9 && s_val <= 1.0 + 1e-9)
-            return t_val;
+        // Window collapsed to (near-)zero length — fall back to the raw single-segment
+        // tangent (e.g. very short open polyline, or window clamped against both open ends).
+        Tv = arc.tangentAt(s);
+        tx = static_cast<double>(Tv.X); ty = static_cast<double>(Tv.Y);
+        tlen = std::sqrt(tx * tx + ty * ty);
     }
-    // Fallback: return Euclidean distance from centroid to nearest endpoint
-    const Point2LL& fp = is_open ? (*poly)[n - 1] : (*poly)[0];
-    double fx = fp.X - centroid.X, fy = fp.Y - centroid.Y;
-    return std::sqrt(fx * fx + fy * fy);
+    if (tlen < 1e-6) { tx = 1.0; ty = 0.0; tlen = 1.0; }
+    tx /= tlen; ty /= tlen;
+
+    // Orient T to match the anchor formula's CCW-increasing-theta convention (x_sign=+1
+    // moves toward increasing theta), regardless of the underlying polygon's actual stored
+    // vertex order. Expected CCW tangent at S = the outward radial vector (S-centroid)
+    // rotated +90 degrees in the same atan2(dy,dx) sense theta itself is measured in:
+    // d/dtheta (r*cos(theta), r*sin(theta)) is proportional to (-sin(theta), cos(theta)),
+    // i.e. the radial vector rotated +90 degrees. If tangentAt(s) runs the other way
+    // (polygon stored CW), flip it — otherwise every feature's along-perimeter placement
+    // runs backwards relative to the skin.
+    double rx = static_cast<double>(S.X - centroid.X);
+    double ry = static_cast<double>(S.Y - centroid.Y);
+    double ex = -ry, ey = rx;
+    if (tx * ex + ty * ey < 0.0) { tx = -tx; ty = -ty; }
+
+    // Inward normal: tangent rotated 90°, sign resolved so it always points toward the
+    // centroid — robust regardless of polygon winding, rather than assuming CCW.
+    double nx = -ty, ny = tx;
+    double cdx = static_cast<double>(centroid.X - S.X);
+    double cdy = static_cast<double>(centroid.Y - S.Y);
+    if (nx * cdx + ny * cdy < 0.0) { nx = -nx; ny = -ny; }
+
+    return TangentFrame{ S, tx, ty, nx, ny };
 }
 
-Point2LL FeatherPrintGenerator::conformPlace(
-    double lx, double ly, double x_sign,
-    double theta_anchor, double R_a,
+FeatherPrintGenerator::BlendPlacement FeatherPrintGenerator::buildBlendPlacement(
+    double theta_anchor, double R_a, double x_sign,
+    double x_s, double x_e,
     const Point2LL& centroid, const ArcParam& arc, coord_t w)
 {
-    double theta = theta_anchor + x_sign * lx * w / R_a;
-    double r     = arc.radiusAt(centroid, theta) + ly * w; // ly < 0 = inward
+    (void)R_a; // no longer used to derive width — retained in the signature since every call
+               // site still computes it for theta_anchor's own resolution alongside R_a.
+
+    // Anchor's own arc-length. theta_anchor is still angle/ray-cast-resolved (that's the
+    // anchor DISTRIBUTION concern, unaffected by this), but Copy A/B are placed by walking the
+    // real perimeter's own arc-length from there — no ray-cast round-trip, so no curvature/
+    // angle-dependent distortion of the physical width between them.
+    double s_anchor = arcLengthAtAngle(arc, centroid, theta_anchor);
+    if (s_anchor < 0.0)
+        s_anchor = 0.0;
+
+    const double s_s = s_anchor + x_sign * x_s * w;
+    const double s_e = s_anchor + x_sign * x_e * w;
+    BlendPlacement bp;
+    bp.A = resolveFrame(arc, centroid, s_s);
+    bp.B = resolveFrame(arc, centroid, s_e);
+    bp.x_s = x_s;
+    bp.x_e = x_e;
+    bp.x_sign = x_sign;
+    return bp;
+}
+
+Point2LL FeatherPrintGenerator::BlendPlacement::place(double lx, double ly, coord_t w) const
+{
+    // Per spec: Copy A places the feature's OWN Start point (lx=x_s) exactly onto S(theta_start)
+    // with no further offset; Copy B places lx=x_e exactly onto S(theta_end). That means each
+    // copy's translation along T must be measured RELATIVE TO ITS OWN ANCHOR (lx-x_s for A,
+    // lx-x_e for B) — not raw lx for both, which double-counts the anchor's own offset (S_A/S_B
+    // are already offset from the feature's theta_anchor by x_sign*x_s*w / x_sign*x_e*w
+    // respectively, via buildBlendPlacement's theta_s/theta_e) and was producing world
+    // separations roughly double the intended canonical size for points sitting at the blend
+    // range's own extremes.
+    const double t = (x_e != x_s) ? (lx - x_s) / (x_e - x_s) : 0.0;
+    const double wl_a = (lx - x_s) * static_cast<double>(w) * x_sign;
+    const double wl_b = (lx - x_e) * static_cast<double>(w) * x_sign;
+    const double wd = ly * static_cast<double>(w);
+
+    const double ax = static_cast<double>(A.S.X) + wl_a * A.tx + wd * A.nx;
+    const double ay = static_cast<double>(A.S.Y) + wl_a * A.ty + wd * A.ny;
+    const double bx = static_cast<double>(B.S.X) + wl_b * B.tx + wd * B.nx;
+    const double by = static_cast<double>(B.S.Y) + wl_b * B.ty + wd * B.ny;
+
     return Point2LL(
-        centroid.X + static_cast<coord_t>(r * std::cos(theta)),
-        centroid.Y + static_cast<coord_t>(r * std::sin(theta)));
+        static_cast<coord_t>(ax + t * (bx - ax)),
+        static_cast<coord_t>(ay + t * (by - ay)));
 }
 
 void FeatherPrintGenerator::appendCanonicalArc(
     ExtrusionLine& line,
     double cx, double cy, double R,
     double a_start_deg, double a_end_deg,
-    bool cw_arc, int segs, double x_sign,
-    double theta_anchor, double R_a,
-    const Point2LL& centroid, const ArcParam& arc,
+    bool cw_arc, int segs,
+    const BlendPlacement& blend,
     coord_t w, bool skip_first)
 {
     const double deg2rad = std::numbers::pi / 180.0;
@@ -276,7 +383,7 @@ void FeatherPrintGenerator::appendCanonicalArc(
         double angle = cw_arc ? (a_start - t * span) : (a_start + t * span);
         double lx    = cx + R * std::cos(angle);
         double ly    = cy + R * std::sin(angle);
-        line.junctions_.emplace_back(conformPlace(lx, ly, x_sign, theta_anchor, R_a, centroid, arc, w), w, 0);
+        line.junctions_.emplace_back(blend.place(lx, ly, w), w, 0);
     }
 }
 
@@ -299,8 +406,16 @@ void FeatherPrintGenerator::appendCanonicalArc(
 
 double FeatherPrintGenerator::arcLengthAtAngle(const ArcParam& arc, const Point2LL& centroid, double theta)
 {
+    // Ray-cast from the centroid at angle theta; the boundary can be non-star-shaped (holes,
+    // concave teeth), so a single ray may cross it more than once. Must take the intersection
+    // NEAREST the centroid (smallest positive t_val along the ray), not the first one found in
+    // vertex order — picking an arbitrary far-side hit (e.g. across a hole) here silently
+    // resolves a tangent frame to the wrong location, which showed up as a Whip Terminal loop
+    // blown up and projecting past the skin into a nearby hole.
     const double cos_t = std::cos(theta), sin_t = std::sin(theta);
     const int n = static_cast<int>(arc.poly->size());
+    double best_t = -1.0;
+    double best_s = -1.0;
     for (int i = 0; i < n; i++)
     {
         int j = (i + 1) % n;
@@ -314,11 +429,15 @@ double FeatherPrintGenerator::arcLengthAtAngle(const ArcParam& arc, const Point2
         double s_val = (ay * cos_t - ax * sin_t) / denom;
         if (t_val > 1e-6 && s_val >= -1e-9 && s_val <= 1.0 + 1e-9)
         {
-            double seg_end = (j == 0) ? arc.total : arc.cum_len[j];
-            return arc.cum_len[i] + s_val * (seg_end - arc.cum_len[i]);
+            if (best_t < 0.0 || t_val < best_t)
+            {
+                double seg_end = (j == 0) ? arc.total : arc.cum_len[j];
+                best_t = t_val;
+                best_s = arc.cum_len[i] + s_val * (seg_end - arc.cum_len[i]);
+            }
         }
     }
-    return -1.0;
+    return best_s;
 }
 
 std::vector<FeatherPrintGenerator::FlangeWallDesc> FeatherPrintGenerator::buildFlangeWallStack(int ramp_index, coord_t w)
@@ -402,6 +521,10 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
     // ---- Compute Stringer/Lacing anchor positions on OML for Flare Rim insertion ----
     const Polygon* oml_poly = largestPoly(outline);
     const int N = settings.get<int>("featherprint_stringer_count");
+    // Flare Rim's Width matches the colliding feature's own Width (Spec REV 2.0), not a
+    // fixed literal.
+    const double stringer_flare_W = settings.get<double>("featherprint_stringer_width");
+    const double lacing_flare_W   = settings.get<double>("featherprint_lacing_width");
 
     // theta/R_oml are evaluated on the OML (per spec, the Flare Rim is anchored there, not on
     // the innermost wall); s_left/s_right cut the innermost wall's own perimeter walk at the
@@ -410,23 +533,32 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
     struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
     std::vector<FlareAnchor> flare_anchors;
 
-    // Q per the Flare Rim spec is toolpath-CENTRELINE-to-toolpath-centreline (the outer
-    // wall's own toolpath centre to the innermost wall's toolpath centre) — NOT the full
-    // physical OML-face-to-IML-face span. Compute it directly from the actual constructed
-    // wall offsets rather than the (1.5 + 0.5*ramp_index) physical-span formula, since the
-    // outer wall is only full-width (offset=0) from ramp 1 onward — at ramp 0 it's a
-    // half-width wall offset outward by w/4, so a constant correction is wrong there.
-    const FlangeWallDesc& wd_outer_layer = walls_outer_first.front();
+    // Q per the WIP Parametric Canonical Toolpaths doc's Flare Rim table is the "Wall Number".
+    // A plain Wall COUNT under-charges any ramp layer whose stack includes a half-width Wall
+    // (the outer half-wall at ramp 0, or a buried half-wall at even ramp indices >= 2) — e.g.
+    // ramp 2's 3-Wall stack (full+half+full = 2.5w) would score the same Q=3 as ramp 3's
+    // 3-Wall stack (full+full+full = 3.0w), even though ramp 2's stack is only 2.5w thick.
+    // Sum each Wall's own width instead, giving the stack's true thickness in w-units. The
+    // innermost Wall itself is excluded from the sum — oml_shift already anchors Start/End at
+    // the innermost Wall's own centreline, so Q should only cover the Walls OUTSIDE it (already
+    // consumed depth before the Rim's own channel begins); including the innermost Wall's own
+    // width double-counted it, undershooting R1 by one Wall's width.
+    double Q = 0.0;
+    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
+        Q += static_cast<double>(walls_outer_first[wi].width) / static_cast<double>(w);
+    const double flare_D = settings.get<double>("featherprint_flare_depth");
     const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
-    const double Q_true = static_cast<double>(wd_inner_layer.offset - wd_outer_layer.offset) / static_cast<double>(w);
-    // arc_oml/oml_poly is the raw slice polygon (ly=0 reference), which coincides with the
-    // outer wall's own toolpath centreline only when its offset is 0 (true for ramp>=1, not
-    // ramp 0). This is the gap to add back when placing canonical y-values (which are
-    // defined relative to the true OML/outer-wall centreline) into arc_oml's own frame.
-    const double oml_shift = -static_cast<double>(wd_outer_layer.offset) / static_cast<double>(w);
-    // Flare Rim half-width in canonical lx (matches appendFlareRim's r = (2.5-Q_true)/2; the
-    // profile's widest points, Arc1/Arc4's departure points, sit at lx = ±(W/2 + r)).
-    const double flare_r = std::max(0.0, (2.5 - Q_true) / 2.0);
+    // Start/End (canonical y=0) must land where the surrounding ordinary innermost-Wall path
+    // actually runs — the innermost Wall's own offset from the OML — not at the OML itself.
+    // The previous version of this shift used the OUTER Wall's (near-zero) offset, which is
+    // only the right correction for arc_oml/oml_poly's own frame vs the true OML centreline;
+    // it left Start/End sitting essentially AT the OML while the ordinary wall_line segments
+    // on either side run at the innermost Wall's real (much deeper) offset, producing a large
+    // spurious jump/zigzag at every Flare anchor instead of a smooth local fillet.
+    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / static_cast<double>(w);
+    // The new single-fillet Flare Rim profile doesn't extend past its declared flat span
+    // W/2 (unlike the old dovetail's r-widened extent) — no extra collision widening needed.
+    const double flare_r = 0.0;
 
     if (oml_poly && oml_poly->size() >= 3 && N >= 1)
     {
@@ -451,12 +583,12 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
         std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
 
         // Two Stringer anchors must merge into one Lacing Rim once their *widened* Flare Rim
-        // footprints (±(1+flare_r) each, wider than the plain 1w Stringer Trace cutout) would
-        // physically overlap — not just when the plain-Trace threshold (w) is crossed. Using
-        // the unwidened threshold here left near-tip layers (small circumference, closely
-        // packed anchors) with two separate, overlapping/crossing Flare Rims instead of one
-        // merged Lacing Rim.
-        const double collision_w = (2.0 + 2.0 * flare_r) * w_d;
+        // footprints (each spanning the Stringer's own Flare Rim Width, wider than the plain
+        // 1w Stringer Trace cutout) would physically overlap — not just when the
+        // plain-Trace threshold (w) is crossed. Using the unwidened threshold here left
+        // near-tip layers (small circumference, closely packed anchors) with two separate,
+        // overlapping/crossing Flare Rims instead of one merged Lacing Rim.
+        const double collision_w = stringer_flare_W * w_d;
 
         const int total_anchors = static_cast<int>(oml_anchors.size());
         for (int i = 0; i < total_anchors; i++)
@@ -496,9 +628,10 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
                 if (R_oml < 1.0)
                     return;
                 // Project the Flare Rim's actual left/right endpoints (lx = ∓(W/2+flare_r),
-                // per conformPlace's angular formula) onto the innermost wall, not just the
-                // anchor's own theta — this is what appendFlareRim will itself emit as its
-                // first/last points, so the ordinary-wall walk must stop exactly there.
+                // per the transform's angular formula theta = theta_anchor + x_sign*lx*w/R_a)
+                // onto the innermost wall, not just the anchor's own theta — this is what
+                // appendFlareRim will itself emit as its first/last points, so the
+                // ordinary-wall walk must stop exactly there.
                 const double lx_max = W / 2.0 + flare_r;
                 const double theta_l = theta - lx_max * static_cast<double>(w) / R_oml;
                 const double theta_r = theta + lx_max * static_cast<double>(w) / R_oml;
@@ -517,9 +650,9 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
                     if (oa.pair_idx > i)
                     {
                         // Lacing anchor: midpoint between the two colliding Stringer anchors,
-                        // symmetric profile (x_sign=+1), W = 3w per spec.
+                        // symmetric profile (x_sign=+1), W = the Lacing's own Width setting.
                         double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
-                        addAnchor(s_mid, 1.0, 3.0);
+                        addAnchor(s_mid, 1.0, lacing_flare_W);
                     }
                     continue;
                 }
@@ -527,8 +660,8 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
                 // symmetric (unlike the ordinary teardrop Trace), so it needs no CW/CCW
                 // mirror — x_sign=-1 would instead reverse the low-s->high-s traversal
                 // direction the wall-walk cutout (s_left/s_right) assumes, stitching it in
-                // backwards for CW anchors. W = 2w.
-                addAnchor(oa.s, 1.0, 2.0);
+                // backwards for CW anchors. W = the Stringer's own Width setting.
+                addAnchor(oa.s, 1.0, stringer_flare_W);
             }
 
             std::sort(flare_anchors.begin(), flare_anchors.end(),
@@ -576,7 +709,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
                 // wall_line.empty() here (now false, since the call above already pushed
                 // points) skipped nothing and left a duplicate/jog at every rim's entry.
                 appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
-                               Q_true, oml_shift, fa.W, w, /*skip_first=*/true);
+                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
 
                 current_s = std::max(fa.s_right, s_depart);
             }
@@ -608,7 +741,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
     const OpenPolyline& open_poly, coord_t z, const Settings& settings,
     int ramp_index, double helix_phase, const OpenLayerParams& params)
 {
-    (void)z;
+    g_fp_debug_z = z;
     if (open_poly.size() < 2)
         return {};
 
@@ -619,17 +752,31 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
     const int N = settings.get<int>("featherprint_stringer_count");
     const double w_d = static_cast<double>(w);
 
+    const double stringer_D = settings.get<double>("featherprint_stringer_depth");
+    const double stringer_W = settings.get<double>("featherprint_stringer_width");
+    const double stringer_R2 = stringer_W / 2.0;
+    const double stringer_R1 = stringer_R2 + 0.5; // matches Stringer Trace's corrected R1=R2+G
+    const double flare_D = settings.get<double>("featherprint_flare_depth");
+    // Flare Rim's Width matches the colliding feature's own Width (Spec REV 2.0).
+    const double lacing_flare_W = settings.get<double>("featherprint_lacing_width");
+
     std::vector<FlangeWallDesc> walls_outer_first = buildFlangeWallStack(ramp_index, w);
     const Point2LL& centroid = params.centroid;
 
-    const FlangeWallDesc& wd_outer_layer = walls_outer_first.front();
     const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
-    // Same Q_true/oml_shift convention as generateFlange(): Q_true is the toolpath-centreline-
-    // to-toolpath-centreline OML-to-IML distance; oml_shift corrects for open_poly (the ly=0
-    // reference) not coinciding with the outer Wall's own centreline at ramp 0.
-    const double Q_true = static_cast<double>(wd_inner_layer.offset - wd_outer_layer.offset) / w_d;
-    const double oml_shift = -static_cast<double>(wd_outer_layer.offset) / w_d;
-    const double flare_r = std::max(0.0, (2.5 - Q_true) / 2.0);
+    // Same oml_shift convention as generateFlange(): Start/End (canonical y=0) must land at
+    // the innermost Wall's own offset from the OML — where the surrounding ordinary
+    // innermost-Wall path actually runs — not at the OML itself (see generateFlange's fuller
+    // comment on this fix).
+    // Q = the Wall stack's true thickness in w-units (sum of each Wall's own width), EXCLUDING
+    // the innermost Wall itself — see generateFlange's fuller comment on this fix.
+    double Q = 0.0;
+    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
+        Q += static_cast<double>(walls_outer_first[wi].width) / w_d;
+    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / w_d;
+    // The new single-fillet Flare Rim profile doesn't extend past its declared flat span
+    // W/2 (unlike the old dovetail's r-widened extent) — no extra collision widening needed.
+    const double flare_r = 0.0;
 
     // ---- Compute Stringer/Lacing anchors within this arc, for Flare Rim insertion ----
     ArcParam arc_oml = buildArcParamOpen(open_poly);
@@ -666,7 +813,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
         }
         std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
 
-        const double collision_w = (2.0 + 2.0 * flare_r) * w_d;
+        const double collision_w = stringer_W * w_d;
         const int total_anchors = static_cast<int>(oml_anchors.size());
         for (int i = 0; i < total_anchors; i++)
         {
@@ -717,11 +864,11 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
                     if (oa.pair_idx > i)
                     {
                         double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
-                        addAnchor(s_mid, 1.0, 3.0); // Lacing anchor, W=3w
+                        addAnchor(s_mid, 1.0, lacing_flare_W); // Lacing anchor, W = Lacing's own Width
                     }
                     continue;
                 }
-                addAnchor(oa.s, 1.0, 2.0); // ordinary Stringer anchor, W=2w (symmetric profile, no mirror needed)
+                addAnchor(oa.s, 1.0, stringer_W); // ordinary Stringer anchor, W = Stringer's own Width (symmetric profile, no mirror needed)
             }
             std::sort(flare_anchors.begin(), flare_anchors.end(),
                 [](const FlareAnchor& a, const FlareAnchor& b){ return a.s_left < b.s_left; });
@@ -750,9 +897,27 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
         {
             // Outer Wall: ordinary Whip Terminal at both ends, continuing the same Terminal
             // column as ordinary Whip layers below the Flange (Miter rule).
-            appendTerminal(wall_line, 0.0, +1.0, arc_w, centroid, wd.width, /*reversed=*/true);
-            appendPolySegment(wall_line, arc_w, 2.0 * w_d, s_end - 1.5 * w_d, wd.width, wall_line.empty());
-            appendTerminal(wall_line, s_end, -1.0, arc_w, centroid, wd.width, /*reversed=*/false);
+            //
+            // The canonical D/R1/R2/W values are defined in units of the true FeatherPrint line
+            // width (w), not this Wall's own printed width (wd.width) — at the first Flange ramp
+            // layer the outer Wall is a HALF-width Wall (wd.width = w/2), so scaling the
+            // Terminal's shape by wd.width shrank the whole loop to half its intended physical
+            // size there, opening a gap against the full-size Terminal in the ordinary Whip
+            // layer immediately below. Scale by w (matching every other Terminal call site) and
+            // only apply wd.width to the emitted junctions' own printed bead width afterward.
+            {
+                const size_t start1 = wall_line.junctions_.size();
+                appendTerminal(wall_line, 0.0, +1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/true);
+                for (size_t i = start1; i < wall_line.junctions_.size(); i++)
+                    wall_line.junctions_[i].w_ = wd.width;
+            }
+            appendPolySegment(wall_line, arc_w, stringer_W * w_d, s_end - stringer_R1 * w_d, wd.width, wall_line.empty());
+            {
+                const size_t start2 = wall_line.junctions_.size();
+                appendTerminal(wall_line, s_end, -1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/false);
+                for (size_t i = start2; i < wall_line.junctions_.size(); i++)
+                    wall_line.junctions_[i].w_ = wd.width;
+            }
         }
         else if (is_innermost && ! flare_anchors.empty())
         {
@@ -765,7 +930,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
                 appendPolySegment(wall_line, arc_w, current_s, s_depart, wd.width, wall_line.empty());
 
                 appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
-                               Q_true, oml_shift, fa.W, w, /*skip_first=*/true);
+                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
 
                 current_s = std::min(std::max(fa.s_right, s_depart), s_end);
             }
@@ -785,37 +950,71 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
 }
 
 // ============================================================================
-// Stringer Trace
+// Stringer Trace — Spec REV 2.0 Point Table, corrected (R1=R2+G, P1/P4 on the opposite
+// side from Start/End so Arc1/Arc3 genuinely cross the centreline — the crossover is a
+// real self-intersection near the top of the loop, not just the Start/End perimeter-level
+// rejoin the first REV 2.0 reading implied).
 // ============================================================================
 //
-// Canonical stringer trace (w-units, anchor at origin, y negative = inward):
-//   Departure  : (−0.5, 0)   Return : (+0.5, 0)   Bottom : (0, −2.5)
-//   Arc 1: CW, centre (−0.5, −1.5), R=1.5, 90°→  0°   → (−0.5,0) to ( 1.0,−1.5)
-//   Arc 2: CW, centre (  0,  −1.5), R=1.0,  0°→180°   → ( 1.0,−1.5) to (−1.0,−1.5) via (0,−2.5)
-//   Arc 3: CW, centre (+0.5, −1.5), R=1.5, 180°→ 90°  → (−1.0,−1.5) to ( 0.5, 0)
+// G=0.5 (fixed default). R2=W/2, R1=R2+G (never degenerates to <=0 for any R2>0 — no
+// lower bound on W needed for this reason, unlike the R2-G formulation this replaces).
+// D, W from featherprint_stringer_depth/width.
+// Point Table: Start(-G,0) P1(R2,R1) P2(R2,D-R2) P3(-R2,D-R2) P4(-R2,R1) End(G,0).
+// Centres: C1(-G,R1) C2(0,D-R2) C3(G,R1).
+// Path: Arc1 Start->P1 R1 CCW c=C1; Line1 P1->P2; Arc2 P2->P3 R2 CCW c=C2;
+//       Line2 P3->P4; Arc3 P4->End R1 CCW c=C3.
+// Validity: D >= W+G or Line1/Line2 invert (negative length); at D=W+G exactly they're
+// zero-length (Arc1 tangent directly to Arc2), a valid degenerate case.
+// Tangent-continuity verified at all four junctions (Arc1 end +Y = Line1 direction; Line1
+// end +Y = Arc2 start; Arc2 end -Y = Line2 direction; Line2 end -Y = Arc3 start) — no cusps.
 //
-// For CW helix traces x_sign=-1 mirrors about x=0, arcs drawn in reverse order/direction.
+// The blend range is widened to the profile's actual canonical x-extent (max(G,R2), since
+// Arc1/Arc2/Arc3/Line1/Line2 all reach out to +-R2, generally >G once R1=R2+G is
+// comfortably nonzero) rather than just the true Start/End connection points at +-G. Using
+// just +-G would extrapolate the two end frames far beyond where they're valid, visibly
+// bowing/flattening the middle of the trace on curved skin.
+//
+// CW helix: per REV 2.0's flagged open item, resolved by direct derivation (not assumed):
+// a naive x_sign flip alone (same call order, same x_s/x_e) misplaces the first-emitted
+// point on the wrong side of the anchor relative to what the caller's stitching (walks to
+// s_anchor-w_d before this call, resumes at s_anchor+w_d after) requires — and swapping
+// x_s/x_e alone without also flipping x_sign stops the mapping from actually mirroring the
+// shape at all (CCW and CW would trace identically). Reversed traversal + flipped arc
+// direction + x_sign=-1 + swapped x_s/x_e (the same treatment the old asymmetric profiles
+// needed) is the combination that satisfies both requirements simultaneously — verified by
+// direct substitution, not merely carried over by default from the old profile's treatment.
 
 void FeatherPrintGenerator::appendTrace(
     ExtrusionLine& line,
     double theta_anchor, double R_a,
     const Point2LL& centroid, const ArcParam& arc,
-    bool is_cw, coord_t w, bool skip_first)
+    bool is_cw, coord_t w,
+    double D, double W, bool skip_first)
 {
+    const double G  = 0.5;
+    const double R2 = W / 2.0;
+    const double R1 = R2 + G;
+    const double X_max = std::max(G, R2);
+
     if (! is_cw)
     {
-        // CCW helix: departure at lx=−0.5, return at lx=+0.5.
-        appendCanonicalArc(line, -0.5, -1.5, 1.5,  90.0,   0.0, true,  8,  1.0, theta_anchor, R_a, centroid, arc, w, skip_first);
-        appendCanonicalArc(line,  0.0, -1.5, 1.0,   0.0, 180.0, true,  10, 1.0, theta_anchor, R_a, centroid, arc, w, true);
-        appendCanonicalArc(line,  0.5, -1.5, 1.5, 180.0,  90.0, true,  8,  1.0, theta_anchor, R_a, centroid, arc, w, true);
+        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, 1.0, -X_max, X_max, centroid, arc, w);
+        appendCanonicalArc(line, -G,  R1, R1,  -90.0,   0.0, false, 8,  bp, w, skip_first);
+        line.junctions_.emplace_back(bp.place(R2, D - R2, w), w, 0);
+        appendCanonicalArc(line,  0.0, D - R2, R2,   0.0, 180.0, false, 10, bp, w, true);
+        line.junctions_.emplace_back(bp.place(-R2, R1, w), w, 0);
+        appendCanonicalArc(line,  G,   R1, R1,  180.0, -90.0, false, 8,  bp, w, true);
     }
     else
     {
-        // CW helix: arcs reversed in order and direction, x_sign=-1 mirrors about x=0.
-        // Departure lx=+0.5 (canon 0.5 × −1 = −0.5 in world → +0.5 on arc), return lx=−0.5.
-        appendCanonicalArc(line,  0.5, -1.5, 1.5,  90.0, 180.0, false, 8,  -1.0, theta_anchor, R_a, centroid, arc, w, skip_first);
-        appendCanonicalArc(line,  0.0, -1.5, 1.0, 180.0, 360.0, false, 10, -1.0, theta_anchor, R_a, centroid, arc, w, true);
-        appendCanonicalArc(line, -0.5, -1.5, 1.5,   0.0,  90.0, false, 8,  -1.0, theta_anchor, R_a, centroid, arc, w, true);
+        // Reverse traversal (End->P4->P3->P2->P1->Start), each arc's direction flipped,
+        // x_sign=-1, x_s/x_e swapped — see derivation above.
+        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, -1.0, X_max, -X_max, centroid, arc, w);
+        appendCanonicalArc(line,  G,   R1, R1,  -90.0, 180.0, true, 8,  bp, w, skip_first);
+        line.junctions_.emplace_back(bp.place(-R2, D - R2, w), w, 0);
+        appendCanonicalArc(line,  0.0, D - R2, R2, 180.0,   0.0, true, 10, bp, w, true);
+        line.junctions_.emplace_back(bp.place(R2, R1, w), w, 0);
+        appendCanonicalArc(line, -G,   R1, R1,    0.0, -90.0, true, 8,  bp, w, true);
     }
 }
 
@@ -835,31 +1034,50 @@ void FeatherPrintGenerator::appendLacingTrace(
     ExtrusionLine& line,
     double theta_anchor, double R_a,
     const Point2LL& centroid, const ArcParam& arc,
-    coord_t w)
+    coord_t w, double D, double W)
 {
+    // Spec REV 2.0's centers-first Lacing derivation (19 Jul 26 update): Lw=1 in w-units
+    // (the whole profile is already scaled by w downstream), so R1=Lw/2=0.5 and
+    // R2=(D-Lw)/2=(D-1)/2. Centres C1=(G+R1,R1), C2=(W/2-R2,D-R2), C3=-C2, C4=-C1; every
+    // other point is an explicit R1/R2 offset from its own centre — see the spec's Point
+    // Table for the full derivation. Verified tangent-continuous at all 8 junctions.
+    //
+    // The spec's own table has Start(=C1.X, positive/ahead-of-anchor) first and
+    // End(=C4.X, negative/behind) last — backwards relative to the caller's stitching
+    // (walks to s_mid-0.75w BEHIND the anchor before this call, resumes at s_mid+0.75w
+    // AHEAD after), same directionality mismatch as appendTrace's and appendFlareRim's own
+    // tables. Implemented as the reverse traversal (End->P7->P6->P5->P4->P3->P2->P1->Start),
+    // each arc's direction flipped and x_s/x_e set to the actual first/last emitted point —
+    // the same treatment already validated for those two features.
+    const double G  = 0.5;
+    const double R1 = 0.5;
+    const double R2 = std::max(0.0, (D - 1.0) / 2.0);
+
+    const double x_start = G + R1;   // = C1.X = -C4.X
+    const double c2x     = W / 2.0 - R2; // = C2.X = -C3.X
+
+    BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, 1.0, -x_start, x_start, centroid, arc, w);
+
     auto pt = [&](double lx, double ly) {
-        line.junctions_.emplace_back(conformPlace(lx, ly, 1.0, theta_anchor, R_a, centroid, arc, w), w, 0);
+        line.junctions_.emplace_back(bp.place(lx, ly, w), w, 0);
     };
 
-    // Left inner arc: CW 90°→-90°, centre (-0.75,-0.50), R=0.5
-    // Departure at (-0.75, 0); arc swings right through (-0.25,-0.50) to (-0.75,-1.0)
-    appendCanonicalArc(line, -0.75, -0.5, 0.5, 90.0, -90.0, true, 4, 1.0, theta_anchor, R_a, centroid, arc, w, false);
-
-    // Left outer arc: CCW 90°→270°, centre (-0.75,-1.75), R=0.75
-    // Chains directly from inner arc end (-0.75,-1.0); swings left through (-1.50,-1.75) to (-0.75,-2.5)
-    appendCanonicalArc(line, -0.75, -1.75, 0.75, 90.0, 270.0, false, 6, 1.0, theta_anchor, R_a, centroid, arc, w, true);
-
-    // Horizontal bottom: (-0.75,-2.5) → (0,-2.5)
-    pt(0.0, -2.5);
-
-    // Right outer arc: CCW -90°→90°, centre (+0.75,-1.75), R=0.75
-    // skip_first=false to emit start (+0.75,-2.5) and complete bottom horizontal
-    // Swings right through (+1.50,-1.75) to (+0.75,-1.0)
-    appendCanonicalArc(line, 0.75, -1.75, 0.75, -90.0, 90.0, false, 6, 1.0, theta_anchor, R_a, centroid, arc, w, false);
-
-    // Right inner arc: CW -90°→90°, centre (+0.75,-0.50), R=0.5
-    // Chains directly from outer arc end (+0.75,-1.0); swings left through (+0.25,-0.50) to (+0.75, 0)
-    appendCanonicalArc(line, 0.75, -0.5, 0.5, -90.0, 90.0, true, 4, 1.0, theta_anchor, R_a, centroid, arc, w, true);
+    // Arc4 rev: End(-x_start,0) -> P7(-x_start,2*R1), R1, CW, centre C4(-x_start,R1)
+    appendCanonicalArc(line, -x_start, R1, R1, -90.0, 90.0, false, 4, bp, w, false);
+    // Line4 rev: -> P6(-c2x, 2*R1)
+    pt(-c2x, 2.0 * R1);
+    // Arc3 rev: -> P5(-c2x, D), R2, CCW, centre C3(-c2x, D-R2)
+    appendCanonicalArc(line, -c2x, D - R2, R2, -90.0, 90.0, true, 6, bp, w, true);
+    // Line3 rev: -> P4(0, D)
+    pt(0.0, D);
+    // Line2 rev: -> P3(c2x, D)
+    pt(c2x, D);
+    // Arc2 rev: -> P2(c2x, 2*R1), R2, CCW, centre C2(c2x, D-R2)
+    appendCanonicalArc(line, c2x, D - R2, R2, 90.0, -90.0, true, 6, bp, w, true);
+    // Line1 rev: -> P1(x_start, 2*R1)
+    pt(x_start, 2.0 * R1);
+    // Arc1 rev: -> Start(x_start, 0), R1, CW, centre C1(x_start, R1)
+    appendCanonicalArc(line, x_start, R1, R1, 90.0, -90.0, false, 4, bp, w, true);
 }
 
 // ============================================================================
@@ -867,53 +1085,60 @@ void FeatherPrintGenerator::appendLacingTrace(
 // ============================================================================
 //
 // Anchored at (0,0) on the true OML (the outer wall's own toolpath centreline — NOT
-// oml_arc's own ly=0 reference, and not the innermost Flange wall's surface). T is Q: the
-// toolpath-centreline-to-toolpath-centreline OML-to-IML distance, used (unshifted) for the
-// fillet radius r = (2.5-Q)/2, so the channel bottom stays pinned at a fixed 2.5w below the
-// true OML regardless of Q. oml_shift corrects only the placement (every canonical y-value
-// is applied at y-oml_shift in oml_arc's own frame) — it must not feed into r, since r is
-// defined relative to the true OML, not oml_arc's frame. d is the width of the colliding
-// feature (2.0 for a Stringer anchor, 3.0 for a Lacing anchor). Mirror-symmetric dovetail
-// cross-section.
-//
-// Traversed left-to-right (increasing lx) so it matches the wall's own increasing-arc-length
-// walk direction — the caller stops the ordinary wall walk at s_left (the lx=-(d/2+r) end)
-// and resumes it at s_right (the lx=+(d/2+r) end); emitting the arcs in the other order
-// stitched this rim in backwards and crossed the incoming/outgoing wall segments:
-//   Arc 1 CW  (-d/2-r,-Q)  -> (-d/2,-Q-r)     centre (-d/2-r,-Q-r)
-//   Arc 2 CCW (-d/2,-Q-r)  -> (-d/2+r,-Q-2r)  centre (-d/2+r,-Q-r)
-//   Line 1    (-d/2+r,-Q-2r) -> (d/2-r,-Q-2r)
-//   Arc 3 CCW (d/2-r,-Q-2r) -> (d/2,-Q-r)     centre (d/2-r,-Q-r)
-//   Arc 4 CW  (d/2,-Q-r)   -> (d/2+r,-Q)      centre (d/2+r,-Q-r)
+// oml_arc's own ly=0 reference). Per Parametric Canonical Toolpaths (WIP).md: a 5-segment
+// channel (Line-in, Arc1, Line-mid, Arc2, Line-out), R1 = min(D - Q, W/2) (w-units; Q = true
+// thickness in w-units of this Flange ramp layer's Wall stack, i.e. the sum of each Wall's own
+// width — NOT a plain Wall count, which under-charges a stack containing a half-width Wall —
+// D = featherprint_flare_depth). The W/2 clamp on R1 keeps Line-mid's span (W - 2*R1) from
+// going negative and crossing the two end arcs over each other when D is large relative to W;
+// the depth this clamp would otherwise cut off (drop = (D-Q) - W/2, when positive) is NOT
+// dropped — it's picked up by the Line-in/Line-out vertical lead-in/out segments, so the
+// channel still reaches the full requested depth D-Q regardless of how R1 clamps.
+// oml_shift corrects only the placement (every canonical
+// y-value is applied at y-oml_shift in oml_arc's own frame), same convention as before.
+// W is the flat span at y=drop+R1 (2.0 for a Stringer anchor, 3.0 for a Lacing anchor).
+// Traversed LEFT-to-right (increasing lx), matching the wall's own increasing-arc-length
+// walk direction (spec requirement) — mirrored from the WIP doc's literal Start/End labels
+// (Start = +W/2, End = -W/2), which read literally run right-to-left, backwards relative to
+// both that stated requirement and the caller's own stitching (walks to s_left/behind first,
+// resumes from s_right/ahead after) — the same issue as appendLacingTrace's Point Table.
+// Mirrored Point Table: Start(-W/2,0) P1(-W/2,drop) P2(-W/2+R1,drop+R1) P3(W/2-R1,drop+R1)
+// P4(W/2,drop) End(W/2,0). Centres: C1(-W/2+R1,drop) C2(W/2-R1,drop).
+// Path: Line-in Start->P1; Arc1 P1->P2 R1 CW c=C1; Line-mid P2->P3;
+//       Arc2 P3->P4 R1 CW c=C2; Line-out P4->End.
 void FeatherPrintGenerator::appendFlareRim(
     ExtrusionLine& line,
     double theta_anchor, double R_a, double x_sign,
     const Point2LL& centroid, const ArcParam& oml_arc,
-    double T, double oml_shift, double W, coord_t w, bool skip_first)
+    double Q, double D, double oml_shift, double W, coord_t w, bool skip_first)
 {
-    const double Q = T;
-    const double d = W;
-    const double r = std::max(0.0, (2.5 - Q) / 2.0);
-    const double Qp = Q - oml_shift; // Q, translated into oml_arc's own ly=0 frame
+    // Q_eff is the requested (unclamped) depth. R1 is clamped to W/2: past that, Line1's span
+    // (W - 2*R1) goes negative and the two end arcs' flat spans cross over each other instead
+    // of meeting at a single point, self-intersecting the profile. Any depth beyond what the
+    // clamped R1 alone can reach is NOT dropped — it's picked up by a straight vertical
+    // lead-in/out segment (Start->P1, P4->End) at each end, so the channel still reaches the
+    // full requested depth D-Q; only the fillet's own radius is capped, not the total depth.
+    const double Q_eff = D - Q;
+    const double R1 = std::max(0.0, std::min(Q_eff, W / 2.0));
+    const double drop = std::max(0.0, Q_eff - W / 2.0); // extra depth beyond the clamped fillet
+    const double y0 = drop + R1 - oml_shift;   // channel floor (Line-mid) depth, in oml_arc's frame
+    const double y_base = drop - oml_shift;    // depth where each end arc begins/ends (= foot of the lead-in/out line)
+    const double y_top = -oml_shift;           // Start/End depth (0), in oml_arc's frame
 
-    auto pt = [&](double lx, double ly) {
-        line.junctions_.emplace_back(conformPlace(lx, ly, x_sign, theta_anchor, R_a, centroid, oml_arc, w), w, 0);
-    };
+    BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, -W / 2.0, W / 2.0, centroid, oml_arc, w);
 
-    // Arc 1: CW, (-d/2-r,-Qp) -> (-d/2,-Qp-r), centre (-d/2-r,-Qp-r)
-    appendCanonicalArc(line, -d / 2.0 - r, -Qp - r, r, 90.0, 0.0, true, 4, x_sign,
-                       theta_anchor, R_a, centroid, oml_arc, w, skip_first);
-    // Arc 2: CCW, (-d/2,-Qp-r) -> (-d/2+r,-Qp-2r), centre (-d/2+r,-Qp-r)
-    appendCanonicalArc(line, -d / 2.0 + r, -Qp - r, r, 180.0, 270.0, false, 4, x_sign,
-                       theta_anchor, R_a, centroid, oml_arc, w, /*skip_first=*/true);
-    // Line 1: (-d/2+r,-Qp-2r) -> (d/2-r,-Qp-2r)
-    pt(d / 2.0 - r, -Qp - 2.0 * r);
-    // Arc 3: CCW, (d/2-r,-Qp-2r) -> (d/2,-Qp-r), centre (d/2-r,-Qp-r)
-    appendCanonicalArc(line, d / 2.0 - r, -Qp - r, r, -90.0, 0.0, false, 4, x_sign,
-                       theta_anchor, R_a, centroid, oml_arc, w, /*skip_first=*/true);
-    // Arc 4: CW, (d/2,-Qp-r) -> (d/2+r,-Qp), centre (d/2+r,-Qp-r)
-    appendCanonicalArc(line, d / 2.0 + r, -Qp - r, r, 180.0, 90.0, true, 4, x_sign,
-                       theta_anchor, R_a, centroid, oml_arc, w, /*skip_first=*/true);
+    // Line-in: Start(-W/2,0) -> P1(-W/2,drop)
+    if (! skip_first)
+        line.junctions_.emplace_back(bp.place(-W / 2.0, y_top, w), w, 0);
+    line.junctions_.emplace_back(bp.place(-W / 2.0, y_base, w), w, 0);
+    // Arc1: P1(-W/2,drop) -> P2(-W/2+R1,drop+R1), R1, CW, centre C1(-W/2+R1,drop)
+    appendCanonicalArc(line, -W / 2.0 + R1, y_base, R1, 180.0, 90.0, true, 4, bp, w, /*skip_first=*/true);
+    // Line-mid: P2 -> P3(W/2-R1, drop+R1)
+    line.junctions_.emplace_back(bp.place(W / 2.0 - R1, y0, w), w, 0);
+    // Arc2: P3 -> P4(W/2,drop), R1, CW, centre C2(W/2-R1,drop)
+    appendCanonicalArc(line, W / 2.0 - R1, y_base, R1, 90.0, 0.0, true, 4, bp, w, true);
+    // Line-out: P4(W/2,drop) -> End(W/2,0)
+    line.junctions_.emplace_back(bp.place(W / 2.0, y_top, w), w, 0);
 }
 
 // ============================================================================
@@ -940,6 +1165,11 @@ VariableWidthLines FeatherPrintGenerator::generate(
     if (N < 1)
         return {};
 
+    const double stringer_D = settings.get<double>("featherprint_stringer_depth");
+    const double stringer_W = settings.get<double>("featherprint_stringer_width");
+    const double lacing_D   = settings.get<double>("featherprint_lacing_depth");
+    const double lacing_W   = settings.get<double>("featherprint_lacing_width");
+
     ArcParam arc = buildArcParam(*outer);
     if (arc.total < 4.0 * w)
         return {};
@@ -964,25 +1194,47 @@ VariableWidthLines FeatherPrintGenerator::generate(
 
     const int total_anchors = static_cast<int>(anchors.size());
 
-    // Cross-helix collision detection: if a CCW and CW anchor are within w
-    // world-space distance they will intersect — mark both for lacing.
-    // Currently: skip the traces to confirm detection visually.
+    // Cross-helix collision detection: if a CCW and CW anchor are within w world-space
+    // distance they will intersect — mark both for lacing (d < w, per the original spec
+    // value — confirmed correct as-is for Stringer x Stringer collisions).
+    const double collision_w = w_d;
+    // anchors is sorted by s in [0, arc.total) — a plain i<j scan with an early break never
+    // considers a pair straddling the seam (one anchor near s~0, the other near s~arc.total,
+    // physically adjacent via wraparound but far apart in this linear index order). Fixed by
+    // scanning an extended list with wrapped duplicates of the near-start anchors appended
+    // past the end (standard circular-array technique) — collision results are written back
+    // to the real anchors via orig_idx, and a wrapped duplicate is never paired with its own
+    // original (orig_idx equality guard) to avoid a false self-collision.
+    struct AnchorRef { double s; bool is_cw; int orig_idx; };
+    std::vector<AnchorRef> ext;
+    ext.reserve(total_anchors + total_anchors);
     for (int i = 0; i < total_anchors; i++)
+        ext.push_back({ anchors[i].s, anchors[i].is_cw, i });
+    for (int i = 0; i < total_anchors; i++)
+        if (anchors[i].s < 2.0 * collision_w)
+            ext.push_back({ anchors[i].s + arc.total, anchors[i].is_cw, i });
+    std::sort(ext.begin(), ext.end(), [](const AnchorRef& a, const AnchorRef& b) { return a.s < b.s; });
+
+    const int total_ext = static_cast<int>(ext.size());
+    for (int i = 0; i < total_ext; i++)
     {
-        for (int j = i + 1; j < total_anchors; j++)
+        for (int j = i + 1; j < total_ext; j++)
         {
-            if (anchors[j].s - anchors[i].s > 2.0 * w_d) break; // outside arc window
-            if (anchors[j].is_cw == anchors[i].is_cw) continue;  // same direction
-            Point2LL pi = arc.pointAt(anchors[i].s);
-            Point2LL pj = arc.pointAt(anchors[j].s);
+            if (ext[j].s - ext[i].s > 2.0 * collision_w) break; // outside arc window
+            if (ext[j].orig_idx == ext[i].orig_idx) continue;   // wrapped duplicate of itself
+            if (ext[j].is_cw == ext[i].is_cw) continue;         // same direction
+            Point2LL pi = arc.pointAt(ext[i].s);
+            Point2LL pj = arc.pointAt(ext[j].s);
             double dx = static_cast<double>(pi.X - pj.X);
             double dy = static_cast<double>(pi.Y - pj.Y);
-            if (std::sqrt(dx * dx + dy * dy) < w_d)
+            double dist = std::sqrt(dx * dx + dy * dy);
+            bool hit = dist < collision_w;
+            if (hit)
             {
-                anchors[i].skip     = true;
-                anchors[j].skip     = true;
-                anchors[i].pair_idx = j;
-                anchors[j].pair_idx = i;
+                anchors[ext[i].orig_idx].skip     = true;
+                anchors[ext[j].orig_idx].skip     = true;
+                anchors[ext[i].orig_idx].pair_idx = ext[j].orig_idx;
+                anchors[ext[j].orig_idx].pair_idx = ext[i].orig_idx;
             }
         }
     }
@@ -1016,9 +1268,16 @@ VariableWidthLines FeatherPrintGenerator::generate(
                 // pair_idx points to the other anchor; only the first one (lower index) drives the lacing.
                 if (anc.pair_idx > i)
                 {
-                    const double s_a   = anc.s;
-                    const double s_b   = anchors[anc.pair_idx].s;
-                    const double s_mid = (s_a + s_b) * 0.5;
+                    const double s_a = anc.s;
+                    const double s_b = anchors[anc.pair_idx].s;
+                    // anchors is sorted by s, so s_a <= s_b normally — except for a pair the
+                    // wraparound fix above matched across the seam (physically close via
+                    // wraparound, but s_b - s_a appears large directly). In that case the
+                    // naive midpoint (s_a+s_b)/2 lands on the wrong side of the part entirely;
+                    // use the wrapped midpoint instead, folded back into [0, arc.total).
+                    const double s_mid = (s_b - s_a > arc.total / 2.0)
+                        ? std::fmod((s_a + s_b - arc.total) * 0.5 + arc.total, arc.total)
+                        : (s_a + s_b) * 0.5;
 
                     double s_depart = s_mid - 0.75 * w_d;
                     if (s_depart < current_s) s_depart = current_s;
@@ -1032,7 +1291,7 @@ VariableWidthLines FeatherPrintGenerator::generate(
                     if (R_a > 1.0)
                     {
                         double theta_mid = std::atan2(dcy, dcx);
-                        appendLacingTrace(fp_line, theta_mid, R_a, centroid, arc, w);
+                        appendLacingTrace(fp_line, theta_mid, R_a, centroid, arc, w, lacing_D, lacing_W);
                     }
 
                     current_s = s_mid + 0.75 * w_d;
@@ -1052,7 +1311,7 @@ VariableWidthLines FeatherPrintGenerator::generate(
             double theta_anchor = std::atan2(dcy, dcx);
 
             appendPolySegment(fp_line, arc, current_s, s_depart, w, fp_line.empty());
-            appendTrace(fp_line, theta_anchor, R_a, centroid, arc, anc.is_cw, w, false);
+            appendTrace(fp_line, theta_anchor, R_a, centroid, arc, anc.is_cw, w, stringer_D, stringer_W, false);
             current_s = s_anchor + w_d;
             ++i;
         }
@@ -1078,16 +1337,16 @@ VariableWidthLines FeatherPrintGenerator::generate(
 }
 
 // ============================================================================
-// Terminal loop — Whip feature for open-manifold boundary edges
+// Whip Terminal — Parametric Canonical Toolpaths (WIP).md
 // ============================================================================
 //
-// Canonical profile (w-units, anchor at lx=0):
-//   Arc 1 : CCW 90°→180°, centre (1.5,-1.5), R=1.5 → (1.5,0) to (0,-1.5)
-//   Arc 2a: CCW 180°→270°, centre (1.0,-1.5), R=1.0 → (0,-1.5) to (1.0,-2.5)
-//   [Ins]  : horizontal at y=-2.5 from (1.0,-2.5) to (1.0+L,-2.5)  [Splay only, L>0]
-//   Arc 2b: CCW 270°→360°, centre (1.0+L,-1.5), R=1.0 → (1.0+L,-2.5) to (2.0+L,-1.5)
-//   Line 1: (2.0+L,-1.5) → (2.0+L,0)
-// At L=0 Arc2a+Arc2b = standard Arc2 (CCW 180°→360°) and profile is the standard Terminal.
+// R1,R2 match Stringer's (passed in). Point Table (+Y inward): Start(R1,0) P1(0,R1)
+//   P2(0,D-R2) P3(R2,D) P4(W-R2,D) P5(W,D-R2) End(W,0) — End.y taken as 0, reading the WIP
+//   doc's literal "Lw/2" as a transcription slip: y=0 is what returns the path to the
+//   perimeter, matching Start's y=0 and the older spec's "returns to the perimeter surface."
+//   Centres: C1(R1,R1) C2(R2,D-R2) C3(W-R2,D-R2).
+// Path: Arc1 Start->P1 R1 CW c=C1; Line1 P1->P2; Arc2 P2->P3 R2 CW c=C2;
+//       Line2 P3->P4 (splay_L widens this span); Arc3 P4->P5 R2 CW c=C3; Line3 P5->End.
 // x_sign=+1 for start endpoint (reversed=true path), -1 for end endpoint (reversed=false).
 
 void FeatherPrintGenerator::appendTerminal(
@@ -1095,6 +1354,7 @@ void FeatherPrintGenerator::appendTerminal(
     double s_anchor, double x_sign,
     const ArcParam& arc, const Point2LL& centroid,
     coord_t w,
+    double D, double R1, double R2, double W,
     bool reversed,
     double splay_L)
 {
@@ -1106,51 +1366,103 @@ void FeatherPrintGenerator::appendTerminal(
         return;
     double theta_anchor = std::atan2(dcy, dcx);
 
-    // Number of tessellation steps for the Insertion segment (straight line).
-    const int n_ins = (splay_L > 1e-6) ? std::max(2, static_cast<int>(splay_L * 4.0 + 0.5)) : 0;
+    const double Ws = W + splay_L; // W widened by the Splay insertion on the far (P4/P5/End) side
 
-    auto cp = [&](double lx, double ly) -> Point2LL {
-        return conformPlace(lx, ly, x_sign, theta_anchor, R_a, centroid, arc, w);
-    };
-
-    if (reversed)
+    if (reversed && s_anchor < 1.0)
     {
-        // "Begins at terminal": Line1_rev → Arc2b_rev → Ins_rev → Arc2a_rev → Arc1_rev
-        // Path starts at (2+L,0) on skin, ends at (1.5,0) for skin walk continuation.
-        for (int k = 0; k <= 6; ++k)
-            line.emplace_back(cp(2.0 + splay_L, -1.5 * k / 6.0), w, 0);
-        // Arc 2b reversed: CW 360°→270°, centre (1.0+L,-1.5)
-        appendCanonicalArc(line, 1.0 + splay_L, -1.5, 1.0, 360.0, 270.0, true, 5, x_sign,
-                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
-        // Insertion reversed: (1.0+L,-2.5) → (1.0,-2.5)
-        for (int k = 1; k <= n_ins; ++k)
-            line.emplace_back(cp(1.0 + splay_L * (1.0 - static_cast<double>(k) / n_ins), -2.5), w, 0);
-        // Arc 2a reversed: CW 270°→180°, centre (1.0,-1.5)
-        appendCanonicalArc(line, 1.0, -1.5, 1.0, 270.0, 180.0, true, 5, x_sign,
-                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
-        // Arc 1 reversed: CW 180°→90°, centre (1.5,-1.5)
-        appendCanonicalArc(line, 1.5, -1.5, 1.5, 180.0, 90.0, true, 8, x_sign,
-                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
+        // TEMPORARY: dump the raw boundary-edge vertices right at the anchor (s=0, the
+        // Flange-loop/Whip junction point) to see the actual local geometry driving the
+        // persistent malformed loop there.
+        std::string dump = fmt::format("[FP-TerminalRaw] z={:.2f}mm theta_anchor={:.1f}deg R_a={:.2f}mm total={:.2f}mm n={} :",
+            g_fp_debug_z / 1000.0, theta_anchor * 180.0 / std::numbers::pi, R_a / 1000.0, arc.total / 1000.0,
+            static_cast<int>(arc.poly->size()));
+        const int dump_n = std::min(8, static_cast<int>(arc.poly->size()));
+        for (int i = 0; i < dump_n; i++)
+        {
+            const Point2LL& p = (*arc.poly)[i];
+            dump += fmt::format(" [{}]=({:.3f},{:.3f})cum={:.4f}", i, p.X / 1000.0, p.Y / 1000.0, arc.cum_len[i] / 1000.0);
+        }
+        fpDebugLog(dump);
+    }
+
+    if (! reversed)
+    {
+        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, R1, Ws, centroid, arc, w);
+        const size_t dbg_start = line.junctions_.size();
+        // Arc1: Start->P1, R1, CW, c=(R1,R1)
+        appendCanonicalArc(line, R1, R1, R1, -90.0, 180.0, true, 8, bp, w, false);
+        // Line1: P1->P2
+        line.junctions_.emplace_back(bp.place(0.0, D - R2, w), w, 0);
+        // Arc2: P2->P3, R2, CW, c=(R2,D-R2)
+        appendCanonicalArc(line, R2, D - R2, R2, 180.0, 90.0, true, 5, bp, w, true);
+        // Line2: P3->P4 (widened by splay)
+        line.junctions_.emplace_back(bp.place(Ws - R2, D, w), w, 0);
+        // Arc3: P4->P5, R2, CW, c=(Ws-R2,D-R2)
+        appendCanonicalArc(line, Ws - R2, D - R2, R2, 90.0, 0.0, true, 5, bp, w, true);
+        // Line3: P5->End (End.y = Lw/2 = 0.5 in w-units, per Spec REV 2.0 — the return point
+        // lands near, not exactly on, the perimeter)
+        line.junctions_.emplace_back(bp.place(Ws, 0.5, w), w, 0);
+        {
+            double dist = std::hypot(static_cast<double>(bp.B.S.X - bp.A.S.X), static_cast<double>(bp.B.S.Y - bp.A.S.Y));
+            double tdot = bp.A.tx * bp.B.tx + bp.A.ty * bp.B.ty;
+            coord_t minx = std::numeric_limits<coord_t>::max(), maxx = std::numeric_limits<coord_t>::min();
+            coord_t miny = std::numeric_limits<coord_t>::max(), maxy = std::numeric_limits<coord_t>::min();
+            for (size_t i = dbg_start; i < line.junctions_.size(); i++)
+            {
+                Point2LL p = line.junctions_[i].p_;
+                minx = std::min(minx, p.X); maxx = std::max(maxx, p.X);
+                miny = std::min(miny, p.Y); maxy = std::max(maxy, p.Y);
+            }
+            double bboxw = (maxx - minx) / 1000.0, bboxh = (maxy - miny) / 1000.0;
+            fpDebugLog(fmt::format(
+                "[FP-Terminal] z={:.2f}mm reversed=0 s_anchor={:.2f}mm x_sign={:.0f} R_a={:.2f}mm theta_anchor={:.1f}deg "
+                "D={:.2f} R1={:.2f} R2={:.2f} W={:.2f} splay_L={:.2f} Ws={:.2f} A.S=({:.2f},{:.2f}) B.S=({:.2f},{:.2f}) "
+                "A-B_dist={:.2f}mm expected~{:.2f}mm tdot={:.3f} bbox=({:.2f}x{:.2f})mm",
+                g_fp_debug_z / 1000.0, s_anchor / 1000.0, x_sign, R_a / 1000.0, theta_anchor * 180.0 / std::numbers::pi,
+                D, R1, R2, W, splay_L, Ws,
+                bp.A.S.X / 1000.0, bp.A.S.Y / 1000.0, bp.B.S.X / 1000.0, bp.B.S.Y / 1000.0,
+                dist / 1000.0, (Ws - R1) * w / 1000.0, tdot, bboxw, bboxh));
+        }
     }
     else
     {
-        // "Ends at terminal": Arc1 → Arc2a → Ins → Arc2b → Line1
-        // Path starts at (1.5,0) where skin walk stopped (s_anchor−1.5w).
-        // Arc 1: CCW 90°→180°, centre (1.5,-1.5)
-        appendCanonicalArc(line, 1.5, -1.5, 1.5, 90.0, 180.0, false, 8, x_sign,
-                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/false);
-        // Arc 2a: CCW 180°→270°, centre (1.0,-1.5) → reaches bottom (1.0,-2.5)
-        appendCanonicalArc(line, 1.0, -1.5, 1.0, 180.0, 270.0, false, 5, x_sign,
-                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
-        // Insertion: (1.0,-2.5) → (1.0+L,-2.5) at maximum depth
-        for (int k = 1; k <= n_ins; ++k)
-            line.emplace_back(cp(1.0 + splay_L * static_cast<double>(k) / n_ins, -2.5), w, 0);
-        // Arc 2b: CCW 270°→360°, centre (1.0+L,-1.5) → arrives at (2.0+L,-1.5)
-        appendCanonicalArc(line, 1.0 + splay_L, -1.5, 1.0, 270.0, 360.0, false, 5, x_sign,
-                           theta_anchor, R_a, centroid, arc, w, /*skip_first=*/true);
-        // Line 1: (2.0+L,-1.5) → (2.0+L,0)
-        for (int k = 1; k <= 6; ++k)
-            line.emplace_back(cp(2.0 + splay_L, -1.5 + 1.5 * k / 6.0), w, 0);
+        // Reverse traversal (End->P5->P4->P3->P2->P1->Start), each arc's direction flipped.
+        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, Ws, R1, centroid, arc, w);
+        const size_t dbg_start = line.junctions_.size();
+        // Line3 rev: End->P5 (emit both endpoints — this is the first segment of the reversal)
+        line.junctions_.emplace_back(bp.place(Ws, 0.5, w), w, 0);
+        line.junctions_.emplace_back(bp.place(Ws, D - R2, w), w, 0);
+        // Arc3 rev: P5->P4, R2, CCW, c=(Ws-R2,D-R2)
+        appendCanonicalArc(line, Ws - R2, D - R2, R2, 0.0, 90.0, false, 5, bp, w, true);
+        // Line2 rev: P4->P3
+        line.junctions_.emplace_back(bp.place(R2, D, w), w, 0);
+        // Arc2 rev: P3->P2, R2, CCW, c=(R2,D-R2)
+        appendCanonicalArc(line, R2, D - R2, R2, 90.0, 180.0, false, 5, bp, w, true);
+        // Line1 rev: P2->P1
+        line.junctions_.emplace_back(bp.place(0.0, R1, w), w, 0);
+        // Arc1 rev: P1->Start, R1, CCW, c=(R1,R1)
+        appendCanonicalArc(line, R1, R1, R1, 180.0, -90.0, false, 8, bp, w, true);
+        {
+            double dist = std::hypot(static_cast<double>(bp.B.S.X - bp.A.S.X), static_cast<double>(bp.B.S.Y - bp.A.S.Y));
+            double tdot = bp.A.tx * bp.B.tx + bp.A.ty * bp.B.ty;
+            coord_t minx = std::numeric_limits<coord_t>::max(), maxx = std::numeric_limits<coord_t>::min();
+            coord_t miny = std::numeric_limits<coord_t>::max(), maxy = std::numeric_limits<coord_t>::min();
+            for (size_t i = dbg_start; i < line.junctions_.size(); i++)
+            {
+                Point2LL p = line.junctions_[i].p_;
+                minx = std::min(minx, p.X); maxx = std::max(maxx, p.X);
+                miny = std::min(miny, p.Y); maxy = std::max(maxy, p.Y);
+            }
+            double bboxw = (maxx - minx) / 1000.0, bboxh = (maxy - miny) / 1000.0;
+            fpDebugLog(fmt::format(
+                "[FP-Terminal] z={:.2f}mm reversed=1 s_anchor={:.2f}mm x_sign={:.0f} R_a={:.2f}mm theta_anchor={:.1f}deg "
+                "D={:.2f} R1={:.2f} R2={:.2f} W={:.2f} splay_L={:.2f} Ws={:.2f} A.S=({:.2f},{:.2f}) B.S=({:.2f},{:.2f}) "
+                "A-B_dist={:.2f}mm expected~{:.2f}mm tdot={:.3f} bbox=({:.2f}x{:.2f})mm",
+                g_fp_debug_z / 1000.0, s_anchor / 1000.0, x_sign, R_a / 1000.0, theta_anchor * 180.0 / std::numbers::pi,
+                D, R1, R2, W, splay_L, Ws,
+                bp.A.S.X / 1000.0, bp.A.S.Y / 1000.0, bp.B.S.X / 1000.0, bp.B.S.Y / 1000.0,
+                dist / 1000.0, (Ws - R1) * w / 1000.0, tdot, bboxw, bboxh));
+        }
     }
 }
 
@@ -1165,6 +1477,7 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
     double helix_phase,
     const OpenLayerParams& params)
 {
+    g_fp_debug_z = z;
     // open_poly is already oriented CCW in math coordinates by the caller.
     if (open_poly.size() < 2)
         return {};
@@ -1176,6 +1489,13 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
     const int N = settings.get<int>("featherprint_stringer_count");
     if (N < 1)
         return {};
+
+    const double stringer_D = settings.get<double>("featherprint_stringer_depth");
+    const double stringer_W = settings.get<double>("featherprint_stringer_width");
+    const double lacing_D   = settings.get<double>("featherprint_lacing_depth");
+    const double lacing_W   = settings.get<double>("featherprint_lacing_width");
+    const double stringer_R2 = stringer_W / 2.0;
+    const double stringer_R1 = stringer_R2 + 0.5; // matches Stringer Trace's corrected R1=R2+G
 
     ArcParam arc_open = buildArcParamOpen(open_poly);
     const double s_end = arc_open.total;
@@ -1214,19 +1534,22 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
         s_end / 1000.0, params.full_ring_total / 1000.0, params.arc_start_in_ring / 1000.0,
         anchors.size(), ccw_adv_abs / 1000.0, cw_adv_abs / 1000.0);
 
-    // Collision detection — same logic as generate(), using arc_open for world positions
+    // Collision detection — same logic as generate() (d < w), using arc_open for world positions
     const int total_anchors = static_cast<int>(anchors.size());
+    const double collision_w = w_d;
     for (int i = 0; i < total_anchors; i++)
     {
         for (int j = i + 1; j < total_anchors; j++)
         {
-            if (anchors[j].s - anchors[i].s > 2.0 * w_d) break;
+            if (anchors[j].s - anchors[i].s > 2.0 * collision_w) break;
             if (anchors[j].is_cw == anchors[i].is_cw) continue;
             Point2LL pi = arc_open.pointAt(anchors[i].s);
             Point2LL pj = arc_open.pointAt(anchors[j].s);
             double dx = static_cast<double>(pi.X - pj.X);
             double dy = static_cast<double>(pi.Y - pj.Y);
-            if (std::sqrt(dx * dx + dy * dy) < w_d)
+            double dist = std::sqrt(dx * dx + dy * dy);
+            bool hit = dist < collision_w;
+            if (hit)
             {
                 anchors[i].skip     = true;
                 anchors[j].skip     = true;
@@ -1269,10 +1592,10 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
     double current_s = 0.0;
     if (draw_start_terminal)
     {
-        // Start terminal: "begins at terminal" — draw reversed (Line→Arc2rev→Arc1rev).
-        // Path starts at (2w,0) on skin, ends at (1.5w,0). Walk picks up from 1.5w.
-        appendTerminal(fp_line, 0.0, +1.0, arc_open, centroid, w, /*reversed=*/true, start_splay_L);
-        current_s = (2.0 + start_splay_L) * w_d;
+        // Start terminal: "begins at terminal" — draw reversed (Line3rev→Arc3rev→Line2rev→Arc2rev→Line1rev→Arc1rev).
+        // Path starts at (W+L,0) on skin, ends at (R1,0). Walk picks up from R1.
+        appendTerminal(fp_line, 0.0, +1.0, arc_open, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/true, start_splay_L);
+        current_s = (stringer_W + start_splay_L) * w_d;
     }
     int i = 0;
     while (i < total_anchors)
@@ -1293,7 +1616,7 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
                 double dcy = static_cast<double>(mid_pt.Y - centroid.Y);
                 double R_a = std::sqrt(dcx * dcx + dcy * dcy);
                 if (R_a > 1.0)
-                    appendLacingTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, w);
+                    appendLacingTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, w, lacing_D, lacing_W);
 
                 current_s = s_mid + 0.75 * w_d;
             }
@@ -1312,17 +1635,17 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
         if (R_a < 1.0) { ++i; continue; }
 
         appendPolySegment(fp_line, arc_open, current_s, s_depart, w, fp_line.empty());
-        appendTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, anc.is_cw, w, false);
+        appendTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, anc.is_cw, w, stringer_D, stringer_W, false);
         current_s = s_anchor + w_d;
         ++i;
     }
 
-    // End terminal: Arc1 departs from s_end - 1.5w (standard) or s_end - (1.5+L)w (splay).
-    const double end_walk_stop = draw_end_terminal ? s_end - (1.5 + end_splay_L) * w_d : s_end;
+    // End terminal: Arc1 departs from s_end - R1*w (standard) or s_end - (R1+L)w (splay).
+    const double end_walk_stop = draw_end_terminal ? s_end - (stringer_R1 + end_splay_L) * w_d : s_end;
     appendPolySegment(fp_line, arc_open, current_s, end_walk_stop, w, fp_line.empty());
 
     if (draw_end_terminal)
-        appendTerminal(fp_line, s_end, -1.0, arc_open, centroid, w, /*reversed=*/false, end_splay_L);
+        appendTerminal(fp_line, s_end, -1.0, arc_open, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/false, end_splay_L);
 
     if (fp_line.size() < 2)
         return {};

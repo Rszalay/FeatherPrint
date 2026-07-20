@@ -105,15 +105,67 @@ private:
         Point2LL pointAt(double s) const;
         Point2LL tangentAt(double s) const;
         double referenceArcPos(const Point2LL& centroid) const;
-        // Distance from centroid to the perimeter along the ray at angle theta.
-        // Implements R(theta) for the Conformal Placement Transform.
-        double radiusAt(const Point2LL& centroid, double theta) const;
     };
 
     static ArcParam buildArcParam(const Polygon& poly);
     static ArcParam buildArcParamOpen(const OpenPolyline& poly);
     static Point2LL centroidBbox(const Polygon& poly);
     static const Polygon* largestPoly(const Shape& shape);
+
+    // ---- Skin-Normal Tangent-Blend Placement (Self-Reference/03-conformal-placement-transform.md
+    //      "Skin-Normal Variant") -----------------------------------------------------------
+    //
+    // Replaces the earlier centroid-radial transform (r = R(theta) - y about the layer centroid).
+    // Anchor resolution (theta_anchor, R_a) is unchanged; only per-point placement differs: each
+    // canonical point is placed by affine-blending between two RIGID frames built from the real
+    // perimeter's own local tangent/normal at the feature's Start and End extents, rather than by
+    // projecting radially toward the centroid. Convention: canonical +Y = inward (toward centroid),
+    // matching the spec's "y - direction from anchor toward centroid" and the WIP Parametric
+    // Canonical Toolpaths doc's Point Tables (opposite of this file's prior ly<0=inward convention).
+
+    // A rigid world-space frame anchored at a point on the real perimeter: S = position, (tx,ty) =
+    // unit tangent (direction of increasing arc-length), (nx,ny) = unit inward normal (always points
+    // toward the centroid, sign-resolved rather than assumed from polygon winding).
+    struct TangentFrame
+    {
+        Point2LL S;
+        double tx{}, ty{};
+        double nx{}, ny{};
+    };
+
+    // Resolves S(s), T(s), N(s) directly from the real polyline's own arc-length parametrization
+    // (ArcParam::pointAt / tangentAt) — NOT from an angle ray-cast against the centroid. Width
+    // (the lateral extent between a feature's two blend frames) must equal the caller's requested
+    // physical distance exactly regardless of local skin curvature or angle relative to the
+    // centroid; an angle-then-ray-cast resolution only preserves that distance where the perimeter
+    // happens to be locally circular about the centroid, and distorts it (roughly by 1/cos of the
+    // tangent's angle off the centroid-perpendicular) everywhere else. Arc-length is intrinsic to
+    // the curve, so it has no such distortion. (The anchor's OWN position is still resolved by
+    // angle/ray-cast elsewhere — that's a separate concern, distributing anchors around the part.)
+    static TangentFrame resolveFrame(const ArcParam& arc, const Point2LL& centroid, double s);
+
+    // Two rigid placements (Copy A at the feature's Start, Copy B at its End) of the entire
+    // canonical point cloud, affine-blended by t = (lx - x_s) / (x_e - x_s). x_s/x_e are the
+    // canonical x-coordinates (w-units) of the FIRST and LAST points emitted in traversal order
+    // (which for a CW-mirrored feature are the table's End/Start, swapped) - not necessarily the
+    // profile's x-extrema. x_sign folds the CW helix mirror into the tangent component only (the
+    // t-blend itself is direction-agnostic).
+    struct BlendPlacement
+    {
+        TangentFrame A, B;
+        double x_s{}, x_e{};
+        double x_sign{ 1.0 };
+
+        Point2LL place(double lx, double ly, coord_t w) const;
+    };
+
+    // theta_anchor/R_a locate the anchor itself (still angle/ray-cast-based — that positioning is
+    // unaffected by this). Copy A/B are then placed at s_anchor +/- x*w along the real perimeter's
+    // own arc-length, so the physical distance between them is exactly (x_e - x_s) * w regardless
+    // of local curvature or the anchor's angle relative to the centroid.
+    static BlendPlacement buildBlendPlacement(double theta_anchor, double R_a, double x_sign,
+                                              double x_s, double x_e,
+                                              const Point2LL& centroid, const ArcParam& arc, coord_t w);
 
     // One Wall of a Flange's wall stack: offset = inward distance from the OML to the
     // Wall's own toolpath centreline (µm); width = the Wall's own extrusion width (µm).
@@ -151,78 +203,100 @@ private:
     static void appendPolySegment(ExtrusionLine& line, const ArcParam& arc,
                                   double s0, double s1, coord_t w, bool add_start);
 
-    // Maps a canonical (lx, ly) point in w-units to a world Point2LL via the
-    // Conformal Placement Transform (spec: FeatherPrint_ConformalPlacement_Spec.md).
+    // Tessellates one canonical arc through the tangent-blend placement and appends to line.
     // lx: along-perimeter offset from anchor (positive = CCW-forward).
-    // ly: inward depth (negative = inward toward centroid, 0 = on perimeter).
-    // x_sign: +1 for CCW helix, -1 for CW helix (mirrors the canonical profile).
-    static Point2LL conformPlace(double lx, double ly, double x_sign,
-                                 double theta_anchor, double R_a,
-                                 const Point2LL& centroid, const ArcParam& arc,
-                                 coord_t w);
-
-    // Tessellates one canonical arc through conformPlace and appends to line.
+    // ly: inward depth (positive = inward toward centroid, 0 = on perimeter).
     static void appendCanonicalArc(ExtrusionLine& line,
                                    double cx, double cy, double R,
                                    double a_start_deg, double a_end_deg,
-                                   bool cw_arc, int segs, double x_sign,
-                                   double theta_anchor, double R_a,
-                                   const Point2LL& centroid, const ArcParam& arc,
+                                   bool cw_arc, int segs,
+                                   const BlendPlacement& blend,
                                    coord_t w, bool skip_first = false);
 
     // Ray from centroid at angle theta; returns arc-length of first polygon intersection, or -1.
     static double arcLengthAtAngle(const ArcParam& arc, const Point2LL& centroid, double theta);
 
+    // Stringer Trace — Spec REV 2.0 (corrected). G=0.5 (fixed default, not user-exposed),
+    // R2 = featherprint_stringer_width/2, R1 = R2+G, D = featherprint_stringer_depth.
+    // Point Table: Anchor(0,0) Start(-G,0) P1(R2,R1) P2(R2,D-R2) P3(-R2,D-R2) P4(-R2,R1) End(G,0).
+    // P1/P4 sit on the opposite side from Start/End, so Arc1/Arc3 genuinely cross the
+    // centreline near the top — a real self-intersecting crossover, per REV 2.0.
+    // Path: Arc1 Start->P1 R1 CCW c(-G,R1); Line1 P1->P2; Arc2 P2->P3 R2 CCW c(0,D-R2);
+    //       Line2 P3->P4; Arc3 P4->End R1 CCW c(G,R1).
+    // CW helix: same centres/radii, traversed in reverse order with each arc's direction flipped
+    // and x_sign=-1 (spec: CW Helix Mirroring).
     static void appendTrace(ExtrusionLine& line,
                             double theta_anchor, double R_a,
                             const Point2LL& centroid, const ArcParam& arc,
-                            bool is_cw, coord_t w, bool skip_first = false);
+                            bool is_cw, coord_t w,
+                            double D, double W, bool skip_first = false);
 
-    // Terminal loop at one open endpoint of an open polyline.
-    // Canonical profile: same arc radii as Stringer Trace, but the departure and return
-    // both land at the anchor (x=0). The loop extends 2w in the -x_sign direction from
-    // the anchor, dipping 2.5w inward. Followed by a closing perimeter segment that
-    // retraces the loop back to the anchor (the crossover bond).
+    // Whip Terminal — Spec REV 2.0. R1,R2 match Stringer's (R1=R2+G, R2=featherprint_stringer_width/2).
+    // D = featherprint_stringer_depth ("matching Stringer's canonical depth", same as R1/R2).
+    // Re-verified by hand against the corrected Stringer R1=R2+G formula (spec's own note had
+    // flagged this table stale from before that fix): Arc2 and Arc3 share one centre/radius
+    // (C2==C3 since R2=W/2 makes P3==P4), so together they form a single smooth 180° arc over
+    // the top regardless of which of R1/R2 is larger — no self-intersection or tangent
+    // discontinuity is introduced by R1 now exceeding R2. Validity mirrors Stringer's own
+    // D >= W+G bound (D >= R1+R2, else Line1 inverts).
+    // Point Table: Start(R1,0) P1(0,R1) P2(0,D-R2) P3(R2,D) P4(W-R2,D) P5(W,D-R2) End(W,Lw/2)
+    // (End.y = Lw/2 = 0.5 in w-units — confirmed intentional per REV 2.0: "the path ends at
+    // End, near the surface... on the far side", not exactly on the perimeter).
+    // Path: Arc1 Start->P1 R1 CW c(R1,R1); Line1 P1->P2; Arc2 P2->P3 R2 CW c(R2,D-R2);
+    //       Line2 P3->P4 (splay_L inserted here); Arc3 P4->P5 R2 CW c(W-R2,D-R2); Line3 P5->End.
     // s_anchor: arc-length position of the open endpoint.
     // x_sign  : +1 to extend forward (CCW, for the start endpoint), -1 to extend backward (CW, for the end endpoint).
-    // splay_L > 0 inserts a horizontal segment of length L·w at the loop bottom,
-    // widening the terminal to cover the deleted Stringer Trace footprint (Splay feature).
+    // splay_L > 0 widens the flat-bottom Line2 span by L*w, widening the terminal to cover the
+    // deleted Stringer Trace footprint (Splay feature).
     static void appendTerminal(ExtrusionLine& line,
                                double s_anchor, double x_sign,
                                const ArcParam& arc, const Point2LL& centroid,
                                coord_t w,
+                               double D, double R1, double R2, double W,
                                bool reversed = false,
                                double splay_L = 0.0);
 
-    // Lacing Trace canonical profile (w-units, anchor at midpoint between two colliding stringers):
-    //   Departure : (-0.75, 0)   Return : (+0.75, 0)
-    //   Left inner arc  : centre (-0.75, -0.5), R=0.5,  CW  90°→-90°   (inner eye, opens right)
-    //   Left outer arc  : centre (-0.75,-1.75), R=0.75, CCW 90°→270°   (outer loop, swings left to x=-1.5)
-    //   Right outer arc : centre (+0.75,-1.75), R=0.75, CCW -90°→90°   (outer loop, swings right to x=+1.5)
-    //   Right inner arc : centre (+0.75, -0.5), R=0.5,  CW  -90°→90°  (inner eye, opens left)
+    // Lacing Trace — per Spec REV 2.0's centers-first derivation, anchor at the midpoint between
+    // two colliding stringers. R1 = Lw/2, R2 = (D - Lw)/2, D = featherprint_lacing_depth,
+    // W = featherprint_lacing_width, G = 0.5 (fixed).
+    // Centres: C1(G+R1,R1) C2(W/2-R2,D-R2) C3(-C2.x,C2.y) C4(-C1.x,C1.y).
+    // Point Table: Start(C1.x,0) P1(C1.x,2R1) P2(C2.x,2R1) P3(C2.x,D) P4(0,D)
+    //              P5(C3.x,D) P6(C3.x,2R1) P7(C4.x,2R1) End(C4.x,0).
+    // Path (spec order): Arc1 Start->P1 R1 CCW C1; Line1 P1->P2; Arc2 P2->P3 R2 CW C2;
+    //       Line2 P3->P4; Line3 P4->P5; Arc3 P5->P6 R2 CW C3;
+    //       Line4 P6->P7; Arc4 P7->End R1 CCW C4.
+    // Implementation walks the REVERSE of the spec's own table (End->P7->...->Start, each arc
+    // direction flipped) because the spec's literal Start sits ahead of the anchor and End
+    // behind — backwards relative to the caller's stitching direction. Symmetric profile:
+    // x_sign = +1 unconditionally (no CW helix mirror needed).
     static void appendLacingTrace(ExtrusionLine& line,
                                   double theta_anchor, double R_a,
                                   const Point2LL& centroid, const ArcParam& arc,
-                                  coord_t w);
+                                  coord_t w, double D, double W);
 
-    // Flare Rim (Stringer/Lacing × Flange) — flat-bottomed filleted channel anchored at
-    // (0,0) on the true OML (the outer wall's own toolpath centreline), so the channel
-    // bottom stays pinned at a fixed 2.5w below the true OML regardless of the Flange's
-    // current wall-stack thickness:
-    //   T       = toolpath-centreline-to-toolpath-centreline OML-to-IML distance (w-units)
-    //   D = 2.5 - T (channel depth below the true OML), R = 0.75 * (D / 2.5)
-    //   W       = 2.0 for a Stringer anchor, 3.0 for a Lacing anchor (flat span at y=-T)
+    // Flare Rim (Stringer/Lacing × Flange) — per Parametric Canonical Toolpaths (WIP).md: a
+    // single-fillet 3-segment channel (Arc1 -> Line1 -> Arc2) anchored at (0,0) on the true OML
+    // (the outer wall's own toolpath centreline):
+    //   Q = total thickness (w-units) of the current Flange ramp layer's Wall stack — the sum
+    //       of each Wall's own width, not a plain Wall count, since some ramp layers include a
+    //       half-width (buried or outer) Wall ("Wall Number" per the WIP doc, corrected: a
+    //       count would under-charge a stack containing a half-width Wall, making the channel
+    //       shallower than the Wall stack it's welding into actually is)
+    //   D = featherprint_flare_depth setting (w-units); R1 = min(D - Q, W/2) (w-units) —
+    //       clamped to W/2 so Line1's span (W - 2*R1) can't go negative and cross the two end
+    //       arcs over each other when D is large relative to W
+    //   W = 2.0 for a Stringer anchor, 3.0 for a Lacing anchor (flat span at y=R1)
     //   oml_shift = the gap (w-units) between oml_arc's own ly=0 reference (the raw slice
     //               polygon) and the true OML — 0 except at the first Flange ramp layer,
     //               where the outer wall is a half-width wall offset outward of the raw
     //               polygon. Every canonical y-value is placed at (y - oml_shift) in
     //               oml_arc's own frame so the profile still anchors to the true OML.
     // theta_anchor/R_a must be evaluated against the OML (oml_arc), not the innermost wall,
-    // and oml_arc must also be passed as the `arc` used for the profile's radial reference.
+    // and oml_arc must also be passed as the `arc` used for the profile's tangent-blend frames.
     static void appendFlareRim(ExtrusionLine& line,
                                double theta_anchor, double R_a, double x_sign,
                                const Point2LL& centroid, const ArcParam& oml_arc,
-                               double T, double oml_shift, double W, coord_t w, bool skip_first = false);
+                               double Q, double D, double oml_shift, double W, coord_t w, bool skip_first = false);
 
     struct Anchor
     {
