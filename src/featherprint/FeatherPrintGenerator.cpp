@@ -5,9 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <limits>
 #include <numbers>
 
 #include "utils/AABB.h"
@@ -15,22 +12,6 @@
 
 namespace cura
 {
-
-// TEMPORARY diagnostic logging for the Whip Terminal malformed-loop investigation — writes to
-// %TEMP%\FeatherPrint_debug.log (unelevated-safe, unlike C:\ root). Remove once resolved.
-static void fpDebugLog(const std::string& msg)
-{
-    const char* tmp = std::getenv("TEMP");
-    if (! tmp) return;
-    std::string path = std::string(tmp) + "\\FeatherPrint_debug.log";
-    if (FILE* f = std::fopen(path.c_str(), "a"))
-    {
-        std::fwrite(msg.data(), 1, msg.size(), f);
-        std::fputc('\n', f);
-        std::fclose(f);
-    }
-}
-static coord_t g_fp_debug_z = 0; // set by generateOpen/generateFlangeOpen before Terminal calls, for logging only
 
 // ============================================================================
 // ArcParam helpers
@@ -741,7 +722,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
     const OpenPolyline& open_poly, coord_t z, const Settings& settings,
     int ramp_index, double helix_phase, const OpenLayerParams& params)
 {
-    g_fp_debug_z = z;
+    (void)z;
     if (open_poly.size() < 2)
         return {};
 
@@ -1368,27 +1349,9 @@ void FeatherPrintGenerator::appendTerminal(
 
     const double Ws = W + splay_L; // W widened by the Splay insertion on the far (P4/P5/End) side
 
-    if (reversed && s_anchor < 1.0)
-    {
-        // TEMPORARY: dump the raw boundary-edge vertices right at the anchor (s=0, the
-        // Flange-loop/Whip junction point) to see the actual local geometry driving the
-        // persistent malformed loop there.
-        std::string dump = fmt::format("[FP-TerminalRaw] z={:.2f}mm theta_anchor={:.1f}deg R_a={:.2f}mm total={:.2f}mm n={} :",
-            g_fp_debug_z / 1000.0, theta_anchor * 180.0 / std::numbers::pi, R_a / 1000.0, arc.total / 1000.0,
-            static_cast<int>(arc.poly->size()));
-        const int dump_n = std::min(8, static_cast<int>(arc.poly->size()));
-        for (int i = 0; i < dump_n; i++)
-        {
-            const Point2LL& p = (*arc.poly)[i];
-            dump += fmt::format(" [{}]=({:.3f},{:.3f})cum={:.4f}", i, p.X / 1000.0, p.Y / 1000.0, arc.cum_len[i] / 1000.0);
-        }
-        fpDebugLog(dump);
-    }
-
     if (! reversed)
     {
         BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, R1, Ws, centroid, arc, w);
-        const size_t dbg_start = line.junctions_.size();
         // Arc1: Start->P1, R1, CW, c=(R1,R1)
         appendCanonicalArc(line, R1, R1, R1, -90.0, 180.0, true, 8, bp, w, false);
         // Line1: P1->P2
@@ -1402,33 +1365,11 @@ void FeatherPrintGenerator::appendTerminal(
         // Line3: P5->End (End.y = Lw/2 = 0.5 in w-units, per Spec REV 2.0 — the return point
         // lands near, not exactly on, the perimeter)
         line.junctions_.emplace_back(bp.place(Ws, 0.5, w), w, 0);
-        {
-            double dist = std::hypot(static_cast<double>(bp.B.S.X - bp.A.S.X), static_cast<double>(bp.B.S.Y - bp.A.S.Y));
-            double tdot = bp.A.tx * bp.B.tx + bp.A.ty * bp.B.ty;
-            coord_t minx = std::numeric_limits<coord_t>::max(), maxx = std::numeric_limits<coord_t>::min();
-            coord_t miny = std::numeric_limits<coord_t>::max(), maxy = std::numeric_limits<coord_t>::min();
-            for (size_t i = dbg_start; i < line.junctions_.size(); i++)
-            {
-                Point2LL p = line.junctions_[i].p_;
-                minx = std::min(minx, p.X); maxx = std::max(maxx, p.X);
-                miny = std::min(miny, p.Y); maxy = std::max(maxy, p.Y);
-            }
-            double bboxw = (maxx - minx) / 1000.0, bboxh = (maxy - miny) / 1000.0;
-            fpDebugLog(fmt::format(
-                "[FP-Terminal] z={:.2f}mm reversed=0 s_anchor={:.2f}mm x_sign={:.0f} R_a={:.2f}mm theta_anchor={:.1f}deg "
-                "D={:.2f} R1={:.2f} R2={:.2f} W={:.2f} splay_L={:.2f} Ws={:.2f} A.S=({:.2f},{:.2f}) B.S=({:.2f},{:.2f}) "
-                "A-B_dist={:.2f}mm expected~{:.2f}mm tdot={:.3f} bbox=({:.2f}x{:.2f})mm",
-                g_fp_debug_z / 1000.0, s_anchor / 1000.0, x_sign, R_a / 1000.0, theta_anchor * 180.0 / std::numbers::pi,
-                D, R1, R2, W, splay_L, Ws,
-                bp.A.S.X / 1000.0, bp.A.S.Y / 1000.0, bp.B.S.X / 1000.0, bp.B.S.Y / 1000.0,
-                dist / 1000.0, (Ws - R1) * w / 1000.0, tdot, bboxw, bboxh));
-        }
     }
     else
     {
         // Reverse traversal (End->P5->P4->P3->P2->P1->Start), each arc's direction flipped.
         BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, Ws, R1, centroid, arc, w);
-        const size_t dbg_start = line.junctions_.size();
         // Line3 rev: End->P5 (emit both endpoints — this is the first segment of the reversal)
         line.junctions_.emplace_back(bp.place(Ws, 0.5, w), w, 0);
         line.junctions_.emplace_back(bp.place(Ws, D - R2, w), w, 0);
@@ -1442,27 +1383,6 @@ void FeatherPrintGenerator::appendTerminal(
         line.junctions_.emplace_back(bp.place(0.0, R1, w), w, 0);
         // Arc1 rev: P1->Start, R1, CCW, c=(R1,R1)
         appendCanonicalArc(line, R1, R1, R1, 180.0, -90.0, false, 8, bp, w, true);
-        {
-            double dist = std::hypot(static_cast<double>(bp.B.S.X - bp.A.S.X), static_cast<double>(bp.B.S.Y - bp.A.S.Y));
-            double tdot = bp.A.tx * bp.B.tx + bp.A.ty * bp.B.ty;
-            coord_t minx = std::numeric_limits<coord_t>::max(), maxx = std::numeric_limits<coord_t>::min();
-            coord_t miny = std::numeric_limits<coord_t>::max(), maxy = std::numeric_limits<coord_t>::min();
-            for (size_t i = dbg_start; i < line.junctions_.size(); i++)
-            {
-                Point2LL p = line.junctions_[i].p_;
-                minx = std::min(minx, p.X); maxx = std::max(maxx, p.X);
-                miny = std::min(miny, p.Y); maxy = std::max(maxy, p.Y);
-            }
-            double bboxw = (maxx - minx) / 1000.0, bboxh = (maxy - miny) / 1000.0;
-            fpDebugLog(fmt::format(
-                "[FP-Terminal] z={:.2f}mm reversed=1 s_anchor={:.2f}mm x_sign={:.0f} R_a={:.2f}mm theta_anchor={:.1f}deg "
-                "D={:.2f} R1={:.2f} R2={:.2f} W={:.2f} splay_L={:.2f} Ws={:.2f} A.S=({:.2f},{:.2f}) B.S=({:.2f},{:.2f}) "
-                "A-B_dist={:.2f}mm expected~{:.2f}mm tdot={:.3f} bbox=({:.2f}x{:.2f})mm",
-                g_fp_debug_z / 1000.0, s_anchor / 1000.0, x_sign, R_a / 1000.0, theta_anchor * 180.0 / std::numbers::pi,
-                D, R1, R2, W, splay_L, Ws,
-                bp.A.S.X / 1000.0, bp.A.S.Y / 1000.0, bp.B.S.X / 1000.0, bp.B.S.Y / 1000.0,
-                dist / 1000.0, (Ws - R1) * w / 1000.0, tdot, bboxw, bboxh));
-        }
     }
 }
 
@@ -1477,7 +1397,7 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
     double helix_phase,
     const OpenLayerParams& params)
 {
-    g_fp_debug_z = z;
+    (void)z;
     // open_poly is already oriented CCW in math coordinates by the caller.
     if (open_poly.size() < 2)
         return {};
