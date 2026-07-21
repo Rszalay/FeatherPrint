@@ -336,6 +336,18 @@ public:
     // Set during the helix pre-pass in FffPolygonGenerator.
     std::vector<Point2LL> fp_phase_origin;
 
+    // FeatherPrint: Curvature-Weighted Stringer Density (Spec REV 2.6) reference radius, in
+    // the same coord_t-valued double units as ArcParam's arc-lengths (µm). Computed ONCE for
+    // the whole mesh (not per layer, unlike fp_helix_phase/fp_phase_origin above) as
+    // R_ref = k_ref * R_avg, where R_avg is a length-weighted average of local perimeter
+    // radius-of-curvature sampled across every layer. 0.0 means "not computed" (feature
+    // inactive or a degenerate mesh with no measurable perimeter) — callers must treat that as
+    // "use raw arc-length, no warping" rather than passing it through. Set during the helix
+    // pre-pass in FffPolygonGenerator, in a first sequential loop across all layers before the
+    // existing per-layer phase/origin loop (which needs R_ref already known to compute
+    // W_total(z) for the updated Δphase formula).
+    double fp_r_ref{ 0.0 };
+
     std::vector<AngleDegrees> infill_angles; //!< a list of angle values which is cycled through to determine the infill angle of each layer
     std::vector<AngleDegrees> roofing_angles; //!< a list of angle values which is cycled through to determine the roofing angle of each layer
     std::vector<AngleDegrees> flooring_angles; //!< a list of angle values which is cycled through to determine the flooring angle of each layer

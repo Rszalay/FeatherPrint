@@ -178,6 +178,274 @@ double FeatherPrintGenerator::ArcParam::nearestArcPos(const Point2LL& target) co
     return best_s;
 }
 
+// ---- Curvature-Weighted Stringer Density (Spec REV 2.6) -----------------------------------
+
+void FeatherPrintGenerator::ArcParam::ensureResampled(double step) const
+{
+    if (resample_built_)
+        return;
+    resample_built_ = true;
+    resample_pts_.clear();
+    if (total < 1.0)
+        return;
+
+    // Divide into a WHOLE number of equal-length intervals (not literal fixed-length steps) so
+    // every resampled segment is exactly the same physical length on this ring, with no leftover
+    // odd-length final segment -- that uniformity is the entire point of this method.
+    const int n_intervals = std::max(is_open ? 2 : 3, static_cast<int>(std::llround(total / step)));
+    const int n_points = is_open ? (n_intervals + 1) : n_intervals;
+    resample_pts_.reserve(n_points);
+    for (int i = 0; i < n_points; i++)
+    {
+        // Phase-locked to resample_phase_s (the caller-supplied Phase Origin arc-length), NOT
+        // simply i/n_intervals*total from raw s=0 -- see resample_phase_s's declaration for why
+        // an unlocked grid reintroduced the exact vertex-reindexing instability Anchor
+        // Distribution was built to eliminate.
+        double s = resample_phase_s + (static_cast<double>(i) / n_intervals) * total;
+        if (! is_open)
+        {
+            s = std::fmod(s, total);
+            if (s < 0.0) s += total;
+        }
+        resample_pts_.push_back(pointAt(s));
+    }
+}
+
+double FeatherPrintGenerator::ArcParam::curvatureRadiusAt(double s) const
+{
+    // Estimated against a UNIFORMLY RESAMPLED copy of this ring (ensureResampled), not the raw
+    // vertices. Three prior approaches here (a fixed arc-length window, a fixed vertex count, a
+    // window that grows to a minimum physical span) all eventually failed on a real part's mesh
+    // -- every one of them was really trying to reason about "how many real facets does my
+    // window span" against a raw vertex spacing that turned out to be wildly non-uniform
+    // (sub-mm in places, several mm in others, confirmed via diagnostic logging). Resampling
+    // once to even spacing removes the question: every curvature estimate below is a plain
+    // three-point turning angle between adjacent resampled points, which are the same physical
+    // distance apart everywhere on this ring by construction, so there's no window-vs-facet
+    // aliasing left to have a failure mode.
+    constexpr double kResampleStep = 1000.0; // 1mm -- tentative, not yet validated against a tight-fillet case
+    ensureResampled(kResampleStep);
+    const int m = static_cast<int>(resample_pts_.size());
+    if (m < 3)
+        return 1.0e9;
+
+    double sN = s;
+    if (is_open)
+        sN = std::max(0.0, std::min(total, sN));
+    else
+    {
+        sN = std::fmod(sN, total);
+        if (sN < 0.0) sN += total;
+    }
+
+    const int n_intervals = is_open ? (m - 1) : m;
+    // Invert the same phase offset ensureResampled applied when building the grid, so this
+    // lookup lands on the correct resampled index regardless of resample_phase_s.
+    double rel = is_open ? sN : (sN - resample_phase_s);
+    if (! is_open)
+    {
+        rel = std::fmod(rel, total);
+        if (rel < 0.0) rel += total;
+    }
+    int k = static_cast<int>(std::llround(rel / total * n_intervals));
+    int prev, next;
+    if (is_open)
+    {
+        k = std::max(1, std::min(m - 2, k));
+        prev = k - 1;
+        next = k + 1;
+    }
+    else
+    {
+        k = ((k % m) + m) % m;
+        prev = (k - 1 + m) % m;
+        next = (k + 1) % m;
+    }
+
+    const Point2LL& a = resample_pts_[prev];
+    const Point2LL& b = resample_pts_[k];
+    const Point2LL& c = resample_pts_[next];
+    double ex0 = static_cast<double>(b.X - a.X), ey0 = static_cast<double>(b.Y - a.Y);
+    double ex1 = static_cast<double>(c.X - b.X), ey1 = static_cast<double>(c.Y - b.Y);
+    const double l0 = std::sqrt(ex0 * ex0 + ey0 * ey0);
+    const double l1 = std::sqrt(ex1 * ex1 + ey1 * ey1);
+    if (l0 < 1e-6 || l1 < 1e-6)
+        return 1.0e9;
+    const double ds = l0 + l1;
+    ex0 /= l0; ey0 /= l0;
+    ex1 /= l1; ey1 /= l1;
+    const double cross = ex0 * ey1 - ey0 * ex1;
+    const double dot   = ex0 * ex1 + ey0 * ey1;
+    const double dtheta = std::abs(std::atan2(cross, dot));
+    if (dtheta < 1e-6)
+        return 1.0e9; // no measurable turning here -- treat as straight
+    return ds / dtheta;
+}
+
+void FeatherPrintGenerator::ArcParam::buildWarp(double R_ref)
+{
+    if (R_ref <= 0.0)
+        return; // Curvature-Weighted Stringer Density inactive -- leave cum_warp empty (identity fallback)
+    if (R_ref < 1.0)
+        R_ref = 1.0;
+
+    // Numerical safety clamps on rho = R_c/R_ref (not on curvatureRadiusAt's own large-value
+    // return): the upper clamp is what actually prevents a straight segment (R_c -> infinity)
+    // from producing an unbounded warped length; the lower clamp keeps a very tight curl from
+    // collapsing a nonzero real span to ~zero warped length, which would break the monotonic
+    // bijection buildWarp/fromWarped both depend on. Exact values are an implementation-level
+    // tuning knob per the spec's own framing, not a designer-facing parameter.
+    constexpr double kMinRho = 0.05;
+    constexpr double kMaxRho = 20.0;
+
+    const int n = static_cast<int>(poly->size());
+    cum_warp.assign(n, 0.0);
+
+    auto rhoAt = [&](double s)
+    {
+        double rho = curvatureRadiusAt(s) / R_ref;
+        return std::min(std::max(rho, kMinRho), kMaxRho);
+    };
+
+    double running = 0.0;
+    for (int i = 0; i < n; i++)
+    {
+        int j = (i + 1) % n;
+        if (is_open && j == 0)
+            break;
+        double seg_start = cum_len[i];
+        double seg_end   = (j == 0) ? total : cum_len[j];
+        double seg_len = seg_end - seg_start;
+        double rho0 = rhoAt(seg_start);
+        double rho1 = rhoAt(seg_end);
+        running += 0.5 * (rho0 + rho1) * seg_len;
+        if (j != 0)
+            cum_warp[j] = running;
+    }
+    total_warped = running;
+}
+
+double FeatherPrintGenerator::ArcParam::toWarped(double s) const
+{
+    if (cum_warp.empty())
+        return s; // Curvature-Weighted Stringer Density inactive -- identity
+
+    if (is_open)
+        s = std::max(0.0, std::min(total, s));
+    else
+    {
+        s = std::fmod(s, total);
+        if (s < 0.0) s += total;
+    }
+
+    const int n = static_cast<int>(poly->size());
+    for (int i = 0; i < n; i++)
+    {
+        int j = (i + 1) % n;
+        if (is_open && j == 0) break;
+        double seg_start = cum_len[i];
+        double seg_end   = (j == 0) ? total : cum_len[j];
+        if (s <= seg_end + 1e-6)
+        {
+            double seg_len = seg_end - seg_start;
+            double t = (seg_len > 1e-6) ? (s - seg_start) / seg_len : 0.0;
+            t = std::max(0.0, std::min(1.0, t));
+            double w_start = cum_warp[i];
+            double w_end   = (j == 0) ? total_warped : cum_warp[j];
+            return w_start + t * (w_end - w_start);
+        }
+    }
+    return is_open ? total_warped : 0.0;
+}
+
+double FeatherPrintGenerator::ArcParam::fromWarped(double w_target) const
+{
+    if (cum_warp.empty())
+        return w_target; // Curvature-Weighted Stringer Density inactive -- identity
+
+    if (is_open)
+        w_target = std::max(0.0, std::min(total_warped, w_target));
+    else
+    {
+        w_target = std::fmod(w_target, total_warped);
+        if (w_target < 0.0) w_target += total_warped;
+    }
+
+    const int n = static_cast<int>(poly->size());
+    for (int i = 0; i < n; i++)
+    {
+        int j = (i + 1) % n;
+        if (is_open && j == 0) break;
+        double w_start = cum_warp[i];
+        double w_end   = (j == 0) ? total_warped : cum_warp[j];
+        if (w_target <= w_end + 1e-6)
+        {
+            double seg_w = w_end - w_start;
+            double t = (seg_w > 1e-9) ? (w_target - w_start) / seg_w : 0.0;
+            t = std::max(0.0, std::min(1.0, t));
+            double s_start = cum_len[i];
+            double s_end   = (j == 0) ? total : cum_len[j];
+            return s_start + t * (s_end - s_start);
+        }
+    }
+    return is_open ? total : 0.0;
+}
+
+void FeatherPrintGenerator::accumulateCurvatureStats(const std::vector<Point2LL>& ring_pts, double& weighted_sum, double& length_sum)
+{
+    if (ring_pts.size() < 3)
+        return;
+    Polygon tmp;
+    for (const Point2LL& p : ring_pts)
+        tmp.push_back(p);
+    ArcParam arc = buildArcParam(tmp);
+    if (arc.total < 1e-6)
+        return;
+
+    // Absolute numerical safety cap on raw R_c -- R_ref isn't known yet at this stage (this IS
+    // the pre-pass that determines R_avg, which R_ref is derived from), so the rho-based clamp
+    // buildWarp uses can't apply here; a large fixed cap (100 m in coord_t/µm units) keeps a
+    // near-straight segment from dominating the weighted average without needing R_ref first.
+    constexpr double kAbsMaxRc = 1.0e8;
+    const int n = static_cast<int>(tmp.size());
+    for (int i = 0; i < n; i++)
+    {
+        int j = (i + 1) % n;
+        double seg_start = arc.cum_len[i];
+        double seg_end   = (j == 0) ? arc.total : arc.cum_len[j];
+        double seg_len = seg_end - seg_start;
+        double rc0 = std::min(arc.curvatureRadiusAt(seg_start), kAbsMaxRc);
+        double rc1 = std::min(arc.curvatureRadiusAt(seg_end), kAbsMaxRc);
+        weighted_sum += 0.5 * (rc0 + rc1) * seg_len;
+        length_sum   += seg_len;
+    }
+}
+
+void FeatherPrintGenerator::computeWarpedTotal(const std::vector<Point2LL>& ring_pts, double R_ref, const Point2LL& phase_origin, double& total, double& total_warped)
+{
+    total = 0.0;
+    total_warped = 0.0;
+    if (ring_pts.size() < 3)
+        return;
+    Polygon tmp;
+    for (const Point2LL& p : ring_pts)
+        tmp.push_back(p);
+    ArcParam arc = buildArcParam(tmp);
+    total = arc.total;
+    if (R_ref > 0.0)
+    {
+        // Phase-lock the curvature-resampling grid to this Layer's own Phase Origin BEFORE
+        // buildWarp triggers ensureResampled -- see resample_phase_s's declaration.
+        arc.resample_phase_s = arc.nearestArcPos(phase_origin);
+        arc.buildWarp(R_ref);
+        total_warped = arc.total_warped;
+    }
+    else
+    {
+        total_warped = arc.total;
+    }
+}
+
 Point2LL FeatherPrintGenerator::centroidBbox(const Polygon& poly)
 {
     AABB bb(poly);
@@ -604,7 +872,7 @@ OpenPolyline FeatherPrintGenerator::radialOffsetOpen(const OpenPolyline& poly, c
     return result;
 }
 
-VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase, Point2LL phase_origin)
+VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase, Point2LL phase_origin, double R_ref)
 {
     const coord_t w = settings.get<coord_t>("featherprint_line_width");
 
@@ -667,19 +935,28 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
         const double w_d = static_cast<double>(w);
         const double helix_frac  = std::fmod(helix_phase, 1.0);
         const double arc_ref     = arc_oml.nearestArcPos(phase_origin);
-        const double ccw_advance = std::fmod(helix_frac * arc_oml.total + arc_ref, arc_oml.total);
-        const double cw_advance  = std::fmod(arc_ref - helix_frac * arc_oml.total + arc_oml.total, arc_oml.total);
+        // Phase-lock the curvature-resampling grid to Phase Origin BEFORE buildWarp triggers
+        // ensureResampled -- see ArcParam::resample_phase_s's declaration for why this order
+        // matters (an unlocked grid reintroduces vertex-reindexing instability).
+        arc_oml.resample_phase_s = arc_ref;
+        arc_oml.buildWarp(R_ref); // Curvature-Weighted Stringer Density (REV 2.6); no-op if R_ref <= 0
+        const double arc_oml_total_w = arc_oml.cum_warp.empty() ? arc_oml.total : arc_oml.total_warped;
+        const double origin_w    = arc_oml.toWarped(arc_ref);
+        const double ccw_advance_w = std::fmod(helix_frac * arc_oml_total_w + origin_w, arc_oml_total_w);
+        const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_oml_total_w + arc_oml_total_w, arc_oml_total_w);
 
         // OML anchor positions, CCW+CW interleaved and sorted by arc position so adjacent
         // opposite-direction anchors can be tested for a Lacing collision (same pattern as
-        // the main generate() collision pass).
+        // the main generate() collision pass). Distributed in warped space (REV 2.6), then
+        // inverted back to real arc-length via fromWarped -- everything downstream of this
+        // (collision detection, Flare Rim placement) operates on real s exactly as before.
         struct OmlAnchor { double s; bool is_cw; bool skip{ false }; int pair_idx{ -1 }; };
         std::vector<OmlAnchor> oml_anchors;
         oml_anchors.reserve(2 * N);
         for (int i = 0; i < N; i++)
-            oml_anchors.push_back({std::fmod(static_cast<double>(i) / N * arc_oml.total + ccw_advance, arc_oml.total), false});
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + ccw_advance_w, arc_oml_total_w)), false});
         for (int i = 0; i < N; i++)
-            oml_anchors.push_back({std::fmod(static_cast<double>(i) / N * arc_oml.total + cw_advance,  arc_oml.total), true });
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + cw_advance_w,  arc_oml_total_w)), true });
         std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
 
         // Two Stringer anchors must merge into one Lacing Rim once their *widened* Flare Rim
@@ -1276,7 +1553,8 @@ VariableWidthLines FeatherPrintGenerator::generate(
     coord_t z,
     const Settings& settings,
     double helix_phase,
-    Point2LL phase_origin)
+    Point2LL phase_origin,
+    double R_ref)
 {
     seam_pt_ = Point2LL(0, 0);
 
@@ -1310,17 +1588,34 @@ VariableWidthLines FeatherPrintGenerator::generate(
     // giving constant intersection angle across the full height of a tapered tube.
     const double helix_frac = std::fmod(helix_phase, 1.0);
     const double arc_ref    = arc.nearestArcPos(phase_origin);
-    // CCW helix advances with z; CW helix retreats — geodesic interlocking pair.
-    const double ccw_advance = std::fmod(helix_frac * arc.total + arc_ref, arc.total);
-    const double cw_advance  = std::fmod(arc_ref - helix_frac * arc.total + arc.total, arc.total);
+
+    // Curvature-Weighted Stringer Density (Spec REV 2.6): R_ref (= k_ref * R_avg) is passed in
+    // already computed once for the whole mesh; buildWarp is a no-op (leaves cum_warp empty,
+    // toWarped/fromWarped become the identity) when R_ref <= 0, so this is safe to call
+    // unconditionally and behaves as "feature inactive" automatically. Phase-lock the
+    // curvature-resampling grid to Phase Origin (arc_ref) BEFORE buildWarp triggers
+    // ensureResampled -- see ArcParam::resample_phase_s's declaration; must run after arc_ref
+    // is computed above, not before.
+    arc.resample_phase_s = arc_ref;
+    arc.buildWarp(R_ref);
+    const double arc_total_w = (arc.cum_warp.empty()) ? arc.total : arc.total_warped;
+    // Phase Origin itself is still a REAL arc-length landmark (Anchor Distribution's walk
+    // operates in real space, unaffected by REV 2.6); only the per-stringer distribution below
+    // is done in the warped coordinate, per the spec's own scoping.
+    const double origin_w = arc.toWarped(arc_ref);
+    // CCW helix advances with z; CW helix retreats — geodesic interlocking pair. Advance
+    // magnitudes are expressed in warped units (arc_total_w), so a monotonic re-parametrization
+    // can't break the ring-wide synchronized-crossing property (see spec's own argument for why).
+    const double ccw_advance_w = std::fmod(helix_frac * arc_total_w + origin_w, arc_total_w);
+    const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_total_w + arc_total_w, arc_total_w);
     const double w_d         = static_cast<double>(w);
 
     std::vector<Anchor> anchors;
     anchors.reserve(2 * N);
     for (int i = 0; i < N; i++)
-        anchors.push_back({ std::fmod(static_cast<double>(i) / N * arc.total + ccw_advance, arc.total), false });
+        anchors.push_back({ arc.fromWarped(std::fmod(static_cast<double>(i) / N * arc_total_w + ccw_advance_w, arc_total_w)), false });
     for (int i = 0; i < N; i++)
-        anchors.push_back({ std::fmod(static_cast<double>(i) / N * arc.total + cw_advance,  arc.total), true  });
+        anchors.push_back({ arc.fromWarped(std::fmod(static_cast<double>(i) / N * arc_total_w + cw_advance_w,  arc_total_w)), true  });
     std::sort(anchors.begin(), anchors.end(), [](const Anchor& a, const Anchor& b) { return a.s < b.s; });
 
     const int total_anchors = static_cast<int>(anchors.size());
@@ -1370,7 +1665,10 @@ VariableWidthLines FeatherPrintGenerator::generate(
         }
     }
 
-    // Seam at the CCW helix-0 departure
+    // Seam at the CCW helix-0 departure. anchors[].s is real arc-length (already inverted via
+    // fromWarped above); ccw_advance_w is warped, so it must be inverted the same way for this
+    // real-space nearest-anchor comparison.
+    const double ccw_advance = arc.fromWarped(ccw_advance_w);
     int start_idx = 0;
     {
         double min_dist = arc.total;

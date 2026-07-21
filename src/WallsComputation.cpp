@@ -38,12 +38,14 @@ WallsComputation::WallsComputation(
     const LayerIndex layer_nr,
     double fp_helix_phase,
     LayerIndex fp_flange_start_layer,
-    Point2LL fp_phase_origin)
+    Point2LL fp_phase_origin,
+    double fp_r_ref)
     : settings_(settings)
     , layer_nr_(layer_nr)
     , fp_helix_phase_(fp_helix_phase)
     , fp_flange_start_layer_(fp_flange_start_layer)
     , fp_phase_origin_(fp_phase_origin)
+    , fp_r_ref_(fp_r_ref)
 {
 }
 
@@ -80,11 +82,11 @@ void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_t
             if (is_flange_layer)
             {
                 const int ramp_index = static_cast<int>(layer_nr_ - fp_flange_start_layer_);
-                wl = fp.generateFlange(gen_outline, settings_, ramp_index, fp_helix_phase_, fp_phase_origin_);
+                wl = fp.generateFlange(gen_outline, settings_, ramp_index, fp_helix_phase_, fp_phase_origin_, fp_r_ref_);
             }
             else
             {
-                wl = fp.generate(gen_outline, z_coord, settings_, fp_helix_phase_, fp_phase_origin_);
+                wl = fp.generate(gen_outline, z_coord, settings_, fp_helix_phase_, fp_phase_origin_, fp_r_ref_);
             }
             part->wall_toolpaths = { std::move(wl) };
             // Inner area: the region enclosed by the innermost printed Wall at this Layer, so

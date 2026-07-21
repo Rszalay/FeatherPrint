@@ -36,6 +36,7 @@
 #include "TopSurface.h"
 #include "TreeSupport.h"
 #include "WallsComputation.h"
+#include "featherprint/FeatherPrintGenerator.h"
 #include "settings/EnumSettings.h"
 #include "infill/DensityProvider.h"
 #include "infill/ImageBasedDensityProvider.h"
@@ -528,6 +529,146 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
         const coord_t fp_w = mesh.settings.get<coord_t>("featherprint_line_width");
         mesh.fp_helix_phase.resize(mesh_layer_count, 0.0);
         mesh.fp_phase_origin.resize(mesh_layer_count, Point2LL(0, 0));
+
+        // Gathers this layer's outer-wall point ring: the largest closed polygon part, or (if
+        // none) the same full virtual ring (real arcs + gap chords) WallsComputation and
+        // generateOpen build for an open-manifold layer. Shared by the R_avg pre-pass below and
+        // the existing phase/origin loop that follows it — both need the identical ring.
+        //
+        // Closed-polygon case is put through the SAME morphological open (offset in by w/2,
+        // then out by w/2) WallsComputation applies before ever calling generate() — this is
+        // NOT optional cosmetic parity: curvature is far more sensitive to small-scale mesh-
+        // slicing facet noise than plain perimeter length is (which is all this ring was used
+        // for before REV 2.6). Measuring curvature against the RAW, un-smoothed slice polygon
+        // here while generate() itself places anchors against the cleaned gen_outline produces
+        // two genuinely different curvature signals for "the same" layer — the phase integral
+        // (built from raw-polygon noise) and the per-layer warp used for placement (built from
+        // the cleaned polygon) end up uncorrelated, which reads as anchors "randomly" failing to
+        // track no matter how the curvature estimator itself is refined. Fixed by smoothing here
+        // to match, rather than by further tuning the estimator (which had no effect, since the
+        // estimator wasn't the actual mismatch).
+        const coord_t fp_w_smooth = fp_w;
+        auto gatherRing = [fp_w_smooth](const SliceLayer& layer) -> std::vector<Point2LL>
+        {
+            double best_area = 0.0;
+            std::vector<Point2LL> ring_pts;
+            for (const SliceLayerPart& part : layer.parts)
+                for (const Polygon& poly : part.outline)
+                {
+                    double a = std::abs(poly.area());
+                    if (a > best_area)
+                    {
+                        best_area = a;
+                        ring_pts.assign(poly.begin(), poly.end());
+                    }
+                }
+            if (! ring_pts.empty())
+            {
+                Polygon raw_poly;
+                for (const Point2LL& p : ring_pts)
+                    raw_poly.push_back(p);
+                Shape smoothed = Shape(raw_poly).offset(-fp_w_smooth / 2).offset(fp_w_smooth / 2);
+                const Polygon* largest = nullptr;
+                double la = 0.0;
+                for (const Polygon& p : smoothed)
+                {
+                    double a = std::abs(p.area());
+                    if (a > la) { la = a; largest = &p; }
+                }
+                if (largest)
+                    ring_pts.assign(largest->begin(), largest->end());
+                return ring_pts;
+            }
+            if (layer.open_polylines.empty())
+                return ring_pts;
+
+            // Open-manifold layers: build the same full virtual ring that WallsComputation
+            // and generateOpen use. All arc fragments are concatenated in angular order
+            // (sorted by start angle from the layer centroid); gap chords between consecutive
+            // arcs and the closing chord are implicit polygon segments, matching the
+            // full_ring_total in generateOpen.
+            coord_t bbx0{}, bbx1{}, bby0{}, bby1{};
+            bool first = true;
+            for (const OpenPolyline& poly : layer.open_polylines)
+                for (const Point2LL& p : poly)
+                {
+                    if (first) { bbx0 = bbx1 = p.X; bby0 = bby1 = p.Y; first = false; }
+                    if (p.X < bbx0) bbx0 = p.X; if (p.X > bbx1) bbx1 = p.X;
+                    if (p.Y < bby0) bby0 = p.Y; if (p.Y > bby1) bby1 = p.Y;
+                }
+            const Point2LL cx((bbx0 + bbx1) / 2, (bby0 + bby1) / 2);
+
+            // Orient each arc (CCW in math = positive virtual-closed area) so that poly[0] is
+            // the correct start point for angle-sorting and chord measurement. Without this,
+            // reversed arcs sort by the wrong endpoint, producing wrong inter-arc chord lengths
+            // and an inflated full_ring_total.
+            struct OrientedRef
+            {
+                std::vector<Point2LL> pts; // oriented points (may be reversed copy)
+                double angle{};
+            };
+            std::vector<OrientedRef> refs;
+            for (const OpenPolyline& poly : layer.open_polylines)
+            {
+                if (poly.size() < 2) continue;
+                double area2 = 0.0;
+                for (size_t k = 0; k < poly.size(); k++)
+                {
+                    size_t j = (k + 1) % poly.size();
+                    area2 += static_cast<double>(poly[k].X) * poly[j].Y
+                           - static_cast<double>(poly[j].X) * poly[k].Y;
+                }
+                OrientedRef ref;
+                ref.pts.resize(poly.size());
+                if (area2 < 0.0)
+                    std::reverse_copy(poly.begin(), poly.end(), ref.pts.begin());
+                else
+                    std::copy(poly.begin(), poly.end(), ref.pts.begin());
+                double dx = ref.pts[0].X - cx.X, dy = ref.pts[0].Y - cx.Y;
+                ref.angle = std::atan2(dy, dx);
+                refs.push_back(std::move(ref));
+            }
+            std::sort(refs.begin(), refs.end(), [](const OrientedRef& a, const OrientedRef& b){ return a.angle < b.angle; });
+
+            for (const OrientedRef& ref : refs)
+                ring_pts.insert(ring_pts.end(), ref.pts.begin(), ref.pts.end());
+            return ring_pts;
+        };
+
+        auto ringLength = [](const std::vector<Point2LL>& pts) -> double
+        {
+            if (pts.size() < 2) return 0.0;
+            double total = 0.0;
+            const size_t n = pts.size();
+            for (size_t i = 0; i + 1 < n; i++)
+            {
+                double dx = pts[i + 1].X - pts[i].X, dy = pts[i + 1].Y - pts[i].Y;
+                total += std::sqrt(dx * dx + dy * dy);
+            }
+            double cdx = pts[0].X - pts[n - 1].X, cdy = pts[0].Y - pts[n - 1].Y;
+            total += std::sqrt(cdx * cdx + cdy * cdy);
+            return total;
+        };
+
+        // Curvature-Weighted Stringer Density (Spec REV 2.6) -- DISABLED as-built pending
+        // further investigation. Six rounds of fixes to the per-layer curvature estimator
+        // (fixed arc-length window at several sizes, fixed vertex count, a window grown to a
+        // minimum physical span, uniform resampling, and finally resample-grid phase-locking to
+        // Anchor Distribution's own Phase Origin -- a genuine structural bug, confirmed and
+        // fixed) all failed to produce a stable W_total(z) on a real part: total_warped kept
+        // swinging by a large factor between layers whose real geometry (arc_total_mm) was
+        // essentially unchanged. The likely remaining cause is NOT a bug in this per-layer
+        // estimator: different Z-layers slice through different mesh triangle edges even on a
+        // smooth CAD surface, so each layer's cross-section polygon is built from a genuinely
+        // different vertex set layer to layer -- no amount of smoothing a curvature estimate
+        // reconstructed from one layer's own 2D slice fixes that; it would need curvature
+        // derived from the source mesh's 3D geometry before slicing, which is a materially
+        // bigger undertaking left for a dedicated future session. mesh.fp_r_ref stays 0.0 here
+        // unconditionally, which every downstream caller (buildWarp, computeWarpedTotal) already
+        // treats as "feature inactive" -- Δphase and anchor placement both fall back to plain
+        // uniform arc-length spacing, matching pre-REV-2.6 behavior exactly.
+        mesh.fp_r_ref = 0.0;
+
         double phase = 0.0;
         Point2LL fp_prev_origin{};
         bool fp_have_prev_origin = false;
@@ -536,124 +677,24 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
             mesh.fp_helix_phase[layer_nr] = std::fmod(phase, 1.0);
             const SliceLayer& layer = mesh.layers[layer_nr];
 
-            // Compute perimeter reference from the largest closed polygon part.
-            double best_area    = 0.0;
-            double arc_total_mm = 0.0;
             // Anchor Distribution (Spec REV 2.2): the outer wall's own point set for this
-            // layer, gathered here (closed-polygon case below, open-manifold virtual-ring
-            // case further down) so the one-time seed-point capture after this block can use
-            // it regardless of which case applied — see the seeding block below.
-            std::vector<Point2LL> fp_seed_ring_pts;
-            for (const SliceLayerPart& part : layer.parts)
-            {
-                for (const Polygon& poly : part.outline)
-                {
-                    double a = std::abs(poly.area());
-                    if (a > best_area)
-                    {
-                        best_area = a;
-                        double len = 0.0;
-                        for (size_t i = 0; i < poly.size(); i++)
-                        {
-                            const Point2LL& p0 = poly[i];
-                            const Point2LL& p1 = poly[(i + 1) % poly.size()];
-                            double dx = p1.X - p0.X, dy = p1.Y - p0.Y;
-                            len += std::sqrt(dx * dx + dy * dy);
-                        }
-                        arc_total_mm = len / 1000.0;
-                        fp_seed_ring_pts.assign(poly.begin(), poly.end());
-                    }
-                }
-            }
-
-            // Open-manifold layers: build the same full virtual ring that WallsComputation
-            // and generateOpen use so the helix phase advances by the correct perimeter.
-            // All arc fragments are concatenated in angular order (sorted by start angle from
-            // the layer centroid); gap chords between consecutive arcs and the closing chord
-            // are implicit polygon segments, matching the full_ring_total in generateOpen.
-            if (arc_total_mm < 1e-6 && ! layer.open_polylines.empty())
-            {
-                // Centroid from bounding box of all open polylines
-                coord_t bbx0{}, bbx1{}, bby0{}, bby1{};
-                bool first = true;
-                for (const OpenPolyline& poly : layer.open_polylines)
-                    for (const Point2LL& p : poly)
-                    {
-                        if (first) { bbx0 = bbx1 = p.X; bby0 = bby1 = p.Y; first = false; }
-                        if (p.X < bbx0) bbx0 = p.X; if (p.X > bbx1) bbx1 = p.X;
-                        if (p.Y < bby0) bby0 = p.Y; if (p.Y > bby1) bby1 = p.Y;
-                    }
-                const Point2LL cx((bbx0 + bbx1) / 2, (bby0 + bby1) / 2);
-
-                // Orient each arc (CCW in math = positive virtual-closed area) so that
-                // poly[0] is the correct start point for angle-sorting and chord measurement.
-                // Without this, reversed arcs sort by the wrong endpoint, producing wrong
-                // inter-arc chord lengths and an inflated full_ring_total.
-                struct OrientedRef
-                {
-                    std::vector<Point2LL> pts; // oriented points (may be reversed copy)
-                    double angle{};
-                };
-                std::vector<OrientedRef> refs;
-                for (const OpenPolyline& poly : layer.open_polylines)
-                {
-                    if (poly.size() < 2) continue;
-                    // Build virtual closed polygon to check winding
-                    double area2 = 0.0;
-                    for (size_t k = 0; k < poly.size(); k++)
-                    {
-                        size_t j = (k + 1) % poly.size();
-                        area2 += static_cast<double>(poly[k].X) * poly[j].Y
-                               - static_cast<double>(poly[j].X) * poly[k].Y;
-                    }
-                    OrientedRef ref;
-                    ref.pts.resize(poly.size());
-                    if (area2 < 0.0)
-                        std::reverse_copy(poly.begin(), poly.end(), ref.pts.begin());
-                    else
-                        std::copy(poly.begin(), poly.end(), ref.pts.begin());
-                    double dx = ref.pts[0].X - cx.X, dy = ref.pts[0].Y - cx.Y;
-                    ref.angle = std::atan2(dy, dx);
-                    refs.push_back(std::move(ref));
-                }
-                std::sort(refs.begin(), refs.end(), [](const OrientedRef& a, const OrientedRef& b){ return a.angle < b.angle; });
-
-                // Sum all arc segment lengths; inter-arc and closing chords are added via
-                // the last-to-next-first distances, matching the implicit polygon edges.
-                double total = 0.0;
-                for (size_t i = 0; i < refs.size(); i++)
-                {
-                    const auto& pts = refs[i].pts;
-                    for (size_t k = 0; k + 1 < pts.size(); k++)
-                    {
-                        double dx = pts[k + 1].X - pts[k].X, dy = pts[k + 1].Y - pts[k].Y;
-                        total += std::sqrt(dx * dx + dy * dy);
-                    }
-                    // chord to next arc's start (or back to first arc's start for the last)
-                    const auto& next_pts = refs[(i + 1) % refs.size()].pts;
-                    double cdx = next_pts[0].X - pts.back().X;
-                    double cdy = next_pts[0].Y - pts.back().Y;
-                    total += std::sqrt(cdx * cdx + cdy * cdy);
-                }
-                arc_total_mm = total / 1000.0;
-
-                fp_seed_ring_pts.clear();
-                for (const OrientedRef& ref : refs)
-                    fp_seed_ring_pts.insert(fp_seed_ring_pts.end(), ref.pts.begin(), ref.pts.end());
-            }
-
-            if (arc_total_mm > 1e-6)
-            {
-                const double layer_height_mm = static_cast<double>(layer.printZ) / 1000.0
-                    - (layer_nr > 0 ? static_cast<double>(mesh.layers[layer_nr - 1].printZ) / 1000.0 : 0.0);
-                phase += layer_height_mm / (arc_total_mm * tan_alpha);
-            }
+            // layer (closed-polygon case, or the open-manifold virtual ring) — used both below
+            // for the phase/W_total increment and by the seed-point capture that follows.
+            std::vector<Point2LL> fp_seed_ring_pts = gatherRing(layer);
+            const double arc_total_mm = ringLength(fp_seed_ring_pts) / 1000.0;
 
             // Anchor Distribution (Spec REV 2.2, continuity-tracking variant — see
             // fp_phase_origin's declaration for why this deviates from the spec's literal
             // fixed-point design). "Layer 0" is the first layer whose largest outline passes
             // the same size guard generate() itself uses (arc.total < 4.0 * w returns early
             // there); every layer from there up walks its own Phase Origin forward.
+            //
+            // Moved BEFORE the phase/W_total block below (was previously after it): Curvature-
+            // Weighted Stringer Density's computeWarpedTotal call needs THIS layer's own Phase
+            // Origin already known, to phase-lock its internal curvature-resampling grid to it
+            // (see ArcParam::resample_phase_s) rather than to gatherRing's own arbitrary
+            // (slicer-determined) starting vertex — using the origin computed here, not a stale
+            // one, is what makes that phase-lock actually stable layer to layer.
             if (arc_total_mm >= 4.0 * (static_cast<double>(fp_w) / 1000.0) && fp_seed_ring_pts.size() >= 2)
             {
                 Point2LL origin{};
@@ -730,6 +771,22 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 // No valid outer-wall points this layer (e.g. a momentary gap) — carry the
                 // previous origin forward unchanged rather than leaving a (0,0) hole in the walk.
                 mesh.fp_phase_origin[layer_nr] = fp_prev_origin;
+            }
+
+            if (arc_total_mm > 1e-6)
+            {
+                const double layer_height_mm = static_cast<double>(layer.printZ) / 1000.0
+                    - (layer_nr > 0 ? static_cast<double>(mesh.layers[layer_nr - 1].printZ) / 1000.0 : 0.0);
+                // Curvature-Weighted Stringer Density (REV 2.6) is disabled as-built (see the
+                // mesh.fp_r_ref = 0.0 assignment above) -- computeWarpedTotal always falls back
+                // to total == total_warped == raw arc length, so this reduces exactly to the
+                // pre-REV-2.6 formula. Still routed through computeWarpedTotal (rather than
+                // simplified back to raw arc_total_mm directly) so re-enabling the feature later
+                // only requires removing that one forced assignment, not restoring this call.
+                double total_raw = 0.0, total_warped = 0.0;
+                FeatherPrintGenerator::computeWarpedTotal(fp_seed_ring_pts, mesh.fp_r_ref, mesh.fp_phase_origin[layer_nr], total_raw, total_warped);
+                const double w_total_mm = (total_warped > 1e-6) ? (total_warped / 1000.0) : arc_total_mm;
+                phase += layer_height_mm / (w_total_mm * tan_alpha);
             }
         }
 
@@ -1003,7 +1060,7 @@ void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
     SliceLayer* layer = &mesh.layers[layer_nr];
     const double fp_phase = (layer_nr < mesh.fp_helix_phase.size()) ? mesh.fp_helix_phase[layer_nr] : 0.0;
     const Point2LL fp_phase_origin = (layer_nr < mesh.fp_phase_origin.size()) ? mesh.fp_phase_origin[layer_nr] : Point2LL(0, 0);
-    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_phase_origin);
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_phase_origin, mesh.fp_r_ref);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

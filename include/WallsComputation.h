@@ -34,7 +34,8 @@ public:
         const LayerIndex layer_nr,
         double fp_helix_phase = 0.0,
         LayerIndex fp_flange_start_layer = -1,
-        Point2LL fp_phase_origin = Point2LL(0, 0));
+        Point2LL fp_phase_origin = Point2LL(0, 0),
+        double fp_r_ref = 0.0);
 
     /*!
      * \brief Generates the walls / inner area for all parts in a layer.
@@ -60,6 +61,9 @@ private:
     const double fp_helix_phase_;
     const LayerIndex fp_flange_start_layer_;
     const Point2LL fp_phase_origin_;
+    // Curvature-Weighted Stringer Density (Spec REV 2.6): k_ref * R_avg, computed once per
+    // mesh (see SliceMeshStorage::fp_r_ref). <= 0 means the feature is inactive for this mesh.
+    const double fp_r_ref_;
 
     /*!
      * Generates the walls / inner area for a single layer part.

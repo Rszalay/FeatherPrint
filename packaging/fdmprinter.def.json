@@ -2833,6 +2833,19 @@
                     "enabled": "infill_pattern == 'featherprint' and featherprint_flange_enabled",
                     "settable_per_mesh": true,
                     "settable_globally": true
+                },
+                "featherprint_curvature_k_ref":
+                {
+                    "label": "FeatherPrint Curvature Density Reference (k_ref)",
+                    "description": "Curvature-Weighted Stringer Density (Spec REV 2.6): sets the reference radius R_ref = k_ref x R_avg at which the Helix Angle is achieved exactly, where R_avg is a once-per-mesh, length-weighted average local radius of curvature. Flatter-than-reference regions get denser stringer spacing; more-curved-than-reference regions get sparser spacing. The default of 1.0 reduces to plain uniform spacing on a roughly constant-radius tube.",
+                    "type": "float",
+                    "unit": "",
+                    "default_value": 1.0,
+                    "minimum_value": "0.01",
+                    "maximum_value": "100.0",
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
                 }
             }
         },

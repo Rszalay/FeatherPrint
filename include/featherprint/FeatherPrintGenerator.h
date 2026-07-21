@@ -48,7 +48,8 @@ public:
         coord_t z,
         const Settings& settings,
         double helix_phase = 0.0,
-        Point2LL phase_origin = Point2LL(0, 0));
+        Point2LL phase_origin = Point2LL(0, 0),
+        double R_ref = 0.0);
 
     /*!
      * Generate the Flange wall stack for one closed-boundary-loop layer.
@@ -60,7 +61,8 @@ public:
         const Settings& settings,
         int ramp_index,
         double helix_phase = 0.0,
-        Point2LL phase_origin = Point2LL(0, 0));
+        Point2LL phase_origin = Point2LL(0, 0),
+        double R_ref = 0.0);
 
     // Parameters shared across all open-polyline arcs on the same layer.
     // Computed once from the full virtual ring (all arcs + gap chords) so that
@@ -72,6 +74,15 @@ public:
         double full_ring_arc_ref{};  // arc-length position of the +X reference ray intersection
         double arc_start_in_ring{};  // start position of this specific arc within the full ring
     };
+    // NOTE: Curvature-Weighted Stringer Density (Spec REV 2.6) is NOT applied on open-manifold
+    // (Whip/Miter) layers in this pass — anchor spacing there stays raw-arc-length, uniform, as
+    // before. Warping the full virtual ring (real arcs + gap chords, built by the caller across
+    // possibly several independent OpenPolyline arcs) would require sharing a warp lookup table
+    // across every arc call for the layer, not just a couple of scalars in OpenLayerParams — a
+    // real extension, deliberately deferred rather than half-implemented. Flagged as an explicit
+    // scope narrowing, consistent with several other features here that already accept a
+    // narrower or approximate treatment specifically for the open-manifold case (e.g. Miter's
+    // radial-offset Wall approximation).
 
     /*!
      * Generate the wall toolpath for one open-manifold layer (open polyline input).
@@ -119,6 +130,35 @@ public:
      */
     coord_t innerOffset() const { return inner_offset_; }
 
+    /*!
+     * Curvature-Weighted Stringer Density (Spec REV 2.6): accumulates one Layer's
+     * length-weighted local-radius-of-curvature contribution into running sums, for the
+     * whole-mesh R_avg pre-pass (R_avg = weighted_sum / length_sum once every Layer's
+     * contribution has been added — computed once, sequentially, before per-layer wall
+     * generation). ring_pts is the same closed point ring the Phase Pre-Pass already gathers
+     * for helix-phase purposes — a real closed polygon for an ordinary Layer, or Anchor
+     * Distribution's own virtual closed ring (real arcs + gap chords) for an open-manifold
+     * Layer; both are handled identically here for the same reason the existing phase integral
+     * already treats them the same way (a warped-length re-parametrization doesn't care whether
+     * an edge is real material or a virtual gap chord).
+     */
+    static void accumulateCurvatureStats(const std::vector<Point2LL>& ring_pts, double& weighted_sum, double& length_sum);
+
+    /*!
+     * Real total and warped total arc-length of ring_pts, given R_ref = k_ref * R_avg. Used by
+     * the Phase Pre-Pass to compute this Layer's contribution to the helix-phase integral as
+     * layer_height / (W_total(z) * tan(theta_h)) in place of raw L(z), once Curvature-Weighted
+     * Stringer Density is active. Pass R_ref <= 0 to get total == total_warped (feature
+     * inactive, or R_avg not yet known / degenerate). phase_origin is this Layer's own Anchor
+     * Distribution Phase Origin (see SliceMeshStorage::fp_phase_origin) — required so the
+     * internal curvature-resampling grid is phase-locked to that stable landmark rather than to
+     * ring_pts' own arbitrary (slicer-determined) starting vertex; without this, the resampling
+     * grid's phase drifts unpredictably layer to layer even on an unchanging true shape, which
+     * aliases a smooth curvature field into an apparently uncorrelated signal. Callers must
+     * compute this Layer's own Phase Origin BEFORE calling this function.
+     */
+    static void computeWarpedTotal(const std::vector<Point2LL>& ring_pts, double R_ref, const Point2LL& phase_origin, double& total, double& total_warped);
+
 private:
     // ---- Arc-length parameterization of a closed or open polyline -----------
 
@@ -150,6 +190,74 @@ private:
         // centroid-ray-cast this replaces (referenceArcPos, removed). Returns the arc-length
         // position of the projection.
         double nearestArcPos(const Point2LL& target) const;
+
+        // ---- Curvature-Weighted Stringer Density (Spec REV 2.6) --------------------------
+        //
+        // Local radius of curvature at arc-length s, estimated against a UNIFORMLY RESAMPLED
+        // copy of this polyline (see ensureResampled), not the raw vertices directly. Every
+        // prior approach here — a fixed arc-length window, a fixed vertex count, a window that
+        // grows to a minimum physical span — eventually failed on a real part's mesh, and all
+        // of them failed for the same underlying reason: the raw polyline's vertex spacing is
+        // wildly non-uniform (sub-mm in some places, several mm in others, confirmed via
+        // diagnostic logging), and every windowing scheme's failure mode was really just a
+        // symptom of trying to reason about "how many real facets does my window span" against
+        // that non-uniform spacing. Resampling once, up front, to even spacing removes the
+        // question entirely: every subsequent curvature estimate is a plain three-point turning
+        // angle between adjacent resampled points, which are guaranteed (by construction) to be
+        // close to the same physical distance apart everywhere on this ring. Returns a large
+        // fixed value (1e9) for a resampled window with no measurable turning (genuinely
+        // straight, or the ring/arc is too degenerate to resample at all) rather than letting
+        // ds/turn blow up — a numerical safety measure, not a designer-facing limit.
+        double curvatureRadiusAt(double s) const;
+
+        // Lazily builds resample_pts_: this ring's own shape sampled at points evenly spaced by
+        // arc-length (via pointAt), roughly `step` apart (closed rings divide the total into a
+        // whole number of equal intervals; open arcs sample step-spaced points from 0 to total
+        // inclusive). Cached per ArcParam instance (mutable — called from the const
+        // curvatureRadiusAt) since a single ArcParam is queried many times during one buildWarp
+        // or accumulateCurvatureStats pass.
+        //
+        // Sample 0 sits at arc-length resample_phase_s, not at s=0 (the slicer's own, arbitrary
+        // vertex order) — this was a real correctness bug, not just noise: cum_len[0]/s=0 is
+        // defined by whichever vertex the slicer happened to emit first for that Layer, which
+        // can reindex layer to layer with no relation to the actual shape. Building the resample
+        // grid from that raw origin meant the grid's own phase shifted unpredictably between
+        // layers, aliasing even a smooth true curvature field into an apparently uncorrelated
+        // signal — exactly the class of bug Anchor Distribution (REV 2.2/2.3) already fixed once
+        // for anchor placement, crept back in here one layer removed. Callers MUST set
+        // resample_phase_s (typically via nearestArcPos(phase_origin), the same stable landmark
+        // Anchor Distribution itself uses) BEFORE the first call that triggers ensureResampled
+        // (buildWarp, or curvatureRadiusAt directly) — see buildWarp's call sites in generate()/
+        // generateFlange()/computeWarpedTotal for the required call order.
+        void ensureResampled(double step) const;
+        mutable std::vector<Point2LL> resample_pts_;
+        mutable bool resample_built_{ false };
+        double resample_phase_s{ 0.0 };
+
+        // Populates cum_warp/total_warped: the warped arc-length coordinate W(s) = integral of
+        // rho(s') ds' from 0 to s, where rho(s) = clamp(curvatureRadiusAt(s) / R_ref, kMinRho,
+        // kMaxRho). R_ref = k_ref * R_avg is the caller's already-computed whole-part reference
+        // radius (see SliceMeshStorage::fp_r_ref). The clamp on rho (not on curvatureRadiusAt's
+        // own large-value return) is what actually prevents a straight segment from producing
+        // an unbounded warped length, and also floors rho away from zero so a very tight curl
+        // can't collapse a nonzero real span to zero warped length. No-op (cum_warp left empty)
+        // if R_ref <= 0 — toWarped/fromWarped fall back to the identity (raw arc-length) in
+        // that case, so callers can unconditionally call buildWarp and check nothing further.
+        void buildWarp(double R_ref);
+
+        // Real arc-length s -> warped arc-length W(s), by linear interpolation within the
+        // segment s falls in (mirrors pointAt's own segment-walk structure exactly, replacing
+        // cum_len/total with cum_warp/total_warped). Identity (returns s unchanged) if
+        // buildWarp was never called (cum_warp empty) — i.e. Curvature-Weighted Density is
+        // inactive for this ArcParam.
+        double toWarped(double s) const;
+
+        // Inverse of toWarped: warped arc-length W -> real arc-length s. Identity if buildWarp
+        // was never called.
+        double fromWarped(double w) const;
+
+        std::vector<double> cum_warp;     // parallel to cum_len, in warped units; empty until buildWarp() is called
+        double total_warped{ 0.0 };       // W_total for this Layer's ring; meaningless while cum_warp is empty
     };
 
     static ArcParam buildArcParam(const Polygon& poly);
