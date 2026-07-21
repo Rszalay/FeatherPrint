@@ -525,8 +525,12 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
 
         const double alpha_rad = mesh.settings.get<double>("featherprint_helix_angle") * std::numbers::pi / 180.0;
         const double tan_alpha = std::tan(alpha_rad);
+        const coord_t fp_w = mesh.settings.get<coord_t>("featherprint_line_width");
         mesh.fp_helix_phase.resize(mesh_layer_count, 0.0);
+        mesh.fp_phase_origin.resize(mesh_layer_count, Point2LL(0, 0));
         double phase = 0.0;
+        Point2LL fp_prev_origin{};
+        bool fp_have_prev_origin = false;
         for (size_t layer_nr = 0; layer_nr < mesh_layer_count; layer_nr++)
         {
             mesh.fp_helix_phase[layer_nr] = std::fmod(phase, 1.0);
@@ -535,6 +539,11 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
             // Compute perimeter reference from the largest closed polygon part.
             double best_area    = 0.0;
             double arc_total_mm = 0.0;
+            // Anchor Distribution (Spec REV 2.2): the outer wall's own point set for this
+            // layer, gathered here (closed-polygon case below, open-manifold virtual-ring
+            // case further down) so the one-time seed-point capture after this block can use
+            // it regardless of which case applied — see the seeding block below.
+            std::vector<Point2LL> fp_seed_ring_pts;
             for (const SliceLayerPart& part : layer.parts)
             {
                 for (const Polygon& poly : part.outline)
@@ -552,6 +561,7 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                             len += std::sqrt(dx * dx + dy * dy);
                         }
                         arc_total_mm = len / 1000.0;
+                        fp_seed_ring_pts.assign(poly.begin(), poly.end());
                     }
                 }
             }
@@ -626,6 +636,10 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                     total += std::sqrt(cdx * cdx + cdy * cdy);
                 }
                 arc_total_mm = total / 1000.0;
+
+                fp_seed_ring_pts.clear();
+                for (const OrientedRef& ref : refs)
+                    fp_seed_ring_pts.insert(fp_seed_ring_pts.end(), ref.pts.begin(), ref.pts.end());
             }
 
             if (arc_total_mm > 1e-6)
@@ -633,6 +647,89 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 const double layer_height_mm = static_cast<double>(layer.printZ) / 1000.0
                     - (layer_nr > 0 ? static_cast<double>(mesh.layers[layer_nr - 1].printZ) / 1000.0 : 0.0);
                 phase += layer_height_mm / (arc_total_mm * tan_alpha);
+            }
+
+            // Anchor Distribution (Spec REV 2.2, continuity-tracking variant — see
+            // fp_phase_origin's declaration for why this deviates from the spec's literal
+            // fixed-point design). "Layer 0" is the first layer whose largest outline passes
+            // the same size guard generate() itself uses (arc.total < 4.0 * w returns early
+            // there); every layer from there up walks its own Phase Origin forward.
+            if (arc_total_mm >= 4.0 * (static_cast<double>(fp_w) / 1000.0) && fp_seed_ring_pts.size() >= 2)
+            {
+                Point2LL origin{};
+                if (! fp_have_prev_origin)
+                {
+                    // Seed: the point on this layer's outer wall at world x=0 furthest in +Y.
+                    bool found = false;
+                    double best_y = 0.0;
+                    const size_t n = fp_seed_ring_pts.size();
+                    for (size_t i = 0; i < n; i++)
+                    {
+                        const Point2LL& a = fp_seed_ring_pts[i];
+                        const Point2LL& b = fp_seed_ring_pts[(i + 1) % n];
+                        // Segment crosses world x=0
+                        if ((a.X <= 0 && b.X > 0) || (a.X > 0 && b.X <= 0))
+                        {
+                            double t = static_cast<double>(-a.X) / static_cast<double>(b.X - a.X);
+                            double y = a.Y + t * (b.Y - a.Y);
+                            if (! found || y > best_y)
+                            {
+                                found  = true;
+                                best_y = y;
+                                origin = Point2LL(0, static_cast<coord_t>(std::llround(y)));
+                            }
+                        }
+                    }
+                    // Degenerate fallback: the outline never crosses world x=0 at all (the
+                    // part doesn't straddle the build plate's X origin). Not addressed by the
+                    // spec — fall back to the outline's own topmost point so seeding succeeds.
+                    if (! found)
+                    {
+                        origin = fp_seed_ring_pts[0];
+                        for (const Point2LL& p : fp_seed_ring_pts)
+                            if (p.Y > origin.Y)
+                                origin = p;
+                    }
+                }
+                else
+                {
+                    // Walk: nearest point on THIS layer's outer wall to the PREVIOUS layer's
+                    // own Phase Origin (world-space point-to-segment min-distance scan) — see
+                    // fp_phase_origin's declaration for why this replaces projecting against
+                    // one fixed point every layer.
+                    double best_d2 = -1.0;
+                    const size_t n = fp_seed_ring_pts.size();
+                    for (size_t i = 0; i < n; i++)
+                    {
+                        const Point2LL& a = fp_seed_ring_pts[i];
+                        const Point2LL& b = fp_seed_ring_pts[(i + 1) % n];
+                        double ax = static_cast<double>(a.X), ay = static_cast<double>(a.Y);
+                        double ex = static_cast<double>(b.X - a.X), ey = static_cast<double>(b.Y - a.Y);
+                        double seg_len2 = ex * ex + ey * ey;
+                        double t = (seg_len2 > 1e-9)
+                            ? ((static_cast<double>(fp_prev_origin.X) - ax) * ex + (static_cast<double>(fp_prev_origin.Y) - ay) * ey) / seg_len2
+                            : 0.0;
+                        t = std::max(0.0, std::min(1.0, t));
+                        double px = ax + t * ex, py = ay + t * ey;
+                        double dx = static_cast<double>(fp_prev_origin.X) - px;
+                        double dy = static_cast<double>(fp_prev_origin.Y) - py;
+                        double d2 = dx * dx + dy * dy;
+                        if (best_d2 < 0.0 || d2 < best_d2)
+                        {
+                            best_d2 = d2;
+                            origin  = Point2LL(static_cast<coord_t>(std::llround(px)), static_cast<coord_t>(std::llround(py)));
+                        }
+                    }
+                }
+                mesh.fp_phase_origin[layer_nr] = origin;
+                fp_prev_origin      = origin;
+                fp_have_prev_origin = true;
+            }
+            else if (fp_have_prev_origin)
+            {
+                // No valid outer-wall points this layer (e.g. a momentary gap) — carry the
+                // previous origin forward unchanged rather than leaving a (0,0) hole in the walk.
+                mesh.fp_phase_origin[layer_nr] = fp_prev_origin;
             }
         }
 
@@ -905,7 +1002,8 @@ void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
 {
     SliceLayer* layer = &mesh.layers[layer_nr];
     const double fp_phase = (layer_nr < mesh.fp_helix_phase.size()) ? mesh.fp_helix_phase[layer_nr] : 0.0;
-    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer);
+    const Point2LL fp_phase_origin = (layer_nr < mesh.fp_phase_origin.size()) ? mesh.fp_phase_origin[layer_nr] : Point2LL(0, 0);
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_phase_origin);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

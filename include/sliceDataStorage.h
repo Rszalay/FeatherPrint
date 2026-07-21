@@ -320,6 +320,22 @@ public:
     // Set during the helix pre-pass in FffPolygonGenerator.
     LayerIndex fp_flange_start_layer{ -1 };
 
+    // FeatherPrint: per-layer Phase Origin for Anchor Distribution (Spec REV 2.2), one entry
+    // per layer like fp_helix_phase. Deviates from REV 2.2's stated "recomputed independently
+    // each Layer against one fixed world point" design: testing found that a fixed point
+    // (seeded at world x=0, which is also the symmetry axis of most fuselage-like
+    // cross-sections) produces large jumps whenever the true nearest point is nearly tied
+    // between the two symmetric sides of the boundary — a small, smooth shape change between
+    // layers can flip the winner to the mirror point on the opposite side of the part. Instead,
+    // each layer's origin is the nearest point on THAT layer's own outer wall to the PREVIOUS
+    // layer's own origin (a genuine continuity-tracking walk), seeded at the first layer that
+    // carries a Stringer as the point on that layer's outer wall at world x=0 furthest in +Y.
+    // This reintroduces the drift risk REV 2.2 explicitly tried to avoid — a local shape
+    // distortion can now bias every layer above it, not just the one layer it occurs on — a
+    // known, accepted tradeoff versus the large symmetry-tie jumps of the fixed-point scheme.
+    // Set during the helix pre-pass in FffPolygonGenerator.
+    std::vector<Point2LL> fp_phase_origin;
+
     std::vector<AngleDegrees> infill_angles; //!< a list of angle values which is cycled through to determine the infill angle of each layer
     std::vector<AngleDegrees> roofing_angles; //!< a list of angle values which is cycled through to determine the roofing angle of each layer
     std::vector<AngleDegrees> flooring_angles; //!< a list of angle values which is cycled through to determine the flooring angle of each layer

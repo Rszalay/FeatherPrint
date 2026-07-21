@@ -33,11 +33,17 @@
 namespace cura
 {
 
-WallsComputation::WallsComputation(const Settings& settings, const LayerIndex layer_nr, double fp_helix_phase, LayerIndex fp_flange_start_layer)
+WallsComputation::WallsComputation(
+    const Settings& settings,
+    const LayerIndex layer_nr,
+    double fp_helix_phase,
+    LayerIndex fp_flange_start_layer,
+    Point2LL fp_phase_origin)
     : settings_(settings)
     , layer_nr_(layer_nr)
     , fp_helix_phase_(fp_helix_phase)
     , fp_flange_start_layer_(fp_flange_start_layer)
+    , fp_phase_origin_(fp_phase_origin)
 {
 }
 
@@ -74,14 +80,23 @@ void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_t
             if (is_flange_layer)
             {
                 const int ramp_index = static_cast<int>(layer_nr_ - fp_flange_start_layer_);
-                wl = fp.generateFlange(gen_outline, settings_, ramp_index, fp_helix_phase_);
+                wl = fp.generateFlange(gen_outline, settings_, ramp_index, fp_helix_phase_, fp_phase_origin_);
             }
             else
             {
-                wl = fp.generate(gen_outline, z_coord, settings_, fp_helix_phase_);
+                wl = fp.generate(gen_outline, z_coord, settings_, fp_helix_phase_, fp_phase_origin_);
             }
             part->wall_toolpaths = { std::move(wl) };
-            part->inner_area    = Shape{};
+            // Inner area: the region enclosed by the innermost printed Wall at this Layer, so
+            // top_layers/bottom_layers (stock Cura settings) can cap a FeatherPrint shell with
+            // real skin where the designer left the surface closed. Previously left
+            // unconditionally empty, which silently disabled top/bottom skin on every
+            // FeatherPrint Layer regardless of those settings. This is only reached for a
+            // closed-perimeter Layer (a SliceLayerPart with a real outline) — an open-manifold
+            // (Whip) Layer, where the designer intentionally left a boundary edge open, is
+            // handled entirely separately (the open_polylines branch below) and continues to
+            // leave inner_area empty there; no surface exists for skin to cap.
+            part->inner_area    = Shape(gen_outline).offset(-fp.innerOffset());
             part->print_outline = part->outline;
 
             part->outline = SingleShape{ Simplify(settings_).polygon(part->outline) };
@@ -256,22 +271,37 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             full_ring_total = cum_len[n_ring - 1] + std::sqrt(dx * dx + dy * dy);
         }
 
-        // ---- Step 5: reference ray (+X from centroid) position in full ring ----
+        // ---- Step 5: Phase Origin — nearest point on the full ring to the fixed world seed
+        // point (Spec REV 2.2 Anchor Distribution). Plain point-to-segment min-distance scan,
+        // no centroid/ray/angle involved — replaces the old +X-from-centroid ray-cast, which
+        // took the first crossing found in vertex order with no nearest-to-centroid
+        // disambiguation and could silently resolve to the wrong point on a non-star-convex
+        // ring (a ray crossing more than once). Same nearest-point technique as
+        // ArcParam::nearestArcPos, duplicated here since this full_ring is WallsComputation's
+        // own flat point array, not an ArcParam.
         double full_ring_arc_ref = 0.0;
-        for (size_t i = 0; i < n_ring; i++)
         {
-            size_t j = (i + 1) % n_ring;
-            double ax = full_ring[i].X - centroid.X, ay = full_ring[i].Y - centroid.Y;
-            double bx = full_ring[j].X - centroid.X, by = full_ring[j].Y - centroid.Y;
-            if ((ay <= 0.0 && by > 0.0) || (ay > 0.0 && by <= 0.0))
+            double best_d2 = -1.0;
+            for (size_t i = 0; i < n_ring; i++)
             {
-                double t  = ay / (ay - by);
-                double ix = ax + t * (bx - ax);
-                if (ix > 0.0)
+                size_t j = (i + 1) % n_ring;
+                double ax = static_cast<double>(full_ring[i].X), ay = static_cast<double>(full_ring[i].Y);
+                double ex = static_cast<double>(full_ring[j].X - full_ring[i].X);
+                double ey = static_cast<double>(full_ring[j].Y - full_ring[i].Y);
+                double seg_len2 = ex * ex + ey * ey;
+                double t = (seg_len2 > 1e-9)
+                    ? ((static_cast<double>(fp_phase_origin_.X) - ax) * ex + (static_cast<double>(fp_phase_origin_.Y) - ay) * ey) / seg_len2
+                    : 0.0;
+                t = std::max(0.0, std::min(1.0, t));
+                double px = ax + t * ex, py = ay + t * ey;
+                double dx = static_cast<double>(fp_phase_origin_.X) - px;
+                double dy = static_cast<double>(fp_phase_origin_.Y) - py;
+                double d2 = dx * dx + dy * dy;
+                if (best_d2 < 0.0 || d2 < best_d2)
                 {
+                    best_d2 = d2;
                     double seg_end = (j == 0) ? full_ring_total : cum_len[j];
                     full_ring_arc_ref = cum_len[i] + t * (seg_end - cum_len[i]);
-                    break;
                 }
             }
         }

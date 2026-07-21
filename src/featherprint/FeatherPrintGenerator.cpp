@@ -38,6 +38,18 @@ FeatherPrintGenerator::ArcParam FeatherPrintGenerator::buildArcParam(const Polyg
         double dx = b.X - a.X, dy = b.Y - a.Y;
         ap.total = ap.cum_len[n - 1] + std::sqrt(dx * dx + dy * dy);
     }
+
+    // Signed area via the shoelace formula — a single global winding test, exact for any
+    // simple (non-self-intersecting) polygon regardless of concavity. Positive = CCW in
+    // standard math convention (x-right, y-up), matching this file's atan2-based angle sense.
+    double signed_area2 = 0.0;
+    for (int i = 0; i < n; i++)
+    {
+        const Point2LL& a = poly[i];
+        const Point2LL& b = poly[(i + 1) % n];
+        signed_area2 += static_cast<double>(a.X) * b.Y - static_cast<double>(b.X) * a.Y;
+    }
+    ap.ccw = signed_area2 >= 0.0;
     return ap;
 }
 
@@ -46,6 +58,8 @@ FeatherPrintGenerator::ArcParam FeatherPrintGenerator::buildArcParamOpen(const O
     ArcParam ap;
     ap.poly    = &poly;
     ap.is_open = true;
+    // ccw stays at its default (true) — open arcs have no independent signed area; the caller
+    // already guarantees CCW ordering (see ArcParam::ccw's declaration for the full rationale).
     int n = static_cast<int>(poly.size());
     ap.cum_len.resize(n, 0.0);
 
@@ -132,31 +146,36 @@ Point2LL FeatherPrintGenerator::ArcParam::tangentAt(double s) const
     return is_open ? ((*poly)[n - 1] - (*poly)[n - 2]) : ((*poly)[1] - (*poly)[0]);
 }
 
-double FeatherPrintGenerator::ArcParam::referenceArcPos(const Point2LL& centroid) const
+double FeatherPrintGenerator::ArcParam::nearestArcPos(const Point2LL& target) const
 {
-    int n = static_cast<int>(poly->size());
+    const int n = static_cast<int>(poly->size());
+    double best_d2 = -1.0;
+    double best_s  = 0.0;
     for (int i = 0; i < n; i++)
     {
         int j = (i + 1) % n;
-        if (is_open && j == 0) continue; // no closing segment for open polylines
+        if (is_open && j == 0) break; // no closing segment for open polylines
         const Point2LL& a = (*poly)[i];
         const Point2LL& b = (*poly)[j];
-        double ay = static_cast<double>(a.Y - centroid.Y);
-        double by = static_cast<double>(b.Y - centroid.Y);
-        // Segment crosses the horizontal ray Y=0 (centroid-relative)
-        if ((ay <= 0.0 && by > 0.0) || (ay > 0.0 && by <= 0.0))
+        double ax = static_cast<double>(a.X), ay = static_cast<double>(a.Y);
+        double ex = static_cast<double>(b.X - a.X), ey = static_cast<double>(b.Y - a.Y);
+        double seg_len2 = ex * ex + ey * ey;
+        double t = (seg_len2 > 1e-9)
+            ? ((static_cast<double>(target.X) - ax) * ex + (static_cast<double>(target.Y) - ay) * ey) / seg_len2
+            : 0.0;
+        t = std::max(0.0, std::min(1.0, t));
+        double px = ax + t * ex, py = ay + t * ey;
+        double dx = static_cast<double>(target.X) - px, dy = static_cast<double>(target.Y) - py;
+        double d2 = dx * dx + dy * dy;
+        if (best_d2 < 0.0 || d2 < best_d2)
         {
-            double t  = ay / (ay - by);
-            double ix = a.X + t * (b.X - a.X);
-            if (ix > static_cast<double>(centroid.X)) // only the +X side
-            {
-                double seg_start = cum_len[i];
-                double seg_end   = (j == 0) ? total : cum_len[j];
-                return seg_start + t * (seg_end - seg_start);
-            }
+            best_d2 = d2;
+            double seg_start = cum_len[i];
+            double seg_end   = (j == 0) ? total : cum_len[j];
+            best_s = seg_start + t * (seg_end - seg_start);
         }
     }
-    return 0.0; // fallback: no crossing found
+    return best_s;
 }
 
 Point2LL FeatherPrintGenerator::centroidBbox(const Polygon& poly)
@@ -224,6 +243,9 @@ void FeatherPrintGenerator::appendPolySegment(
 FeatherPrintGenerator::TangentFrame FeatherPrintGenerator::resolveFrame(
     const ArcParam& arc, const Point2LL& centroid, double s)
 {
+    (void)centroid; // no longer used for orientation (see the winding-based fix below) — kept
+                     // in the signature since every caller already has it in scope regardless.
+
     // s is resolved directly from the real perimeter's own arc-length parametrization (by the
     // caller, from the anchor's arc-length +/- a physical offset) — no angle/ray-cast involved,
     // so there is no distortion from local curvature or the point's angle relative to centroid.
@@ -257,44 +279,32 @@ FeatherPrintGenerator::TangentFrame FeatherPrintGenerator::resolveFrame(
     tx /= tlen; ty /= tlen;
 
     // Orient T to match the anchor formula's CCW-increasing-theta convention (x_sign=+1
-    // moves toward increasing theta), regardless of the underlying polygon's actual stored
-    // vertex order. Expected CCW tangent at S = the outward radial vector (S-centroid)
-    // rotated +90 degrees in the same atan2(dy,dx) sense theta itself is measured in:
-    // d/dtheta (r*cos(theta), r*sin(theta)) is proportional to (-sin(theta), cos(theta)),
-    // i.e. the radial vector rotated +90 degrees. If tangentAt(s) runs the other way
-    // (polygon stored CW), flip it — otherwise every feature's along-perimeter placement
-    // runs backwards relative to the skin.
-    double rx = static_cast<double>(S.X - centroid.X);
-    double ry = static_cast<double>(S.Y - centroid.Y);
-    double ex = -ry, ey = rx;
-    if (tx * ex + ty * ey < 0.0) { tx = -tx; ty = -ty; }
-
-    // Inward normal: tangent rotated 90°, sign resolved so it always points toward the
-    // centroid — robust regardless of polygon winding, rather than assuming CCW.
+    // moves toward increasing theta), and derive the inward normal from it — using the
+    // polygon's own global winding (arc.ccw), NOT a centroid-relative test. This used to
+    // compare the tangent against the radial vector (S-centroid) rotated 90 degrees, and
+    // separately resolve the normal's sign against (centroid-S); both assume "toward/away
+    // from the centroid" reliably means "outward/inward," which breaks down in a concave
+    // region or near a hole — the true inward side and the centroid-relative side can differ
+    // there, silently misplacing every feature anchored nearby. Winding is a single global,
+    // topology-level fact (computed once in buildArcParam/buildArcParamOpen, see ArcParam::ccw)
+    // that stays correct at every point regardless of concavity: for a CCW-wound simple
+    // polygon, increasing arc-length always runs with the interior on the left, so the inward
+    // normal is always "tangent rotated +90 degrees" — no per-point test needed at all.
+    if (! arc.ccw) { tx = -tx; ty = -ty; }
     double nx = -ty, ny = tx;
-    double cdx = static_cast<double>(centroid.X - S.X);
-    double cdy = static_cast<double>(centroid.Y - S.Y);
-    if (nx * cdx + ny * cdy < 0.0) { nx = -nx; ny = -ny; }
 
     return TangentFrame{ S, tx, ty, nx, ny };
 }
 
 FeatherPrintGenerator::BlendPlacement FeatherPrintGenerator::buildBlendPlacement(
-    double theta_anchor, double R_a, double x_sign,
+    double s_anchor, double x_sign,
     double x_s, double x_e,
     const Point2LL& centroid, const ArcParam& arc, coord_t w)
 {
-    (void)R_a; // no longer used to derive width — retained in the signature since every call
-               // site still computes it for theta_anchor's own resolution alongside R_a.
-
-    // Anchor's own arc-length. theta_anchor is still angle/ray-cast-resolved (that's the
-    // anchor DISTRIBUTION concern, unaffected by this), but Copy A/B are placed by walking the
-    // real perimeter's own arc-length from there — no ray-cast round-trip, so no curvature/
-    // angle-dependent distortion of the physical width between them.
-    double s_anchor = arcLengthAtAngle(arc, centroid, theta_anchor);
-    if (s_anchor < 0.0)
-        s_anchor = 0.0;
-
+    // s_anchor is already a real arc-length position (Anchor Distribution, Spec REV 2.2) —
+    // Copy A/B are placed by walking the real perimeter's own arc-length from there, with no
+    // angle/ray-cast round-trip, so no curvature/angle-dependent distortion of the physical
+    // width between them.
     const double s_s = s_anchor + x_sign * x_s * w;
     const double s_e = s_anchor + x_sign * x_e * w;
     BlendPlacement bp;
@@ -421,6 +431,107 @@ double FeatherPrintGenerator::arcLengthAtAngle(const ArcParam& arc, const Point2
     return best_s;
 }
 
+bool FeatherPrintGenerator::isThinSection(const ArcParam& arc, const Point2LL& centroid, double s_anchor, double D, coord_t w)
+{
+    if (D <= 0.0)
+        return false;
+
+    const TangentFrame tf = resolveFrame(arc, centroid, s_anchor);
+    const double sx = static_cast<double>(tf.S.X), sy = static_cast<double>(tf.S.Y);
+    const double dirx = tf.nx, diry = tf.ny; // unit inward normal, winding-based (REV 2.3)
+    const double ray_len = D * static_cast<double>(w);
+
+    const int n = static_cast<int>(arc.poly->size());
+
+    // Exclusion is by VERTEX ADJACENCY (segment index distance from the anchor's own segment),
+    // not an arc-length or world-distance window — this was the actual bug behind pruning
+    // missing very tight corners (<10 degrees): at a fold that sharp, the genuine opposing wall
+    // (the other side of the point) is arc-length-close to the anchor precisely BECAUSE the
+    // fold is so tight, so an arc-length exclusion window threw out the real hit as if it were
+    // the anchor's own immediate neighborhood. A world-distance window would fail the same way,
+    // since world-closeness is exactly what makes a hit genuine near a tight fold. Only the
+    // segment(s) literally touching the anchor's own vertex should be excluded, to avoid a
+    // trivial t~0 self-intersection at the ray's own origin — anything else, however close in
+    // arc-length or world space, is fair game for the hit test below.
+    int anchor_seg = 0;
+    {
+        double sN = s_anchor;
+        if (arc.is_open) sN = std::max(0.0, std::min(arc.total, sN));
+        else { sN = std::fmod(sN, arc.total); if (sN < 0.0) sN += arc.total; }
+        for (int k = 0; k < n; k++)
+        {
+            int kj = (k + 1) % n;
+            if (arc.is_open && kj == 0) break;
+            double kend = (kj == 0) ? arc.total : arc.cum_len[kj];
+            if (sN <= kend + 1e-6) { anchor_seg = k; break; }
+        }
+    }
+    constexpr int kExclusionSegs = 1; // segment index distance from the anchor's own segment
+    auto segExcluded = [&](int idx)
+    {
+        int d = std::abs(idx - anchor_seg);
+        if (! arc.is_open)
+            d = std::min(d, n - d);
+        return d <= kExclusionSegs;
+    };
+
+    for (int i = 0; i < n; i++)
+    {
+        int j = (i + 1) % n;
+        if (arc.is_open && j == 0) break; // no closing segment on an open arc — real geometry
+                                           // only, per spec (no virtual-ring gap chords here
+                                           // since arc is always the real perimeter, never the
+                                           // synthetic full ring)
+
+        if (segExcluded(i))
+            continue;
+
+        const Point2LL& A = (*arc.poly)[i];
+        const Point2LL& B = (*arc.poly)[j];
+        const double ex = static_cast<double>(B.X - A.X), ey = static_cast<double>(B.Y - A.Y);
+        const double seg_len = std::sqrt(ex * ex + ey * ey);
+        if (seg_len < 1e-6)
+            continue;
+        const double denom = dirx * ey - diry * ex;
+        if (std::abs(denom) < 1e-9)
+            continue; // ray parallel to this segment
+        const double asx = static_cast<double>(A.X) - sx, asy = static_cast<double>(A.Y) - sy;
+        const double t = (asx * ey - asy * ex) / denom; // distance along the ray
+        const double u = (asx * diry - asy * dirx) / denom; // position along the segment
+        if (! (u >= -1e-9 && u <= 1.0 + 1e-9 && t > 1e-6 && t <= ray_len))
+            continue;
+
+        // A genuine thin section is where TWO DIFFERENT walls face each other closely — the
+        // hit segment's own inward normal must point at least roughly opposite our ray, not
+        // roughly the same way. Without this, a ray cast inward from a point on a gently
+        // curved (but not truly thin) wall can "hit" that SAME wall a bit further around its
+        // own curvature, or clip a tiny mesh-slicing kink just past the exclusion window —
+        // both false positives: the hit segment there is still part of the near wall curving
+        // along broadly the same direction as the anchor's own wall, not a distinct far wall
+        // bounding a real gap. Using the same winding-based rule as resolveFrame (no
+        // centroid): tangent = segment direction, flipped if the polygon is CW, inward normal
+        // = tangent rotated +90.
+        //
+        // Threshold widened from a strict 90 degrees (dot < 0, i.e. only accepting hit normals
+        // past perpendicular to the ray) down to kMinOpposingAngleDeg: a tight corner's
+        // far-side segment doesn't always present a cleanly opposing normal the way a
+        // straight/gently-curved thin gap does, so the strict version let features stick
+        // through some sharp corners undetected. Accepting any hit normal more than
+        // kMinOpposingAngleDeg away from pointing the SAME way as the ray (rather than
+        // requiring it past perpendicular) catches those corners too, at the cost of accepting
+        // more marginal, less-than-fully-opposing hits generally — a tentative tradeoff, per
+        // the same "not a settled value" flagging as the rest of this check.
+        constexpr double kMinOpposingAngleDeg = 45.0;
+        const double kOpposingThreshold = std::cos(kMinOpposingAngleDeg * std::numbers::pi / 180.0);
+        double htx = ex / seg_len, hty = ey / seg_len;
+        if (! arc.ccw) { htx = -htx; hty = -hty; }
+        const double hnx = -hty, hny = htx;
+        if (dirx * hnx + diry * hny < kOpposingThreshold)
+            return true;
+    }
+    return false;
+}
+
 std::vector<FeatherPrintGenerator::FlangeWallDesc> FeatherPrintGenerator::buildFlangeWallStack(int ramp_index, coord_t w)
 {
     // Build ordered list of wall centreline offsets and widths, outer→inner.
@@ -493,11 +604,19 @@ OpenPolyline FeatherPrintGenerator::radialOffsetOpen(const OpenPolyline& poly, c
     return result;
 }
 
-VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase)
+VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase, Point2LL phase_origin)
 {
     const coord_t w = settings.get<coord_t>("featherprint_line_width");
 
     std::vector<FlangeWallDesc> walls_outer_first = buildFlangeWallStack(ramp_index, w);
+
+    // Inner-area offset (see innerOffset()'s doc comment): the full Wall-stack depth to the
+    // innermost Wall's own INNER face (offset + half its own width), i.e. the region actually
+    // enclosed by the printed material at this Flange Layer.
+    {
+        const FlangeWallDesc& wd_inner = walls_outer_first.back();
+        inner_offset_ = wd_inner.offset + wd_inner.width / 2;
+    }
 
     // ---- Compute Stringer/Lacing anchor positions on OML for Flare Rim insertion ----
     const Polygon* oml_poly = largestPoly(outline);
@@ -547,7 +666,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
         const Point2LL centroid = centroidBbox(*oml_poly);
         const double w_d = static_cast<double>(w);
         const double helix_frac  = std::fmod(helix_phase, 1.0);
-        const double arc_ref     = arc_oml.referenceArcPos(centroid);
+        const double arc_ref     = arc_oml.nearestArcPos(phase_origin);
         const double ccw_advance = std::fmod(helix_frac * arc_oml.total + arc_ref, arc_oml.total);
         const double cw_advance  = std::fmod(arc_ref - helix_frac * arc_oml.total + arc_oml.total, arc_oml.total);
 
@@ -680,6 +799,15 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
             double current_s = 0.0;
             for (const FlareAnchor& fa : flare_anchors)
             {
+                // Thin-Section Pruning (Spec REV 2.4) — see generate()'s own comment for the
+                // full rationale. Flare's own anchor is angle-based (out of REV 2.2/2.3's
+                // arc-length scope, per spec), so convert to arc-length on arc_oml first, the
+                // same relocation appendFlareRim itself already does internally.
+                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
+                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
+                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
+                    continue; // leave current_s untouched — ordinary wall passes straight through
+
                 double s_depart = fa.s_left;
                 if (s_depart < current_s) s_depart = current_s;
                 appendPolySegment(wall_line, ap, current_s, s_depart, wd.width, wall_line.empty());
@@ -907,6 +1035,13 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
             double current_s = 0.0;
             for (const FlareAnchor& fa : flare_anchors)
             {
+                // Thin-Section Pruning (Spec REV 2.4) — see generate()'s own comment and
+                // generateFlange()'s own Flare loop for the full rationale.
+                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
+                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
+                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
+                    continue;
+
                 double s_depart = std::min(std::max(fa.s_left, current_s), s_end);
                 appendPolySegment(wall_line, arc_w, current_s, s_depart, wd.width, wall_line.empty());
 
@@ -967,7 +1102,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
 
 void FeatherPrintGenerator::appendTrace(
     ExtrusionLine& line,
-    double theta_anchor, double R_a,
+    double s_anchor,
     const Point2LL& centroid, const ArcParam& arc,
     bool is_cw, coord_t w,
     double D, double W, bool skip_first)
@@ -979,7 +1114,7 @@ void FeatherPrintGenerator::appendTrace(
 
     if (! is_cw)
     {
-        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, 1.0, -X_max, X_max, centroid, arc, w);
+        BlendPlacement bp = buildBlendPlacement(s_anchor, 1.0, -X_max, X_max, centroid, arc, w);
         appendCanonicalArc(line, -G,  R1, R1,  -90.0,   0.0, false, 8,  bp, w, skip_first);
         line.junctions_.emplace_back(bp.place(R2, D - R2, w), w, 0);
         appendCanonicalArc(line,  0.0, D - R2, R2,   0.0, 180.0, false, 10, bp, w, true);
@@ -990,7 +1125,7 @@ void FeatherPrintGenerator::appendTrace(
     {
         // Reverse traversal (End->P4->P3->P2->P1->Start), each arc's direction flipped,
         // x_sign=-1, x_s/x_e swapped — see derivation above.
-        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, -1.0, X_max, -X_max, centroid, arc, w);
+        BlendPlacement bp = buildBlendPlacement(s_anchor, -1.0, X_max, -X_max, centroid, arc, w);
         appendCanonicalArc(line,  G,   R1, R1,  -90.0, 180.0, true, 8,  bp, w, skip_first);
         line.junctions_.emplace_back(bp.place(-R2, D - R2, w), w, 0);
         appendCanonicalArc(line,  0.0, D - R2, R2, 180.0,   0.0, true, 10, bp, w, true);
@@ -1013,7 +1148,7 @@ void FeatherPrintGenerator::appendTrace(
 
 void FeatherPrintGenerator::appendLacingTrace(
     ExtrusionLine& line,
-    double theta_anchor, double R_a,
+    double s_anchor,
     const Point2LL& centroid, const ArcParam& arc,
     coord_t w, double D, double W)
 {
@@ -1037,7 +1172,7 @@ void FeatherPrintGenerator::appendLacingTrace(
     const double x_start = G + R1;   // = C1.X = -C4.X
     const double c2x     = W / 2.0 - R2; // = C2.X = -C3.X
 
-    BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, 1.0, -x_start, x_start, centroid, arc, w);
+    BlendPlacement bp = buildBlendPlacement(s_anchor, 1.0, -x_start, x_start, centroid, arc, w);
 
     auto pt = [&](double lx, double ly) {
         line.junctions_.emplace_back(bp.place(lx, ly, w), w, 0);
@@ -1093,6 +1228,9 @@ void FeatherPrintGenerator::appendFlareRim(
     const Point2LL& centroid, const ArcParam& oml_arc,
     double Q, double D, double oml_shift, double W, coord_t w, bool skip_first)
 {
+    (void)R_a; // out of scope for REV 2.2 (Flare Rim's own anchor math stays angle-based);
+               // R_a was only ever forwarded to buildBlendPlacement, which no longer takes it.
+
     // Q_eff is the requested (unclamped) depth. R1 is clamped to W/2: past that, Line1's span
     // (W - 2*R1) goes negative and the two end arcs' flat spans cross over each other instead
     // of meeting at a single point, self-intersecting the profile. Any depth beyond what the
@@ -1106,7 +1244,14 @@ void FeatherPrintGenerator::appendFlareRim(
     const double y_base = drop - oml_shift;    // depth where each end arc begins/ends (= foot of the lead-in/out line)
     const double y_top = -oml_shift;           // Start/End depth (0), in oml_arc's frame
 
-    BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, -W / 2.0, W / 2.0, centroid, oml_arc, w);
+    // Flare Rim's own anchor/blend-range derivation is still angle-based (Spec REV 2.2 leaves
+    // this out of scope — see Perimeter Radius R(theta)'s note), so the arc-length conversion
+    // buildBlendPlacement itself no longer performs has to happen here instead, one mechanical
+    // relocation rather than a behavior change.
+    double s_anchor = arcLengthAtAngle(oml_arc, centroid, theta_anchor);
+    if (s_anchor < 0.0)
+        s_anchor = 0.0;
+    BlendPlacement bp = buildBlendPlacement(s_anchor, x_sign, -W / 2.0, W / 2.0, centroid, oml_arc, w);
 
     // Line-in: Start(-W/2,0) -> P1(-W/2,drop)
     if (! skip_first)
@@ -1130,7 +1275,8 @@ VariableWidthLines FeatherPrintGenerator::generate(
     const Shape& outline,
     coord_t z,
     const Settings& settings,
-    double helix_phase)
+    double helix_phase,
+    Point2LL phase_origin)
 {
     seam_pt_ = Point2LL(0, 0);
 
@@ -1141,6 +1287,10 @@ VariableWidthLines FeatherPrintGenerator::generate(
     const coord_t w = settings.get<coord_t>("featherprint_line_width");
     if (w <= 0)
         return {};
+
+    // Inner-area offset (see innerOffset()'s doc comment): a single, ordinary (non-Flange)
+    // Layer is one Wall wide.
+    inner_offset_ = w;
 
     const int N = settings.get<int>("featherprint_stringer_count");
     if (N < 1)
@@ -1159,7 +1309,7 @@ VariableWidthLines FeatherPrintGenerator::generate(
     // helix_phase is the running integral Σ(dz/arc_total) from the pre-pass,
     // giving constant intersection angle across the full height of a tapered tube.
     const double helix_frac = std::fmod(helix_phase, 1.0);
-    const double arc_ref    = arc.referenceArcPos(centroid);
+    const double arc_ref    = arc.nearestArcPos(phase_origin);
     // CCW helix advances with z; CW helix retreats — geodesic interlocking pair.
     const double ccw_advance = std::fmod(helix_frac * arc.total + arc_ref, arc.total);
     const double cw_advance  = std::fmod(arc_ref - helix_frac * arc.total + arc.total, arc.total);
@@ -1260,39 +1410,37 @@ VariableWidthLines FeatherPrintGenerator::generate(
                         ? std::fmod((s_a + s_b - arc.total) * 0.5 + arc.total, arc.total)
                         : (s_a + s_b) * 0.5;
 
-                    double s_depart = s_mid - 0.75 * w_d;
-                    if (s_depart < current_s) s_depart = current_s;
-
-                    appendPolySegment(fp_line, arc, current_s, s_depart, w, fp_line.empty());
-
-                    Point2LL mid_pt = arc.pointAt(s_mid);
-                    double dcx = static_cast<double>(mid_pt.X - centroid.X);
-                    double dcy = static_cast<double>(mid_pt.Y - centroid.Y);
-                    double R_a = std::sqrt(dcx * dcx + dcy * dcy);
-                    if (R_a > 1.0)
+                    // Thin-Section Pruning (Spec REV 2.4): skip drawing entirely if the local
+                    // material at this Lacing's own midpoint anchor is thinner than its Depth
+                    // — leave current_s untouched so the ordinary perimeter walk (this
+                    // function's own catch-all / the next anchor's departure) passes straight
+                    // through this span unmodified, as if no anchor were here at all.
+                    if (! isThinSection(arc, centroid, s_mid, lacing_D, w))
                     {
-                        double theta_mid = std::atan2(dcy, dcx);
-                        appendLacingTrace(fp_line, theta_mid, R_a, centroid, arc, w, lacing_D, lacing_W);
-                    }
+                        double s_depart = s_mid - 0.75 * w_d;
+                        if (s_depart < current_s) s_depart = current_s;
 
-                    current_s = s_mid + 0.75 * w_d;
+                        appendPolySegment(fp_line, arc, current_s, s_depart, w, fp_line.empty());
+                        appendLacingTrace(fp_line, s_mid, centroid, arc, w, lacing_D, lacing_W);
+
+                        current_s = s_mid + 0.75 * w_d;
+                    }
                 }
                 ++i;
                 continue;
             }
             const double s_anchor = anc.s;
+            // Thin-Section Pruning (Spec REV 2.4): same treatment as the Lacing branch above.
+            if (isThinSection(arc, centroid, s_anchor, stringer_D, w))
+            {
+                ++i;
+                continue;
+            }
             double s_depart = s_anchor - w_d;
             if (s_depart < current_s) s_depart = current_s;
 
-            Point2LL anchor_pt = arc.pointAt(s_anchor);
-            double dcx = static_cast<double>(anchor_pt.X - centroid.X);
-            double dcy = static_cast<double>(anchor_pt.Y - centroid.Y);
-            double R_a = std::sqrt(dcx * dcx + dcy * dcy);
-            if (R_a < 1.0) { ++i; continue; }
-            double theta_anchor = std::atan2(dcy, dcx);
-
             appendPolySegment(fp_line, arc, current_s, s_depart, w, fp_line.empty());
-            appendTrace(fp_line, theta_anchor, R_a, centroid, arc, anc.is_cw, w, stringer_D, stringer_W, false);
+            appendTrace(fp_line, s_anchor, centroid, arc, anc.is_cw, w, stringer_D, stringer_W, false);
             current_s = s_anchor + w_d;
             ++i;
         }
@@ -1339,19 +1487,11 @@ void FeatherPrintGenerator::appendTerminal(
     bool reversed,
     double splay_L)
 {
-    Point2LL anchor_pt = arc.pointAt(s_anchor);
-    double dcx = static_cast<double>(anchor_pt.X - centroid.X);
-    double dcy = static_cast<double>(anchor_pt.Y - centroid.Y);
-    double R_a = std::sqrt(dcx * dcx + dcy * dcy);
-    if (R_a < 1.0)
-        return;
-    double theta_anchor = std::atan2(dcy, dcx);
-
     const double Ws = W + splay_L; // W widened by the Splay insertion on the far (P4/P5/End) side
 
     if (! reversed)
     {
-        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, R1, Ws, centroid, arc, w);
+        BlendPlacement bp = buildBlendPlacement(s_anchor, x_sign, R1, Ws, centroid, arc, w);
         // Arc1: Start->P1, R1, CW, c=(R1,R1)
         appendCanonicalArc(line, R1, R1, R1, -90.0, 180.0, true, 8, bp, w, false);
         // Line1: P1->P2
@@ -1369,7 +1509,7 @@ void FeatherPrintGenerator::appendTerminal(
     else
     {
         // Reverse traversal (End->P5->P4->P3->P2->P1->Start), each arc's direction flipped.
-        BlendPlacement bp = buildBlendPlacement(theta_anchor, R_a, x_sign, Ws, R1, centroid, arc, w);
+        BlendPlacement bp = buildBlendPlacement(s_anchor, x_sign, Ws, R1, centroid, arc, w);
         // Line3 rev: End->P5 (emit both endpoints — this is the first segment of the reversal)
         line.junctions_.emplace_back(bp.place(Ws, 0.5, w), w, 0);
         line.junctions_.emplace_back(bp.place(Ws, D - R2, w), w, 0);
@@ -1526,36 +1666,35 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
             if (anc.pair_idx > i)
             {
                 const double s_mid = (anc.s + anchors[anc.pair_idx].s) * 0.5;
-                double s_depart = s_mid - 0.75 * w_d;
-                if (s_depart < current_s) s_depart = current_s;
+                // Thin-Section Pruning (Spec REV 2.4) — see generate()'s own comment for the
+                // full rationale; same treatment here.
+                if (! isThinSection(arc_open, centroid, s_mid, lacing_D, w))
+                {
+                    double s_depart = s_mid - 0.75 * w_d;
+                    if (s_depart < current_s) s_depart = current_s;
 
-                appendPolySegment(fp_line, arc_open, current_s, s_depart, w, fp_line.empty());
+                    appendPolySegment(fp_line, arc_open, current_s, s_depart, w, fp_line.empty());
+                    appendLacingTrace(fp_line, s_mid, centroid, arc_open, w, lacing_D, lacing_W);
 
-                Point2LL mid_pt = arc_open.pointAt(s_mid);
-                double dcx = static_cast<double>(mid_pt.X - centroid.X);
-                double dcy = static_cast<double>(mid_pt.Y - centroid.Y);
-                double R_a = std::sqrt(dcx * dcx + dcy * dcy);
-                if (R_a > 1.0)
-                    appendLacingTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, w, lacing_D, lacing_W);
-
-                current_s = s_mid + 0.75 * w_d;
+                    current_s = s_mid + 0.75 * w_d;
+                }
             }
             ++i;
             continue;
         }
 
         const double s_anchor = anc.s;
+        // Thin-Section Pruning (Spec REV 2.4) — see generate()'s own comment.
+        if (isThinSection(arc_open, centroid, s_anchor, stringer_D, w))
+        {
+            ++i;
+            continue;
+        }
         double s_depart = s_anchor - w_d;
         if (s_depart < current_s) s_depart = current_s;
 
-        Point2LL anchor_pt = arc_open.pointAt(s_anchor);
-        double dcx = static_cast<double>(anchor_pt.X - centroid.X);
-        double dcy = static_cast<double>(anchor_pt.Y - centroid.Y);
-        double R_a = std::sqrt(dcx * dcx + dcy * dcy);
-        if (R_a < 1.0) { ++i; continue; }
-
         appendPolySegment(fp_line, arc_open, current_s, s_depart, w, fp_line.empty());
-        appendTrace(fp_line, std::atan2(dcy, dcx), R_a, centroid, arc_open, anc.is_cw, w, stringer_D, stringer_W, false);
+        appendTrace(fp_line, s_anchor, centroid, arc_open, anc.is_cw, w, stringer_D, stringer_W, false);
         current_s = s_anchor + w_d;
         ++i;
     }

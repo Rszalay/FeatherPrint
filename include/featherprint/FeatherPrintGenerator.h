@@ -43,14 +43,24 @@ public:
      *                  ExtrusionLine representing the full perimeter+stringer path.
      *                  Returns empty if the contour is too small to slice.
      */
-    VariableWidthLines generate(const Shape& outline, coord_t z, const Settings& settings, double helix_phase = 0.0);
+    VariableWidthLines generate(
+        const Shape& outline,
+        coord_t z,
+        const Settings& settings,
+        double helix_phase = 0.0,
+        Point2LL phase_origin = Point2LL(0, 0));
 
     /*!
      * Generate the Flange wall stack for one closed-boundary-loop layer.
      * ramp_index: 0 = innermost (first) Flange layer, n-1 = topmost brim layer.
      * Returns multiple closed ExtrusionLines (one per Wall), innermost first, outermost last.
      */
-    VariableWidthLines generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase = 0.0);
+    VariableWidthLines generateFlange(
+        const Shape& outline,
+        const Settings& settings,
+        int ramp_index,
+        double helix_phase = 0.0,
+        Point2LL phase_origin = Point2LL(0, 0));
 
     // Parameters shared across all open-polyline arcs on the same layer.
     // Computed once from the full virtual ring (all arcs + gap chords) so that
@@ -92,6 +102,23 @@ public:
      */
     Point2LL seamPoint() const { return seam_pt_; }
 
+    /*!
+     * Returns the inward offset (from the outline passed to generate()/generateFlange(), in
+     * the same coord_t units as w) from the OML to the innermost printed Wall's own inner
+     * face for this layer — the region a caller should treat as this layer's "inner area"
+     * (used for top/bottom skin generation: WallsComputation offsets the layer outline inward
+     * by this amount to populate SliceLayerPart::inner_area, which was previously left empty
+     * unconditionally, silently disabling top/bottom skin on every FeatherPrint layer
+     * regardless of the featherprint_top_layers/bottom_layers... i.e. the stock Cura
+     * top_layers/bottom_layers settings). For an ordinary (non-Flange) Layer this is a single
+     * Wall's own width (w); for a Flange Layer it is the full Wall-stack depth to the
+     * innermost Wall's inner face. Valid only after generate()/generateFlange() has been
+     * called for the same settings; only meaningful for closed-perimeter Layers — an
+     * open-manifold (Whip) Layer represents a boundary edge the designer left open, and the
+     * caller should leave inner_area empty there rather than calling this at all.
+     */
+    coord_t innerOffset() const { return inner_offset_; }
+
 private:
     // ---- Arc-length parameterization of a closed or open polyline -----------
 
@@ -101,10 +128,28 @@ private:
         double total{};
         const Polyline* poly{};  // base-class pointer; works for Polygon and OpenPolyline
         bool is_open{ false };   // true for OpenPolyline: no closing segment, pointAt clamps
+        // True if poly's stored vertex order is mathematically CCW (positive signed area, for
+        // a closed Polygon) — a global, topology-level invariant, computed once when this
+        // ArcParam is built rather than tested per-point. Used by resolveFrame to orient
+        // tangent/inward-normal WITHOUT any centroid-relative test: for a simple polygon with
+        // consistent winding, "inward" is always "tangent rotated toward the interior side"
+        // regardless of concavity — a centroid-relative test (the previous approach) can pick
+        // the wrong side in a concave region or near a hole, where "toward the centroid" isn't
+        // reliably "toward the material." For an open arc (is_open), ccw is always true: the
+        // caller already guarantees open_poly is oriented CCW in math coordinates (see
+        // generateOpen's own doc comment and WallsComputation's arc-orientation step) — there's
+        // no independent signed area to compute for an open (non-closed) polyline.
+        bool ccw{ true };
 
         Point2LL pointAt(double s) const;
         Point2LL tangentAt(double s) const;
-        double referenceArcPos(const Point2LL& centroid) const;
+
+        // Nearest point on this polyline to an arbitrary world-space target point (Spec REV
+        // 2.2 Anchor Distribution's Phase Origin). No centroid, no ray, no angle — a plain
+        // point-to-segment min-distance scan over every edge, same cost order as the
+        // centroid-ray-cast this replaces (referenceArcPos, removed). Returns the arc-length
+        // position of the projection.
+        double nearestArcPos(const Point2LL& target) const;
     };
 
     static ArcParam buildArcParam(const Polygon& poly);
@@ -124,8 +169,10 @@ private:
     // Canonical Toolpaths doc's Point Tables (opposite of this file's prior ly<0=inward convention).
 
     // A rigid world-space frame anchored at a point on the real perimeter: S = position, (tx,ty) =
-    // unit tangent (direction of increasing arc-length), (nx,ny) = unit inward normal (always points
-    // toward the centroid, sign-resolved rather than assumed from polygon winding).
+    // unit tangent (direction of increasing arc-length), (nx,ny) = unit inward normal. Both are
+    // derived purely from the polyline's own global winding (ArcParam::ccw), not a centroid-
+    // relative test — robust on concave/non-star-convex shapes, where "toward the centroid"
+    // isn't reliably "toward the material's interior" (see resolveFrame's fuller comment).
     struct TangentFrame
     {
         Point2LL S;
@@ -159,11 +206,14 @@ private:
         Point2LL place(double lx, double ly, coord_t w) const;
     };
 
-    // theta_anchor/R_a locate the anchor itself (still angle/ray-cast-based — that positioning is
-    // unaffected by this). Copy A/B are then placed at s_anchor +/- x*w along the real perimeter's
-    // own arc-length, so the physical distance between them is exactly (x_e - x_s) * w regardless
-    // of local curvature or the anchor's angle relative to the centroid.
-    static BlendPlacement buildBlendPlacement(double theta_anchor, double R_a, double x_sign,
+    // s_anchor is the anchor's own arc-length position — located by Anchor Distribution (Spec
+    // REV 2.2: fixed-point projection + arc-length walk), not by angle/ray-cast. Copy A/B are
+    // placed at s_anchor +/- x*w along the real perimeter's own arc-length, so the physical
+    // distance between them is exactly (x_e - x_s) * w regardless of local curvature or the
+    // anchor's position relative to the centroid. (theta_anchor/R_a, and the internal
+    // arc-length-via-angle round-trip they required, are gone as of REV 2.2 — s_anchor is
+    // already known directly by every caller.)
+    static BlendPlacement buildBlendPlacement(double s_anchor, double x_sign,
                                               double x_s, double x_e,
                                               const Point2LL& centroid, const ArcParam& arc, coord_t w);
 
@@ -216,6 +266,20 @@ private:
     // Ray from centroid at angle theta; returns arc-length of first polygon intersection, or -1.
     static double arcLengthAtAngle(const ArcParam& arc, const Point2LL& centroid, double theta);
 
+    // Thin-Section Pruning (Spec REV 2.4, proposed). True if a ray cast from the anchor
+    // (s_anchor on arc) along its own local inward normal — the winding-based normal
+    // resolveFrame already computes (REV 2.3), not a centroid-directed ray, for the same
+    // reason Anchor Distribution moved off centroid — hits arc's own real perimeter within
+    // distance D*w. If so, the local material is thinner than this feature's Depth and its
+    // geometry should be suppressed at this anchor for this Layer (the anchor position itself
+    // is unaffected — callers must still use it for anchor continuity, only skip drawing).
+    // A small arc-length window around the anchor is excluded from the hit test so the ray
+    // doesn't trivially register a hit against its own immediate neighborhood. Both the
+    // detection radius (== D, no margin) and the exclusion window width are explicit,
+    // tentative starting points per the spec, not settled values — flagged for revisiting
+    // once tested against real parts.
+    static bool isThinSection(const ArcParam& arc, const Point2LL& centroid, double s_anchor, double D, coord_t w);
+
     // Stringer Trace — Spec REV 2.0 (corrected). G=0.5 (fixed default, not user-exposed),
     // R2 = featherprint_stringer_width/2, R1 = R2+G, D = featherprint_stringer_depth.
     // Point Table: Anchor(0,0) Start(-G,0) P1(R2,R1) P2(R2,D-R2) P3(-R2,D-R2) P4(-R2,R1) End(G,0).
@@ -226,7 +290,7 @@ private:
     // CW helix: same centres/radii, traversed in reverse order with each arc's direction flipped
     // and x_sign=-1 (spec: CW Helix Mirroring).
     static void appendTrace(ExtrusionLine& line,
-                            double theta_anchor, double R_a,
+                            double s_anchor,
                             const Point2LL& centroid, const ArcParam& arc,
                             bool is_cw, coord_t w,
                             double D, double W, bool skip_first = false);
@@ -270,7 +334,7 @@ private:
     // behind — backwards relative to the caller's stitching direction. Symmetric profile:
     // x_sign = +1 unconditionally (no CW helix mirror needed).
     static void appendLacingTrace(ExtrusionLine& line,
-                                  double theta_anchor, double R_a,
+                                  double s_anchor,
                                   const Point2LL& centroid, const ArcParam& arc,
                                   coord_t w, double D, double W);
 
@@ -308,6 +372,9 @@ private:
 
     // Seam point written by generate(), read by seamPoint()
     Point2LL seam_pt_{};
+
+    // Inner-area offset written by generate()/generateFlange(), read by innerOffset()
+    coord_t inner_offset_{ 0 };
 };
 
 } // namespace cura
