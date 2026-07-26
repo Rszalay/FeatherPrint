@@ -389,7 +389,7 @@ private:
     static bool isThinSection(const ArcParam& arc, const Point2LL& centroid, double s_anchor, double D, coord_t w);
 
     // Stringer Trace — Spec REV 2.0 (corrected). G=0.5 (fixed default, not user-exposed),
-    // R2 = featherprint_stringer_width/2, R1 = R2+G, D = featherprint_stringer_depth.
+    // R2 = featherprint_stringer_width/2, R1 = R2+G, D = featherprint_feature_depth (shared).
     // Point Table: Anchor(0,0) Start(-G,0) P1(R2,R1) P2(R2,D-R2) P3(-R2,D-R2) P4(-R2,R1) End(G,0).
     // P1/P4 sit on the opposite side from Start/End, so Arc1/Arc3 genuinely cross the
     // centreline near the top — a real self-intersecting crossover, per REV 2.0.
@@ -404,7 +404,7 @@ private:
                             double D, double W, bool skip_first = false);
 
     // Whip Terminal — Spec REV 2.0. R1,R2 match Stringer's (R1=R2+G, R2=featherprint_stringer_width/2).
-    // D = featherprint_stringer_depth ("matching Stringer's canonical depth", same as R1/R2).
+    // D = featherprint_feature_depth (shared — same value used by Stringer, matching R1/R2).
     // Re-verified by hand against the corrected Stringer R1=R2+G formula (spec's own note had
     // flagged this table stale from before that fix): Arc2 and Arc3 share one centre/radius
     // (C2==C3 since R2=W/2 makes P3==P4), so together they form a single smooth 180° arc over
@@ -429,7 +429,7 @@ private:
                                double splay_L = 0.0);
 
     // Lacing Trace — per Spec REV 2.0's centers-first derivation, anchor at the midpoint between
-    // two colliding stringers. R1 = Lw/2, R2 = (D - Lw)/2, D = featherprint_lacing_depth,
+    // two colliding stringers. R1 = Lw/2, R2 = (D - Lw)/2, D = featherprint_feature_depth (shared),
     // W = featherprint_lacing_width, G = 0.5 (fixed).
     // Centres: C1(G+R1,R1) C2(W/2-R2,D-R2) C3(-C2.x,C2.y) C4(-C1.x,C1.y).
     // Point Table: Start(C1.x,0) P1(C1.x,2R1) P2(C2.x,2R1) P3(C2.x,D) P4(0,D)
@@ -454,7 +454,7 @@ private:
     //       half-width (buried or outer) Wall ("Wall Number" per the WIP doc, corrected: a
     //       count would under-charge a stack containing a half-width Wall, making the channel
     //       shallower than the Wall stack it's welding into actually is)
-    //   D = featherprint_flare_depth setting (w-units); R1 = min(D - Q, W/2) (w-units) —
+    //   D = featherprint_feature_depth setting (shared, w-units); R1 = min(D - Q, W/2) (w-units) —
     //       clamped to W/2 so Line1's span (W - 2*R1) can't go negative and cross the two end
     //       arcs over each other when D is large relative to W
     //   W = 2.0 for a Stringer anchor, 3.0 for a Lacing anchor (flat span at y=R1)

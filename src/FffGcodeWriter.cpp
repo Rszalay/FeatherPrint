@@ -1846,6 +1846,26 @@ void FffGcodeWriter::addMeshLayerToGCode(
         addMeshPartToGCode(storage, mesh, extruder_nr, mesh_config, *path.vertices_, gcode_layer);
     }
 
+    // Shore (Internal Overhang Bridging, Spec REV 3.1): emitted once per mesh per layer here
+    // (not inside addMeshPartToGCode/processInfill, which run once per SliceLayerPart) to avoid
+    // duplicate emission on a multi-part layer. Ordinary Infill print-feature classification via
+    // the mesh's own infill config -- addLinesByOptimizer is the same "just emit these line
+    // segments" mechanism ordinary sparse infill uses, so no new machinery is introduced.
+    if (static_cast<size_t>(gcode_layer.getLayerNr()) < mesh.fp_shore_bridges.size()
+        && ! mesh.fp_shore_bridges[gcode_layer.getLayerNr()].empty()
+        && extruder_nr == mesh.settings.get<ExtruderTrain&>("infill_extruder_nr").extruder_nr_)
+    {
+        OpenLinesSet shore_lines;
+        for (const auto& seg : mesh.fp_shore_bridges[gcode_layer.getLayerNr()])
+        {
+            OpenPolyline line;
+            line.push_back(seg.first);
+            line.push_back(seg.second);
+            shore_lines.push_back(line);
+        }
+        gcode_layer.addLinesByOptimizer(shore_lines, mesh_config.infill_config[0], SpaceFillType::Lines);
+    }
+
     const std::string extruder_identifier = (mesh.settings.get<size_t>("roofing_layer_count") > 0) ? "roofing_extruder_nr" : "top_bottom_extruder_nr";
     if (extruder_nr == mesh.settings.get<ExtruderTrain&>(extruder_identifier).extruder_nr_)
     {

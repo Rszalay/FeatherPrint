@@ -348,6 +348,52 @@ public:
     // W_total(z) for the updated Δphase formula).
     double fp_r_ref{ 0.0 };
 
+    // FeatherPrint: Shore (Internal Overhang Bridging, Spec REV 3.1, as rewritten 22 Jul 26).
+    // Per-layer candidate regions ("O" in the spec) needing a bridge, from two simple, local,
+    // two-layer tests -- no whole-mesh reachability computation, unlike this field's own prior
+    // implementation (see below for why that was replaced):
+    //   T (Top Surface) = layer_n \ layer_{n+1}   -- no angle filter, mirrors ordinary top-skin
+    //                                                 detection (see generateTopAndBottomMostSurfaces,
+    //                                                 skin.cpp) rather than testing a printable angle.
+    //   Enclosure        = T's own footprint, at Layer n-1, falls within that Layer's own outer
+    //                       envelope (OML extent, holes filled in) AND is hollow there -- hollow
+    //                       meaning outside the one-line-width printed Wall band inset from that
+    //                       envelope, NOT "not solid in the raw CAD mesh." FeatherPrint never
+    //                       prints solid fill beyond that Wall band regardless of whether the
+    //                       raw mesh is solid there -- using the raw mesh's own solidity here
+    //                       made this test fire nowhere on any model without a CAD-modeled
+    //                       cavity, confirmed via real diagnostic testing (a solid mesh's own
+    //                       "outer envelope" and "solid area" are identical by construction).
+    // O = T restricted to the portion passing Enclosure.
+    //
+    // Because FeatherPrint prints hollow with no infill, there is no separate concept of
+    // "internal" print geometry -- what matters is only whether the space beneath a given
+    // overhang is open exterior air or bounded by the model's own envelope, which is exactly
+    // what Enclosure tests, directly and locally. An earlier implementation instead asked
+    // whether new solid area extended the model's own silhouette outward (three escalating local
+    // heuristics, then a whole-mesh reachability flood fill when those proved insufficient) --
+    // technically correct for that older question, but real-print testing found it didn't match
+    // the actual use case: a shelf fused to an unrelated wall, confirmed genuinely disconnected
+    // from any enclosed cavity by the flood fill, still needed bridging. The spec's own
+    // definition of "internal" was rewritten to reflect this rather than tuning the flood fill
+    // further -- see the spec's own Revision History for the full account.
+    //
+    // Each candidate is a SingleShape (its own outer polygon plus any holes -- a literal hole
+    // feature in the surface being capped, or a not-yet-closed portion of the same top-facing
+    // region). Usually 0 or 1 per Layer, not assumed unique. Computed in a sequential per-mesh
+    // pre-pass in FffPolygonGenerator.cpp that only needs per-layer outlines (no dependency on
+    // fp_helix_phase/fp_phase_origin -- Shore has no relationship to Stringer at all).
+    std::vector<std::vector<SingleShape>> fp_shore_overhangs;
+
+    // FeatherPrint: Shore's resulting bridge line segments, recorded at the LAYER THEY SHOULD BE
+    // PRINTED AT (n - top_layers, where n is the Layer the internal overhang was detected at),
+    // not the detection Layer itself -- this places the bridge material early enough that
+    // ordinary top skin (top_layers worth) can build up on it by the time the slicer reaches the
+    // true closure. Consumed in FffGcodeWriter.cpp alongside ordinary infill processing, emitted
+    // via LayerPlan::addLinesByOptimizer with the mesh's own infill config -- ordinary Infill
+    // print-feature classification, no new machinery.
+    std::vector<std::vector<std::pair<Point2LL, Point2LL>>> fp_shore_bridges;
+
     std::vector<AngleDegrees> infill_angles; //!< a list of angle values which is cycled through to determine the infill angle of each layer
     std::vector<AngleDegrees> roofing_angles; //!< a list of angle values which is cycled through to determine the roofing angle of each layer
     std::vector<AngleDegrees> flooring_angles; //!< a list of angle values which is cycled through to determine the flooring angle of each layer

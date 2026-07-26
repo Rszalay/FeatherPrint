@@ -914,7 +914,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
     double Q = 0.0;
     for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
         Q += static_cast<double>(walls_outer_first[wi].width) / static_cast<double>(w);
-    const double flare_D = settings.get<double>("featherprint_flare_depth");
+    const double flare_D = settings.get<double>("featherprint_feature_depth");
     const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
     // Start/End (canonical y=0) must land where the surrounding ordinary innermost-Wall path
     // actually runs — the innermost Wall's own offset from the OML — not at the OML itself.
@@ -1138,11 +1138,11 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
     const int N = settings.get<int>("featherprint_stringer_count");
     const double w_d = static_cast<double>(w);
 
-    const double stringer_D = settings.get<double>("featherprint_stringer_depth");
+    const double stringer_D = settings.get<double>("featherprint_feature_depth");
     const double stringer_W = settings.get<double>("featherprint_stringer_width");
     const double stringer_R2 = stringer_W / 2.0;
     const double stringer_R1 = stringer_R2 + 0.5; // matches Stringer Trace's corrected R1=R2+G
-    const double flare_D = settings.get<double>("featherprint_flare_depth");
+    const double flare_D = stringer_D;
     // Flare Rim's Width matches the colliding feature's own Width (Spec REV 2.0).
     const double lacing_flare_W = settings.get<double>("featherprint_lacing_width");
 
@@ -1351,7 +1351,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
 //
 // G=0.5 (fixed default). R2=W/2, R1=R2+G (never degenerates to <=0 for any R2>0 — no
 // lower bound on W needed for this reason, unlike the R2-G formulation this replaces).
-// D, W from featherprint_stringer_depth/width.
+// D from featherprint_feature_depth (shared), W from featherprint_stringer_width.
 // Point Table: Start(-G,0) P1(R2,R1) P2(R2,D-R2) P3(-R2,D-R2) P4(-R2,R1) End(G,0).
 // Centres: C1(-G,R1) C2(0,D-R2) C3(G,R1).
 // Path: Arc1 Start->P1 R1 CCW c=C1; Line1 P1->P2; Arc2 P2->P3 R2 CCW c=C2;
@@ -1482,7 +1482,7 @@ void FeatherPrintGenerator::appendLacingTrace(
 // channel (Line-in, Arc1, Line-mid, Arc2, Line-out), R1 = min(D - Q, W/2) (w-units; Q = true
 // thickness in w-units of this Flange ramp layer's Wall stack, i.e. the sum of each Wall's own
 // width — NOT a plain Wall count, which under-charges a stack containing a half-width Wall —
-// D = featherprint_flare_depth). The W/2 clamp on R1 keeps Line-mid's span (W - 2*R1) from
+// D = featherprint_feature_depth, shared). The W/2 clamp on R1 keeps Line-mid's span (W - 2*R1) from
 // going negative and crossing the two end arcs over each other when D is large relative to W;
 // the depth this clamp would otherwise cut off (drop = (D-Q) - W/2, when positive) is NOT
 // dropped — it's picked up by the Line-in/Line-out vertical lead-in/out segments, so the
@@ -1574,9 +1574,9 @@ VariableWidthLines FeatherPrintGenerator::generate(
     if (N < 1)
         return {};
 
-    const double stringer_D = settings.get<double>("featherprint_stringer_depth");
+    const double stringer_D = settings.get<double>("featherprint_feature_depth");
     const double stringer_W = settings.get<double>("featherprint_stringer_width");
-    const double lacing_D   = settings.get<double>("featherprint_lacing_depth");
+    const double lacing_D   = stringer_D;
     const double lacing_W   = settings.get<double>("featherprint_lacing_width");
 
     ArcParam arc = buildArcParam(*outer);
@@ -1848,9 +1848,9 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
     if (N < 1)
         return {};
 
-    const double stringer_D = settings.get<double>("featherprint_stringer_depth");
+    const double stringer_D = settings.get<double>("featherprint_feature_depth");
     const double stringer_W = settings.get<double>("featherprint_stringer_width");
-    const double lacing_D   = settings.get<double>("featherprint_lacing_depth");
+    const double lacing_D   = stringer_D;
     const double lacing_W   = settings.get<double>("featherprint_lacing_width");
     const double stringer_R2 = stringer_W / 2.0;
     const double stringer_R1 = stringer_R2 + 0.5; // matches Stringer Trace's corrected R1=R2+G

@@ -8,6 +8,7 @@
 #include <map> // multimap (ordered map allowing duplicate keys)
 #include <numbers>
 #include <numeric>
+#include <optional>
 
 #include <spdlog/spdlog.h>
 
@@ -456,6 +457,281 @@ void FffPolygonGenerator::slices2polygons(SliceDataStorage& storage, TimeKeeper&
     AreaSupport::generateSupportInfillFeatures(storage);
 }
 
+namespace
+{
+// ============================================================================
+// Shore (Internal Overhang Bridging, Spec REV 3.1) -- geometry helpers.
+// Deliberately self-contained here (not routed through FeatherPrintGenerator) since Shore, as
+// of REV 3.1, has no dependency on Stringer/Lacing/any other print feature at all -- it only
+// needs per-layer outlines.
+// ============================================================================
+
+// True interior segment-segment crossing only -- a shared endpoint or collinear touch does not
+// count, since a tangent line correctly built against one hole is expected to graze it exactly.
+bool segmentsProperlyIntersect(const Point2LL& p1, const Point2LL& p2, const Point2LL& p3, const Point2LL& p4)
+{
+    auto cross = [](const Point2LL& o, const Point2LL& a, const Point2LL& b) -> double
+    {
+        return static_cast<double>(a.X - o.X) * static_cast<double>(b.Y - o.Y) - static_cast<double>(a.Y - o.Y) * static_cast<double>(b.X - o.X);
+    };
+    const double d1 = cross(p3, p4, p1);
+    const double d2 = cross(p3, p4, p2);
+    const double d3 = cross(p1, p2, p3);
+    const double d4 = cross(p1, p2, p4);
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+
+bool segmentCrossesHoleInterior(const Point2LL& a, const Point2LL& b, const Polygon& hole)
+{
+    const size_t n = hole.size();
+    for (size_t i = 0; i < n; i++)
+    {
+        const size_t j = (i + 1) % n;
+        if (segmentsProperlyIntersect(a, b, hole[i], hole[j]))
+            return true;
+    }
+    return false;
+}
+
+double pointDistance(const Point2LL& a, const Point2LL& b)
+{
+    const double dx = static_cast<double>(b.X - a.X), dy = static_cast<double>(b.Y - a.Y);
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// A point sampled on O's own outer boundary, with its winding-based inward normal (same
+// convention as FeatherPrintGenerator::resolveFrame: tangent rotated +90 degrees, tangent sign
+// flipped for a CW-wound polygon -- no centroid dependency).
+struct ShoreRimPoint
+{
+    Point2LL pos;
+    double nx, ny;
+    int seg_idx; // originating segment index, for ray-cast self-exclusion
+};
+
+// Samples outer's boundary at ~step arc-length intervals. Interval is a tentative constant
+// (see fp_shore_overhangs' doc comment in sliceDataStorage.h) -- not spec-mandated.
+std::vector<ShoreRimPoint> sampleShoreRimPoints(const Polygon& outer, coord_t step)
+{
+    std::vector<ShoreRimPoint> pts;
+    const size_t n = outer.size();
+    if (n < 3 || step <= 0)
+        return pts;
+
+    double area2 = 0.0;
+    std::vector<double> seg_len(n);
+    double total = 0.0;
+    for (size_t i = 0; i < n; i++)
+    {
+        const size_t j = (i + 1) % n;
+        area2 += static_cast<double>(outer[i].X) * outer[j].Y - static_cast<double>(outer[j].X) * outer[i].Y;
+        seg_len[i] = pointDistance(outer[i], outer[j]);
+        total += seg_len[i];
+    }
+    if (total < 1.0)
+        return pts;
+    const bool ccw = area2 > 0.0;
+
+    const int n_samples = std::max(3, static_cast<int>(std::llround(total / static_cast<double>(step))));
+    size_t seg = 0;
+    double seg_start = 0.0;
+    for (int k = 0; k < n_samples; k++)
+    {
+        const double s = (static_cast<double>(k) / n_samples) * total;
+        while (seg + 1 < n && seg_start + seg_len[seg] < s)
+        {
+            seg_start += seg_len[seg];
+            seg++;
+        }
+        const size_t j = (seg + 1) % n;
+        const double ex = static_cast<double>(outer[j].X - outer[seg].X), ey = static_cast<double>(outer[j].Y - outer[seg].Y);
+        const double elen = seg_len[seg];
+        const double t = (elen > 1e-6) ? (s - seg_start) / elen : 0.0;
+        const double px = outer[seg].X + t * ex, py = outer[seg].Y + t * ey;
+        double tx = (elen > 1e-6) ? ex / elen : 1.0, ty = (elen > 1e-6) ? ey / elen : 0.0;
+        if (! ccw)
+        {
+            tx = -tx;
+            ty = -ty;
+        }
+        const double nx = -ty, ny = tx;
+        pts.push_back({ Point2LL(static_cast<coord_t>(std::llround(px)), static_cast<coord_t>(std::llround(py))), nx, ny, static_cast<int>(seg) });
+    }
+    return pts;
+}
+
+// Nearest intersection of the ray (from, dir) against outer's own boundary, excluding the
+// segment(s) immediately adjacent to `from`'s own originating segment (index-adjacency
+// exclusion, same pattern FeatherPrintGenerator::isThinSection uses to avoid a trivial self-hit).
+std::optional<Point2LL> castShoreRay(const Point2LL& from, double dx, double dy, const Polygon& outer, int exclude_seg)
+{
+    const size_t n = outer.size();
+    double best_t = -1.0;
+    Point2LL best_pt{};
+    for (size_t i = 0; i < n; i++)
+    {
+        if (exclude_seg >= 0)
+        {
+            int d = std::abs(static_cast<int>(i) - exclude_seg);
+            d = std::min(d, static_cast<int>(n) - d);
+            if (d <= 1)
+                continue;
+        }
+        const size_t j = (i + 1) % n;
+        const Point2LL& A = outer[i];
+        const Point2LL& B = outer[j];
+        const double ex = static_cast<double>(B.X - A.X), ey = static_cast<double>(B.Y - A.Y);
+        const double denom = dx * ey - dy * ex;
+        if (std::abs(denom) < 1e-9)
+            continue;
+        const double asx = static_cast<double>(A.X - from.X), asy = static_cast<double>(A.Y - from.Y);
+        const double t = (asx * ey - asy * ex) / denom;
+        const double u = (asx * dy - asy * dx) / denom;
+        if (! (u >= -1e-9 && u <= 1.0 + 1e-9 && t > 1e-6))
+            continue;
+        if (best_t < 0.0 || t < best_t)
+        {
+            best_t = t;
+            best_pt = Point2LL(static_cast<coord_t>(std::llround(from.X + t * dx)), static_cast<coord_t>(std::llround(from.Y + t * dy)));
+        }
+    }
+    if (best_t < 0.0)
+        return std::nullopt;
+    return best_pt;
+}
+
+// Standard O(n) tangent-point scan: hull vertex i is a tangent point from external point P iff
+// both its neighboring edges keep the other vertex on the same side of the line P->hull[i].
+std::vector<size_t> findShoreTangentVertices(const std::vector<Point2LL>& hull, const Point2LL& P)
+{
+    std::vector<size_t> tangents;
+    const size_t n = hull.size();
+    if (n < 3)
+        return tangents;
+    auto cross2 = [](double ax, double ay, double bx, double by) { return ax * by - ay * bx; };
+    for (size_t i = 0; i < n; i++)
+    {
+        const size_t prev = (i + n - 1) % n, next = (i + 1) % n;
+        const double vx = static_cast<double>(hull[i].X - P.X), vy = static_cast<double>(hull[i].Y - P.Y);
+        const double px = static_cast<double>(hull[prev].X - P.X), py = static_cast<double>(hull[prev].Y - P.Y);
+        const double nx = static_cast<double>(hull[next].X - P.X), ny = static_cast<double>(hull[next].Y - P.Y);
+        const double c1 = cross2(vx, vy, px, py);
+        const double c2 = cross2(vx, vy, nx, ny);
+        if (c1 * c2 >= 0.0)
+            tangents.push_back(i);
+    }
+    return tangents;
+}
+
+// Raw slice-time outline (SliceLayerPart::outline, includes holes) for every part of a layer.
+// NOT SliceLayer::getOutlines() -- that returns print_outline, which for a FeatherPrint mesh is
+// only ever populated later, inside WallsComputation.cpp's wall-generation pass, which runs
+// AFTER this pre-pass (confirmed the actual bug behind Shore detecting nothing on a real test:
+// print_outline is empty at this point in the pipeline, so every basic_overhang came out empty).
+Shape rawSliceOutline(const SliceLayer& layer)
+{
+    Shape result;
+    for (const SliceLayerPart& part : layer.parts)
+        result.push_back(part.outline);
+    return result;
+}
+
+// Generates every surviving candidate bridge segment for one candidate O (Rim Point
+// Distribution / Candidate Bridge Generation / Selection, Spec REV 3.1).
+std::vector<std::pair<Point2LL, Point2LL>> generateShoreBridges(const SingleShape& O, coord_t rim_step)
+{
+    std::vector<std::pair<Point2LL, Point2LL>> result;
+    if (O.empty())
+        return result;
+    const Polygon& outer = O.outerPolygon();
+    if (outer.size() < 3)
+        return result;
+
+    std::vector<Polygon> holes;
+    for (size_t i = 1; i < O.size(); i++)
+        holes.push_back(O[i]);
+
+    std::vector<std::vector<Point2LL>> hole_hulls;
+    for (const Polygon& hole : holes)
+    {
+        Shape wrap;
+        wrap.push_back(hole);
+        Shape hull_shape = wrap.approxConvexHull(0);
+        const Polygon* hull = nullptr;
+        double best_a = 0.0;
+        for (const Polygon& p : hull_shape)
+        {
+            const double a = std::abs(p.area());
+            if (a > best_a)
+            {
+                best_a = a;
+                hull = &p;
+            }
+        }
+        if (hull)
+            hole_hulls.emplace_back(hull->begin(), hull->end());
+    }
+
+    const std::vector<ShoreRimPoint> rim = sampleShoreRimPoints(outer, rim_step);
+
+    struct Candidate
+    {
+        Point2LL a, b;
+        double len;
+    };
+    std::vector<Candidate> candidates;
+
+    auto tryCandidate = [&](const Point2LL& from, double dx, double dy, int seg_idx)
+    {
+        const std::optional<Point2LL> hit = castShoreRay(from, dx, dy, outer, seg_idx);
+        if (! hit)
+            return;
+        for (const Polygon& hole : holes)
+            if (segmentCrossesHoleInterior(from, *hit, hole))
+                return;
+        candidates.push_back({ from, *hit, pointDistance(from, *hit) });
+    };
+
+    for (const ShoreRimPoint& rp : rim)
+    {
+        tryCandidate(rp.pos, rp.nx, rp.ny, rp.seg_idx);
+        for (const std::vector<Point2LL>& hull : hole_hulls)
+        {
+            for (size_t t : findShoreTangentVertices(hull, rp.pos))
+            {
+                double dx = static_cast<double>(hull[t].X - rp.pos.X), dy = static_cast<double>(hull[t].Y - rp.pos.Y);
+                const double len = std::sqrt(dx * dx + dy * dy);
+                if (len < 1e-6)
+                    continue;
+                dx /= len;
+                dy /= len;
+                tryCandidate(rp.pos, dx, dy, rp.seg_idx);
+            }
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.len < b.len; });
+
+    std::vector<Candidate> kept;
+    for (const Candidate& c : candidates)
+    {
+        bool crosses = false;
+        for (const Candidate& k : kept)
+            if (segmentsProperlyIntersect(c.a, c.b, k.a, k.b))
+            {
+                crosses = true;
+                break;
+            }
+        if (! crosses)
+            kept.push_back(c);
+    }
+
+    for (const Candidate& k : kept)
+        result.emplace_back(k.a, k.b);
+    return result;
+}
+} // namespace
+
 void FffPolygonGenerator::processBasicWallsSkinInfill(
     SliceDataStorage& storage,
     const size_t mesh_order_idx,
@@ -787,6 +1063,90 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 FeatherPrintGenerator::computeWarpedTotal(fp_seed_ring_pts, mesh.fp_r_ref, mesh.fp_phase_origin[layer_nr], total_raw, total_warped);
                 const double w_total_mm = (total_warped > 1e-6) ? (total_warped / 1000.0) : arc_total_mm;
                 phase += layer_height_mm / (w_total_mm * tan_alpha);
+            }
+        }
+
+        // Shore (Internal Overhang Bridging, Spec REV 3.1, as rewritten 22 Jul 26): detection,
+        // then bridge generation. Independent of the phase/origin loop above -- only needs
+        // per-layer outlines, no Stringer/Lacing dependency at all.
+        //
+        // This supersedes an earlier, much more elaborate implementation (three successive
+        // local single/double-layer heuristics, then a whole-mesh reachability flood fill) built
+        // against the PREVIOUS wording of "internal overhang," which asked whether new solid
+        // area extended the model's own silhouette outward. Real-print testing on this fork
+        // found the flood fill technically correct but answering a question the actual use case
+        // didn't have: a shelf fused to an unrelated wall, confirmed genuinely disconnected from
+        // any enclosed cavity by the flood fill itself, still needed bridging in practice, since
+        // FeatherPrint prints hollow with no infill -- there's no separate concept of "internal"
+        // print geometry, only whether the space beneath a given overhang is open exterior air
+        // or bounded by the model's own envelope. The spec was rewritten to reflect this
+        // directly rather than the flood fill being tuned further.
+        //
+        // Two simple, local, two-layer tests, per the rewritten spec text:
+        //   T (Top Surface)  = layer_n \ layer_{n+1}          -- no angle filter, mirrors
+        //                                                          ordinary top-skin detection.
+        //   Enclosure         = T's own footprint, at Layer n-1, falls within that Layer's own
+        //                        outer envelope (OML extent) AND is hollow there (not already
+        //                        solid) -- if already solid at n-1, ordinary skin already has
+        //                        something to rest on, so Shore does not apply.
+        // O = T restricted to the portion passing Enclosure. This single general test also
+        // covers the "flat top of an otherwise-solid hollow-printed part" case directly (T there
+        // is the whole top disk, since nothing exists at layer n+1; Enclosure resolves to the
+        // wall ring's own inner hollow) -- no separate topmost-Layer special case is needed.
+        {
+            mesh.fp_shore_overhangs.assign(mesh_layer_count, {});
+            mesh.fp_shore_bridges.assign(mesh_layer_count, {});
+
+            const coord_t shore_rim_step = mesh.settings.get<coord_t>("featherprint_line_width");
+            const size_t shore_top_layers = mesh.settings.get<size_t>("top_layers");
+
+            for (size_t li = 0; li < mesh_layer_count; li++)
+            {
+                Shape outline_li = rawSliceOutline(mesh.layers[li]);
+                if (outline_li.empty())
+                    continue;
+
+                Shape outline_above = (li + 1 < mesh_layer_count) ? rawSliceOutline(mesh.layers[li + 1]) : Shape{};
+                Shape T = outline_li.difference(outline_above);
+                if (T.empty())
+                    continue;
+
+                if (li == 0)
+                    continue; // no Layer below to test Enclosure against
+
+                // "Solid" here must mean what FeatherPrint actually PRINTS as solid, not what the
+                // raw CAD mesh's own cross-section happens to be. FeatherPrint never prints
+                // solid fill anywhere except within one line width of the traced OML (or the
+                // Flange's own thicker Wall stack, not accounted for here yet -- see below) --
+                // regardless of whether the raw mesh is solid or hollow at that point. Using the
+                // raw mesh's own solidity here (as an earlier version of this code did) made
+                // hollow_below empty everywhere on any model with no CAD-modeled cavity, since a
+                // solid mesh's own "outer envelope" and "solid area" are then identical by
+                // construction -- confirmed via real diagnostic testing this session.
+                const coord_t fp_w = mesh.settings.get<coord_t>("featherprint_line_width");
+                Shape envelope_below = mesh.layers[li - 1].getOutlines(true); // OML extent at li-1, holes filled
+                // TODO: this single-line-width inset doesn't account for a thicker Flange Wall
+                // stack at li-1 (mesh.fp_flange_start_layer isn't computed yet at this point in
+                // the pre-pass) -- an acceptable gap for now since Shore's own settings guidance
+                // is to disable Flange when targeting a genuinely closed top with Shore.
+                Shape hollow_below = envelope_below.offset(-fp_w);
+                if (hollow_below.empty())
+                    continue; // li-1's own envelope is narrower than one Wall -- nothing hollow to enclose T over
+
+                Shape O_all = T.intersection(hollow_below);
+                if (O_all.empty())
+                    continue;
+
+                for (const SingleShape& O : O_all.splitIntoParts())
+                {
+                    mesh.fp_shore_overhangs[li].push_back(O);
+                    std::vector<std::pair<Point2LL, Point2LL>> bridges = generateShoreBridges(O, shore_rim_step);
+                    if (bridges.empty())
+                        continue;
+                    const size_t target_layer = (li > shore_top_layers) ? (li - shore_top_layers) : 0;
+                    auto& dst = mesh.fp_shore_bridges[target_layer];
+                    dst.insert(dst.end(), bridges.begin(), bridges.end());
+                }
             }
         }
 
