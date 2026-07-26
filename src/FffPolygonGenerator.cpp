@@ -636,6 +636,24 @@ Shape rawSliceOutline(const SliceLayer& layer)
     return result;
 }
 
+// Same as rawSliceOutline, but morphologically opened (offset in, then back out) by half a Wall
+// width -- the identical filter WallsComputation.cpp applies (see its own gen_outline) before
+// generating any Wall at all. On a non-manifold/non-watertight input mesh, the slicer's own
+// contour-stitching pass can leave thin spurious slivers in a Layer's raw outline that don't
+// correspond to any real geometry the mesh models; WallsComputation silently drops these before
+// ever laying down a Wall, so no printed surface (and therefore no top skin) ever appears there.
+// Shore must use the same filtered view, not the raw one, or it detects "Top Surface" in slivers
+// that get filtered out before printing and never actually receive real top skin -- confirmed as
+// the cause of Shore firing under regions with no real top layer on a non-watertight test mesh.
+Shape filteredSliceOutline(const SliceLayer& layer, coord_t line_width)
+{
+    Shape raw = rawSliceOutline(layer);
+    if (raw.empty())
+        return raw;
+    Shape opened = raw.offset(-line_width / 2).offset(line_width / 2);
+    return opened.empty() ? raw : opened;
+}
+
 // Generates every surviving candidate bridge segment for one candidate O (Rim Point
 // Distribution / Candidate Bridge Generation / Selection, Spec REV 3.1).
 std::vector<std::pair<Point2LL, Point2LL>> generateShoreBridges(const SingleShape& O, coord_t rim_step)
@@ -1093,6 +1111,36 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
         // covers the "flat top of an otherwise-solid hollow-printed part" case directly (T there
         // is the whole top disk, since nothing exists at layer n+1; Enclosure resolves to the
         // wall ring's own inner hollow) -- no separate topmost-Layer special case is needed.
+        //
+        // Distinguishing a genuinely open top (no real surface to cap, so Shore is pointless
+        // there) from an ordinary closed taper turned out to have NO signal in per-layer 2D
+        // slice geometry at all: real-print testing found a mesh whose top the user modeled as
+        // open still slices into a perfectly ordinary, monotonically-shrinking sequence of
+        // closed loops all the way to a point, with zero open_polylines anywhere near the top --
+        // ray-casting always produces a closed 2D contour regardless of whether the source mesh
+        // actually has a face capping that region in 3D. Two earlier attempts at a geometric
+        // signal (Layer n's own open_polylines, then Layer n+1's) were both confirmed dead ends
+        // this way. Flange is instead used as the actual signal: the user already tells the
+        // engine "this top is open" by enabling Flange (see the ramp ordering below) -- so Shore
+        // simply must not fire within Flange's own ramp zone, computed first so Shore can read
+        // it directly instead of re-deriving open-ness itself.
+        {
+            const size_t n_flange = mesh.settings.get<size_t>("featherprint_flange_ramp_layers");
+            LayerIndex flange_last_geom = -1;
+            for (int li = static_cast<int>(mesh_layer_count) - 1; li >= 0; li--)
+            {
+                if (! mesh.layers[li].parts.empty() || ! mesh.layers[li].open_polylines.empty())
+                {
+                    flange_last_geom = static_cast<LayerIndex>(li);
+                    break;
+                }
+            }
+            if (mesh.settings.get<bool>("featherprint_flange_enabled") && flange_last_geom >= 0)
+            {
+                mesh.fp_flange_start_layer = static_cast<LayerIndex>(
+                    std::max(LayerIndex(0), flange_last_geom - static_cast<LayerIndex>(n_flange) + 1));
+            }
+        }
         {
             mesh.fp_shore_overhangs.assign(mesh_layer_count, {});
             mesh.fp_shore_bridges.assign(mesh_layer_count, {});
@@ -1102,11 +1150,26 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
 
             for (size_t li = 0; li < mesh_layer_count; li++)
             {
-                Shape outline_li = rawSliceOutline(mesh.layers[li]);
+                Shape outline_li = filteredSliceOutline(mesh.layers[li], shore_rim_step);
                 if (outline_li.empty())
                     continue;
 
-                Shape outline_above = (li + 1 < mesh_layer_count) ? rawSliceOutline(mesh.layers[li + 1]) : Shape{};
+                // Flange's own ramp zone is the user's explicit signal that this top is open --
+                // Shore must not fire anywhere Flange is already handling the same region.
+                if (mesh.settings.get<bool>("featherprint_flange_enabled") && mesh.fp_flange_start_layer >= 0
+                    && static_cast<LayerIndex>(li) >= mesh.fp_flange_start_layer)
+                    continue;
+
+                // If Layer n+1 has geometry that isn't represented as closed parts at all --
+                // Whip's own intentionally-open boundary edge, carried as open_polylines rather
+                // than a SliceLayerPart -- the model genuinely continues upward there, just not
+                // as a closed loop. Unrelated to the Flange case above (Whip Terminal, not an
+                // open top), but the same reasoning applies: no real top skin is ever generated
+                // over that continuation either.
+                if (li + 1 < mesh_layer_count && ! mesh.layers[li + 1].open_polylines.empty())
+                    continue;
+
+                Shape outline_above = (li + 1 < mesh_layer_count) ? filteredSliceOutline(mesh.layers[li + 1], shore_rim_step) : Shape{};
                 Shape T = outline_li.difference(outline_above);
                 if (T.empty())
                     continue;
@@ -1116,19 +1179,25 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
 
                 // "Solid" here must mean what FeatherPrint actually PRINTS as solid, not what the
                 // raw CAD mesh's own cross-section happens to be. FeatherPrint never prints
-                // solid fill anywhere except within one line width of the traced OML (or the
-                // Flange's own thicker Wall stack, not accounted for here yet -- see below) --
+                // solid fill anywhere except within one line width of the traced OML --
                 // regardless of whether the raw mesh is solid or hollow at that point. Using the
                 // raw mesh's own solidity here (as an earlier version of this code did) made
                 // hollow_below empty everywhere on any model with no CAD-modeled cavity, since a
                 // solid mesh's own "outer envelope" and "solid area" are then identical by
                 // construction -- confirmed via real diagnostic testing this session.
+                //
+                // li-1's own Wall stack is always the plain single-line-width kind here, never
+                // Flange's thicker ramp: li itself is already confirmed above to be below
+                // mesh.fp_flange_start_layer, so li-1 is strictly further below it too.
                 const coord_t fp_w = mesh.settings.get<coord_t>("featherprint_line_width");
-                Shape envelope_below = mesh.layers[li - 1].getOutlines(true); // OML extent at li-1, holes filled
-                // TODO: this single-line-width inset doesn't account for a thicker Flange Wall
-                // stack at li-1 (mesh.fp_flange_start_layer isn't computed yet at this point in
-                // the pre-pass) -- an acceptable gap for now since Shore's own settings guidance
-                // is to disable Flange when targeting a genuinely closed top with Shore.
+                // Same morphological-open filter as outline_li/outline_above above, applied to the
+                // OML extent at li-1 (holes filled) -- otherwise a stitching sliver from a
+                // non-manifold input mesh can pass the Enclosure test the same way it would
+                // wrongly pass the Top Surface test, for the same reason.
+                Shape envelope_below_raw = mesh.layers[li - 1].getOutlines(true);
+                Shape envelope_below = envelope_below_raw.offset(-fp_w / 2).offset(fp_w / 2);
+                if (envelope_below.empty())
+                    envelope_below = envelope_below_raw;
                 Shape hollow_below = envelope_below.offset(-fp_w);
                 if (hollow_below.empty())
                     continue; // li-1's own envelope is narrower than one Wall -- nothing hollow to enclose T over
@@ -1150,34 +1219,10 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
             }
         }
 
-        // Flange: unconditionally spans featherprint_flange_ramp_layers layers down from the
-        // topmost layer with any boundary geometry (closed parts OR open_polylines — a
-        // boundary loop interrupted by a slot/hole reaching the open top is represented
-        // entirely as open_polylines at those layers, the same container the ordinary
-        // single-slot Whip case already uses). No attempt is made to distinguish an open top
-        // from a closed apex/taper here — that heuristic proved unreliable (it either misses
-        // an open top interrupted by slots, since those top layers have no `parts` to measure
-        // an area from, or misfires on an ordinary closed taper). Models with a genuinely
-        // closed top (e.g. a nose cone) must instead disable the Flange explicitly via
-        // featherprint_flange_enabled.
-        if (mesh.settings.get<bool>("featherprint_flange_enabled"))
-        {
-            const size_t n_flange = mesh.settings.get<size_t>("featherprint_flange_ramp_layers");
-            LayerIndex last_geom = -1;
-            for (int li = static_cast<int>(mesh_layer_count) - 1; li >= 0; li--)
-            {
-                if (! mesh.layers[li].parts.empty() || ! mesh.layers[li].open_polylines.empty())
-                {
-                    last_geom = static_cast<LayerIndex>(li);
-                    break;
-                }
-            }
-            if (last_geom >= 0)
-            {
-                mesh.fp_flange_start_layer = static_cast<LayerIndex>(
-                    std::max(LayerIndex(0), last_geom - static_cast<LayerIndex>(n_flange) + 1));
-            }
-        }
+        // Flange's own start layer (unconditionally spans featherprint_flange_ramp_layers layers
+        // down from the topmost layer with any boundary geometry — closed parts OR
+        // open_polylines) is now computed earlier, above, right before Shore's own pre-pass, so
+        // Shore can read mesh.fp_flange_start_layer directly instead of re-deriving open-ness.
     }
 
     // walls
