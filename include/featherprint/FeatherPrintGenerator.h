@@ -107,6 +107,57 @@ public:
     VariableWidthLines generateFlangeOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_index, double helix_phase, const OpenLayerParams& params);
 
     /*!
+     * Generate the Punchout Line + Terminal geometry for one hole-gap on an open-manifold
+     * layer (Spec REV 3.3), gated by featherprint_punchout_enabled.
+     *
+     * prev_wall_poly and next_wall_poly are the two REAL open polylines the caller
+     * (WallsComputation) determined bound this hole in ring order: P0 = prev_wall_poly.back()
+     * is the END of one real open polyline and P1 = next_wall_poly.front() is the START of
+     * the NEXT, around the layer's full virtual ring. This distinction matters: with more
+     * than one hole open on the same layer, a single real open polyline typically runs from
+     * one hole's edge, around through solid wall material, to a DIFFERENT hole's edge — its
+     * own front()/back() are usually NOT a matched pair bounding one hole. The ring-adjacent
+     * pairing the caller performs is what actually identifies each hole's own two edges; only
+     * in the degenerate single-hole/single-arc-on-this-layer case does prev_wall_poly and
+     * next_wall_poly happen to be the same polyline.
+     *
+     * Internally this builds a synthetic ArcParam over the straight CHORD between P0 and P1
+     * and reuses the same tangent-blend/Terminal machinery Whip Terminal uses — but
+     * parametrized against that chord only, never against either real polyline's own
+     * arc-length (which is solid wall, not hole interior — placing Punchout geometry there,
+     * as an earlier attempt did, puts it outside the hole).
+     *
+     * Returns empty if Punchout is disabled, the endpoints are closer together than 2x the
+     * requested featherprint_punchout_gap cutback, or the resulting chord has no room left
+     * for a Terminal loop at each end (falls back to a plain straight segment in that case).
+     *
+     * The cutback gap between each Terminal's own true endpoint (Q0/Q1) and the real wall
+     * corner (P0/P1) is intentionally left unwelded — an earlier revision closed it with a
+     * tangent-matched "weld stub" curve, tapered in near a hole's own top/bottom, but removed
+     * it again after real-print testing found the stub made the Punchout materially harder to
+     * break away, defeating the point of a removable support feature.
+     *
+     * contour_pts, if non-empty, replaces the straight middle segment between the two
+     * Terminals with a plain polyline through these world-space points instead: the line
+     * becomes exactly Start Terminal -> contour_pts[0] -> ... -> contour_pts[N-1] -> End
+     * Terminal, no chord walk in between. The caller (WallsComputation) computes these by
+     * lofting between the real wall contours immediately below and immediately above this
+     * hole (SliceMeshStorage::fp_punchout_gap_spans' contour_below/contour_above, sampled once
+     * per hole in the pre-pass) at this Layer's own Z — so the Line's shape gradually matches
+     * the wall it meets at the hole's own top and bottom. Pass empty to keep the plain straight
+     * chord (e.g. when the hole reaches the very top/bottom of the mesh and no bounding closed
+     * Layer exists on one side).
+     *
+     * half_width_ends prints this entire Punchout (Terminals included) at half the nominal
+     * line width instead of full width — the caller sets this exactly on the Layer that forms
+     * the literal top of the hole's own span and the Layer that forms its literal bottom, per
+     * spec, to weaken those connections and make the whole feature easier to break away.
+     * Geometry is unaffected (R1/R2/D/W are still derived from the full nominal width, so the
+     * profile keeps its normal proportions) — only the printed bead width changes.
+     */
+    VariableWidthLines generatePunchout(const OpenPolyline& prev_wall_poly, const OpenPolyline& next_wall_poly, coord_t z, const Settings& settings, const OpenLayerParams& params, const std::vector<Point2LL>& contour_pts = {}, bool half_width_ends = false);
+
+    /*!
      * Returns the world-space position of the seam (helix 0 departure) for this layer.
      * Valid only after generate() has been called for the same z / settings combination.
      * Used by WallsComputation to set the z-seam hint on the part.
@@ -297,7 +348,14 @@ private:
     // tangent's angle off the centroid-perpendicular) everywhere else. Arc-length is intrinsic to
     // the curve, so it has no such distortion. (The anchor's OWN position is still resolved by
     // angle/ray-cast elsewhere — that's a separate concern, distributing anchors around the part.)
-    static TangentFrame resolveFrame(const ArcParam& arc, const Point2LL& centroid, double s);
+    //
+    // w (nominal line width) scales the internal tangent-smoothing window (see the .cpp's own
+    // comment) — it was originally a fixed 0.3mm regardless of w, which is fine at the 0.4mm
+    // line width the ratio was tuned against but becomes a much LARGER fraction of w (1.5x
+    // instead of 0.75x) at a finer 0.2mm line width, over-smoothing local tangent direction
+    // right where Lacing's collision detection (a flat `d < w` test) is most sensitive to it —
+    // confirmed as a real contributor to increased Stringer/Lacing overlap at fine line widths.
+    static TangentFrame resolveFrame(const ArcParam& arc, const Point2LL& centroid, double s, coord_t w);
 
     // Two rigid placements (Copy A at the feature's Start, Copy B at its End) of the entire
     // canonical point cloud, affine-blended by t = (lx - x_s) / (x_e - x_s). x_s/x_e are the

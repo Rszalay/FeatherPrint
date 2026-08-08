@@ -4,9 +4,12 @@
 #ifndef WALLS_COMPUTATION_H
 #define WALLS_COMPUTATION_H
 
+#include <vector>
+
 #include "geometry/Point2LL.h"
 #include "settings/Settings.h"
 #include "settings/types/LayerIndex.h"
+#include "sliceDataStorage.h"
 #include "utils/Coord_t.h"
 #include "utils/section_type.h"
 
@@ -35,7 +38,9 @@ public:
         double fp_helix_phase = 0.0,
         LayerIndex fp_flange_start_layer = -1,
         Point2LL fp_phase_origin = Point2LL(0, 0),
-        double fp_r_ref = 0.0);
+        double fp_r_ref = 0.0,
+        std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans = {},
+        std::vector<Polygon> fp_interior_holes = {});
 
     /*!
      * \brief Generates the walls / inner area for all parts in a layer.
@@ -64,6 +69,14 @@ private:
     // Curvature-Weighted Stringer Density (Spec REV 2.6): k_ref * R_avg, computed once per
     // mesh (see SliceMeshStorage::fp_r_ref). <= 0 means the feature is inactive for this mesh.
     const double fp_r_ref_;
+    // Punchout (Spec REV 3.3) hole-span data for THIS layer only (see
+    // SliceMeshStorage::fp_punchout_gap_spans for how it's built) — used to taper the
+    // Punchout cutback near a hole's own top/bottom.
+    const std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans_;
+    // Interior Opening Carry-Through (Spec REV 3.4 Phase 2) hole polygons for THIS layer
+    // only (see SliceMeshStorage::fp_interior_holes for how they're built) — subtracted from
+    // inner_area alongside part->outline's own hole polygons.
+    const std::vector<Polygon> fp_interior_holes_;
 
     /*!
      * Generates the walls / inner area for a single layer part.

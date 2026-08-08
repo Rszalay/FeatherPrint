@@ -9,6 +9,8 @@
 #include <numbers>
 #include <numeric>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 
@@ -64,6 +66,96 @@
 namespace cura
 {
 
+namespace
+{
+// Interior Boundary Loop Detection (Spec REV 3.4 Phase 2): walks the raw mesh's boundary
+// edges (MeshFace::connected_face_index_[k] == -1, computed once at mesh-finish time --
+// see include/mesh.h's own MeshFace doc comment -- fully independent of Z-slicing) and
+// returns every CLOSED, COPLANAR loop found, as a (2D projected polygon, average Z) pair.
+// Must be called BEFORE MeshGroup::clear() discards Mesh::faces_/vertices_ -- confirmed
+// (FffPolygonGenerator::sliceModel, below) that this is the only point in the pipeline this
+// raw topology survives. Does NOT test whether a loop is a genuine interior hole vs. the
+// mesh's own outer silhouette at that Z -- that needs the corresponding Layer's own sliced
+// outline, which doesn't exist yet this early; the caller does that test once
+// SliceMeshStorage/parts are built, later in the same function.
+std::vector<std::pair<Polygon, coord_t>> fpDetectCoplanarInteriorLoops(const Mesh& mesh)
+{
+    std::vector<std::pair<Polygon, coord_t>> result;
+
+    // Collect every boundary edge (an edge with no matching neighbor face), directed
+    // consistent with the owning face's own CCW winding.
+    std::unordered_map<uint32_t, uint32_t> next_vertex;
+    for (const MeshFace& face : mesh.faces_)
+    {
+        for (int k = 0; k < 3; k++)
+        {
+            if (face.connected_face_index_[k] == -1)
+            {
+                const uint32_t v0 = static_cast<uint32_t>(face.vertex_index_[k]);
+                const uint32_t v1 = static_cast<uint32_t>(face.vertex_index_[(k + 1) % 3]);
+                next_vertex[v0] = v1;
+            }
+        }
+    }
+
+    // Chain into closed loops. Each boundary vertex has exactly one outgoing boundary edge
+    // on a simple manifold boundary; walk until back at the start (closed) or a dead end
+    // (open chain -- an ordinary vertical Whip boundary edge or similar, not our concern here).
+    std::unordered_set<uint32_t> visited;
+    constexpr size_t kMaxLoopVerts = 100000; // safety bound against a malformed mesh, not a real design limit
+    for (const auto& start_pair : next_vertex)
+    {
+        const uint32_t start = start_pair.first;
+        if (visited.count(start))
+            continue;
+        std::vector<uint32_t> loop_verts;
+        uint32_t cur = start;
+        bool closed = false;
+        for (size_t iter = 0; iter < kMaxLoopVerts; iter++)
+        {
+            if (visited.count(cur))
+            {
+                closed = (cur == start && ! loop_verts.empty());
+                break;
+            }
+            visited.insert(cur);
+            loop_verts.push_back(cur);
+            auto it = next_vertex.find(cur);
+            if (it == next_vertex.end())
+                break; // dead end -- open chain, not a closed loop
+            cur = it->second;
+        }
+        if (! closed || loop_verts.size() < 3)
+            continue;
+
+        // Coplanar check: every vertex's Z within a small tolerance of the loop's own
+        // average Z -- a real (non-flat) hole boundary already reaches part->outline the
+        // ordinary way and is handled by Phase 1, not this pass.
+        double z_sum = 0.0;
+        for (uint32_t vi : loop_verts)
+            z_sum += static_cast<double>(mesh.vertices_[vi].p_.z_);
+        const double z_avg = z_sum / static_cast<double>(loop_verts.size());
+        constexpr coord_t kCoplanarTolerance = 10; // 0.01mm -- generous only against float/mesh noise, a flat face's own vertices should agree far more tightly than this
+        bool coplanar = true;
+        for (uint32_t vi : loop_verts)
+        {
+            if (std::abs(static_cast<double>(mesh.vertices_[vi].p_.z_) - z_avg) > static_cast<double>(kCoplanarTolerance))
+            {
+                coplanar = false;
+                break;
+            }
+        }
+        if (! coplanar)
+            continue;
+
+        Polygon poly2d;
+        for (uint32_t vi : loop_verts)
+            poly2d.push_back(Point2LL(mesh.vertices_[vi].p_.x_, mesh.vertices_[vi].p_.y_));
+        result.emplace_back(std::move(poly2d), static_cast<coord_t>(std::llround(z_avg)));
+    }
+    return result;
+}
+} // namespace
 
 bool FffPolygonGenerator::generateAreas(SliceDataStorage& storage, MeshGroup* meshgroup, TimeKeeper& timeKeeper)
 {
@@ -208,6 +300,12 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
     }
 
     std::vector<Slicer*> slicerList;
+    // Interior Boundary Loop Detection (Spec REV 3.4 Phase 2): raw candidate loops per mesh
+    // index, detected below (inside this same loop, before meshgroup->clear() discards the
+    // data fpDetectCoplanarInteriorLoops needs) and consumed further down once
+    // SliceMeshStorage/parts/printZ exist to map each loop to its nearest Layer and confirm
+    // it's a genuine interior hole (see the second per-mesh loop, below).
+    std::vector<std::vector<std::pair<Polygon, coord_t>>> pending_interior_loops(meshgroup->meshes.size());
     for (unsigned int mesh_idx = 0; mesh_idx < meshgroup->meshes.size(); mesh_idx++)
     {
         // Check if adaptive layers is populated to prevent accessing a method on NULL
@@ -225,6 +323,11 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
             = new Slicer(&mesh, layer_thickness, slice_layer_count, use_variable_layer_heights, adaptive_layer_height_values, slicing_tolerance, initial_layer_thickness);
 
         slicerList.push_back(slicer);
+
+        if (mesh.settings_.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT)
+        {
+            pending_interior_loops[mesh_idx] = fpDetectCoplanarInteriorLoops(mesh);
+        }
 
         Progress::messageProgress(Progress::Stage::SLICING, mesh_idx + 1, meshgroup->meshes.size());
     }
@@ -343,6 +446,110 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
                 {
                     layer.printZ += train.settings_.get<coord_t>("layer_0_z_overlap"); // undo shifting down of first layer
                 }
+            }
+        }
+
+        // Interior Boundary Loop Detection (Spec REV 3.4 Phase 2), continued: meshStorage's
+        // parts/printZ now exist, so each raw candidate loop detected earlier (before
+        // meshgroup->clear()) can be mapped to its nearest Layer and confirmed as a genuine
+        // interior hole -- strictly inside that Layer's own outer contour, not coincident
+        // with it (a loop matching the Layer's own silhouette is the already-handled
+        // "whole face open" case, Flange's/Shore's territory, not this fix).
+        if (meshIdx < pending_interior_loops.size() && ! pending_interior_loops[meshIdx].empty())
+        {
+            meshStorage.fp_interior_holes.assign(meshStorage.layers.size(), {});
+            for (const auto& loop_entry : pending_interior_loops[meshIdx])
+            {
+                const Polygon& loop_poly = loop_entry.first;
+                const coord_t loop_z = loop_entry.second;
+                if (loop_poly.empty())
+                    continue;
+
+                size_t best_li = 0;
+                coord_t best_dz = std::numeric_limits<coord_t>::max();
+                for (size_t li = 0; li < meshStorage.layers.size(); li++)
+                {
+                    const coord_t dz = std::abs(meshStorage.layers[li].printZ - loop_z);
+                    if (dz < best_dz)
+                    {
+                        best_dz = dz;
+                        best_li = li;
+                    }
+                }
+
+                // Interior test: measure the ACTUAL EFFECT of subtracting this loop from a
+                // given Layer's own outer contour, rather than a single point-inside check. A
+                // point-inside test is fragile exactly where it matters most here: a loop that
+                // nearly coincides with a Layer's own outer boundary (the "whole face open"
+                // case, already handled by Flange/Shore, not this fix) can still register one
+                // sample point as barely "inside" due to mesh/slicing rounding, wrongly passing
+                // as a small interior hole -- confirmed as a real bug via a real test print,
+                // where such a loop wiped out an entire Layer's inner_area (remaining area 0)
+                // instead of cutting a small hole. A genuine interior hole should remove some
+                // area (the loop must actually overlap the face) but leave most of the surface
+                // intact.
+                auto testInterior = [&](size_t li) -> bool
+                {
+                    for (const SliceLayerPart& part : meshStorage.layers[li].parts)
+                    {
+                        if (part.outline.empty())
+                            continue;
+                        const Polygon& outer = part.outline.outerPolygon();
+                        if (outer.size() < 3)
+                            continue;
+                        const double outer_area = std::abs(outer.area());
+                        if (outer_area < 1.0)
+                            continue;
+                        Shape outer_shape;
+                        outer_shape.push_back(outer);
+                        Shape hole_shape;
+                        hole_shape.push_back(loop_poly);
+                        Shape remaining = outer_shape.difference(hole_shape);
+                        // SIGNED sum, not abs() per polygon -- a hole in the result is a
+                        // separate inner-ring polygon with NEGATIVE signed area (Clipper
+                        // convention); taking abs() of it flips a subtraction into an addition.
+                        // Confirmed as a real bug via a real test print, where "remaining" area
+                        // came out LARGER than the original outer area after "subtracting" a hole.
+                        double remaining_area_signed = 0.0;
+                        for (const Polygon& p : remaining)
+                            remaining_area_signed += p.area();
+                        const double remaining_area = std::abs(remaining_area_signed);
+                        if (remaining_area > 0.5 * outer_area && remaining_area < outer_area - 1.0)
+                            return true;
+                    }
+                    return false;
+                };
+
+                if (! testInterior(best_li))
+                    continue;
+
+                meshStorage.fp_interior_holes[best_li].push_back(loop_poly);
+
+                // Carry the SAME hole through every Layer adjacent to best_li where it still
+                // reads as a genuine interior hole (same test, re-run per Layer) -- a flat cap
+                // (e.g. initial_bottom_layers worth of solid base) is uniformly this thick with
+                // the same XY footprint throughout, so the hole persists across all of it, not
+                // just the one Layer nearest the loop's own Z. Walking outward in both
+                // directions (rather than hardcoding a specific setting's layer count) means
+                // this generalizes to whatever span the flat region actually turns out to have,
+                // stopping the moment the test fails (the cap ends, or the model's footprint
+                // changes enough that this hole no longer applies).
+                size_t extend_count = 0;
+                for (size_t li = best_li + 1; li < meshStorage.layers.size(); li++)
+                {
+                    if (! testInterior(li))
+                        break;
+                    meshStorage.fp_interior_holes[li].push_back(loop_poly);
+                    extend_count++;
+                }
+                for (size_t li = best_li; li-- > 0;)
+                {
+                    if (! testInterior(li))
+                        break;
+                    meshStorage.fp_interior_holes[li].push_back(loop_poly);
+                    extend_count++;
+                }
+                spdlog::info("FP-DIAG interior hole found: z={} anchor_layer={} spanning {} Layer(s) total", loop_z, best_li, extend_count + 1);
             }
         }
 
@@ -656,7 +863,7 @@ Shape filteredSliceOutline(const SliceLayer& layer, coord_t line_width)
 
 // Generates every surviving candidate bridge segment for one candidate O (Rim Point
 // Distribution / Candidate Bridge Generation / Selection, Spec REV 3.1).
-std::vector<std::pair<Point2LL, Point2LL>> generateShoreBridges(const SingleShape& O, coord_t rim_step)
+std::vector<std::pair<Point2LL, Point2LL>> generateShoreBridges(const SingleShape& O, coord_t rim_step, const Shape& target_wall_band)
 {
     std::vector<std::pair<Point2LL, Point2LL>> result;
     if (O.empty())
@@ -701,13 +908,44 @@ std::vector<std::pair<Point2LL, Point2LL>> generateShoreBridges(const SingleShap
 
     auto tryCandidate = [&](const Point2LL& from, double dx, double dy, int seg_idx)
     {
+        // Endpoint support check FIRST, before the ray cast even runs: `from` is sampled off
+        // O's own rim at the DETECTION Layer, but the bridge is actually printed several
+        // Layers below (target_layer) -- on a tapering/shifting model the real wall may not
+        // reach this XY position that early, leaving the bridge floating unsupported for
+        // however many Layers separate detection from printing. Checking `from` here, before
+        // any other cull, means a candidate with no real anchor at its own printed Layer never
+        // even costs a ray-cast.
+        if (! target_wall_band.inside(from, true))
+            return;
         const std::optional<Point2LL> hit = castShoreRay(from, dx, dy, outer, seg_idx);
         if (! hit)
+            return;
+        // Same check at the far endpoint -- a bridge floating at ONE end is just as
+        // unsupported as one floating at both.
+        if (! target_wall_band.inside(*hit, true))
+            return;
+        // Discard candidates shorter than kMinBridgeLenLw line widths outright, via early
+        // return BEFORE they're ever pushed into `candidates` below -- this is what makes the
+        // cull happen before the crossing-based greedy selection (the sort + non-crossing
+        // loop further down) rather than after it: a culled short candidate never occupies a
+        // "kept" slot, so a longer candidate that would otherwise have crossed it is free to
+        // be kept in its place. A large, irregularly-shaped O can still produce individual
+        // rim-to-rim bridges far shorter than its own bounding box would suggest (e.g. two
+        // nearby points on a re-entrant rim), and a too-short bridge is a fraction of a single
+        // printable line -- noise, not useful support. Filtering the region's own bounding box
+        // (see the caller) catches only the case where EVERY possible bridge would be this
+        // short; this catches it per-candidate, which is what actually matters.
+        //
+        // Confirmed working at 10 line widths (an obviously large, easy-to-confirm test value);
+        // settled on 3 as the real working value.
+        constexpr double kMinBridgeLenLw = 3.0;
+        const double len = pointDistance(from, *hit);
+        if (len < kMinBridgeLenLw * static_cast<double>(rim_step))
             return;
         for (const Polygon& hole : holes)
             if (segmentCrossesHoleInterior(from, *hit, hole))
                 return;
-        candidates.push_back({ from, *hit, pointDistance(from, *hit) });
+        candidates.push_back({ from, *hit, len });
     };
 
     for (const ShoreRimPoint& rp : rim)
@@ -748,6 +986,149 @@ std::vector<std::pair<Point2LL, Point2LL>> generateShoreBridges(const SingleShap
         result.emplace_back(k.a, k.b);
     return result;
 }
+
+// ============================================================================
+// Punchout contour matching (Spec REV 3.3) — sampling the real wall immediately below/above
+// a hole. Free-function helpers (largest-polygon-by-area, nearest-point projection, arc-length
+// sampling on a closed polygon) mirroring patterns already used elsewhere in this codebase
+// (FeatherPrintGenerator::largestPoly, ArcParam::nearestArcPos, and WallsComputation.cpp's own
+// inline Phase Origin projection) but re-implemented here since those are private to
+// FeatherPrintGenerator/WallsComputation and this pre-pass runs before either is constructed.
+// ============================================================================
+
+const Polygon* fpLargestPoly(const Shape& shape)
+{
+    const Polygon* best = nullptr;
+    double best_area = 0.0;
+    for (const Polygon& p : shape)
+    {
+        const double a = std::abs(p.area());
+        if (a > best_area) { best_area = a; best = &p; }
+    }
+    return best;
+}
+
+void fpBuildClosedCumLen(const Polygon& poly, std::vector<double>& cum_len, double& total)
+{
+    const size_t n = poly.size();
+    cum_len.assign(n, 0.0);
+    for (size_t i = 1; i < n; i++)
+    {
+        const double dx = static_cast<double>(poly[i].X - poly[i - 1].X);
+        const double dy = static_cast<double>(poly[i].Y - poly[i - 1].Y);
+        cum_len[i] = cum_len[i - 1] + std::sqrt(dx * dx + dy * dy);
+    }
+    if (n > 0)
+    {
+        const double dx = static_cast<double>(poly[0].X - poly[n - 1].X);
+        const double dy = static_cast<double>(poly[0].Y - poly[n - 1].Y);
+        total = cum_len[n - 1] + std::sqrt(dx * dx + dy * dy);
+    }
+    else
+        total = 0.0;
+}
+
+double fpNearestArcPos(const Polygon& poly, const std::vector<double>& cum_len, double total, const Point2LL& target)
+{
+    double best_d2 = -1.0;
+    double best_s = 0.0;
+    const size_t n = poly.size();
+    for (size_t i = 0; i < n; i++)
+    {
+        const size_t j = (i + 1) % n;
+        const double ax = static_cast<double>(poly[i].X), ay = static_cast<double>(poly[i].Y);
+        const double ex = static_cast<double>(poly[j].X - poly[i].X), ey = static_cast<double>(poly[j].Y - poly[i].Y);
+        const double seg_len2 = ex * ex + ey * ey;
+        double t = (seg_len2 > 1e-9) ? ((static_cast<double>(target.X) - ax) * ex + (static_cast<double>(target.Y) - ay) * ey) / seg_len2 : 0.0;
+        t = std::max(0.0, std::min(1.0, t));
+        const double px = ax + t * ex, py = ay + t * ey;
+        const double dx = static_cast<double>(target.X) - px, dy = static_cast<double>(target.Y) - py;
+        const double d2 = dx * dx + dy * dy;
+        if (best_d2 < 0.0 || d2 < best_d2)
+        {
+            best_d2 = d2;
+            const double seg_end = (j == 0) ? total : cum_len[j];
+            best_s = cum_len[i] + t * (seg_end - cum_len[i]);
+        }
+    }
+    return best_s;
+}
+
+Point2LL fpPointAtClosed(const Polygon& poly, const std::vector<double>& cum_len, double total, double s)
+{
+    const size_t n = poly.size();
+    if (n == 0)
+        return Point2LL(0, 0);
+    if (total < 1e-9)
+        return poly[0];
+    s = std::fmod(s, total);
+    if (s < 0.0)
+        s += total;
+    for (size_t i = 0; i < n; i++)
+    {
+        const size_t j = (i + 1) % n;
+        const double seg_end = (j == 0) ? total : cum_len[j];
+        if (s <= seg_end + 1e-6)
+        {
+            const double seg_start = cum_len[i];
+            const double seg_len = seg_end - seg_start;
+            double t = (seg_len > 1e-9) ? (s - seg_start) / seg_len : 0.0;
+            t = std::max(0.0, std::min(1.0, t));
+            const Point2LL& a = poly[i];
+            const Point2LL& b = poly[j];
+            return Point2LL(
+                static_cast<coord_t>(std::llround(a.X + t * (b.X - a.X))),
+                static_cast<coord_t>(std::llround(a.Y + t * (b.Y - a.Y))));
+        }
+    }
+    return poly[n - 1];
+}
+
+// Samples n points strictly between arc-length positions s0 and s1 (exclusive of both), along
+// the SHORTER of the two possible arcs between them on a closed polygon of total length
+// `total` — a hole is a small, local feature, so the long way around would trace nearly the
+// model's entire remaining perimeter, never the intended path. Ordered walking from s0's side
+// toward s1's side, so index 0 is nearest s0 and index n-1 nearest s1.
+std::vector<Point2LL> fpSampleShorterArc(const Polygon& poly, const std::vector<double>& cum_len, double total, double s0, double s1, int n)
+{
+    std::vector<Point2LL> pts;
+    if (total < 1e-6 || n < 1)
+        return pts;
+    const double fwd = std::fmod(s1 - s0 + total, total); // s0 -> s1 walking forward (increasing s)
+    const double bwd = total - fwd; // s0 -> s1 walking backward
+    const bool go_forward = fwd <= bwd;
+    const double arc_len = go_forward ? fwd : bwd;
+    const double dir = go_forward ? 1.0 : -1.0;
+    pts.reserve(static_cast<size_t>(n));
+    for (int i = 1; i <= n; i++)
+    {
+        const double t = static_cast<double>(i) / static_cast<double>(n + 1);
+        pts.push_back(fpPointAtClosed(poly, cum_len, total, s0 + dir * t * arc_len));
+    }
+    return pts;
+}
+
+// Builds one side (below OR above) of a hole's contour-matching data: the largest closed
+// polygon on `layer`, p0/p1 projected onto it, and n points sampled along the shorter
+// connecting arc. Returns an empty vector if `layer` has no usable closed outline (e.g. the
+// hole reaches the very top/bottom of the mesh) — callers must treat that as "no contour data,
+// fall back to a straight chord."
+std::vector<Point2LL> fpSampleHoleBoundaryContour(const SliceLayer& layer, const Point2LL& p0, const Point2LL& p1, int n)
+{
+    const Shape outline = layer.getOutlines(true);
+    const Polygon* poly = fpLargestPoly(outline);
+    if (poly == nullptr || poly->size() < 3)
+        return {};
+    std::vector<double> cum_len;
+    double total = 0.0;
+    fpBuildClosedCumLen(*poly, cum_len, total);
+    if (total < 1e-6)
+        return {};
+    const double s0 = fpNearestArcPos(*poly, cum_len, total, p0);
+    const double s1 = fpNearestArcPos(*poly, cum_len, total, p1);
+    return fpSampleShorterArc(*poly, cum_len, total, s0, s1, n);
+}
+
 } // namespace
 
 void FffPolygonGenerator::processBasicWallsSkinInfill(
@@ -1206,13 +1587,47 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 if (O_all.empty())
                     continue;
 
+                // Endpoint support band at the Layer a bridge is ACTUALLY printed on (Spec:
+                // bridges are emitted top_layers below their own detection Layer li, so ordinary
+                // top skin has real material to build on by the time the slicer reaches li
+                // itself). A candidate bridge's endpoints are sampled from O's own rim at li --
+                // on a tapering/shifting model, that XY position may not be reached by the real
+                // wall until several Layers later, leaving the bridge floating over hollow
+                // interior (or open air) at target_layer for however many Layers separate the
+                // two. Same target_layer for every O detected at this li, so computed once here
+                // rather than per O.
+                const size_t target_layer = (li > shore_top_layers) ? (li - shore_top_layers) : 0;
+                Shape target_outline = filteredSliceOutline(mesh.layers[target_layer], shore_rim_step);
+                // Generous band around the OML (FeatherPrint's wall IS the OML, one line width
+                // wide, not a filled solid) -- wide enough to tolerate ordinary offset/rounding
+                // noise between the detection and target Layers' own outlines, not a tightly
+                // tuned value.
+                Shape target_wall_band = target_outline.offset(shore_rim_step).difference(target_outline.offset(-2 * shore_rim_step));
+
                 for (const SingleShape& O : O_all.splitIntoParts())
                 {
+                    // Skip overhangs smaller than one line width in extent -- too small to
+                    // bridge meaningfully (any resulting bridge would be a fraction of a
+                    // printable line, pure noise rather than useful support), and small enough
+                    // that ordinary top skin overlap/expansion can already cross it unaided.
+                    const Polygon& O_outer = O.outerPolygon();
+                    if (! O_outer.empty())
+                    {
+                        coord_t min_x = O_outer[0].X, max_x = O_outer[0].X;
+                        coord_t min_y = O_outer[0].Y, max_y = O_outer[0].Y;
+                        for (const Point2LL& p : O_outer)
+                        {
+                            min_x = std::min(min_x, p.X); max_x = std::max(max_x, p.X);
+                            min_y = std::min(min_y, p.Y); max_y = std::max(max_y, p.Y);
+                        }
+                        if (std::max(max_x - min_x, max_y - min_y) < shore_rim_step)
+                            continue;
+                    }
+
                     mesh.fp_shore_overhangs[li].push_back(O);
-                    std::vector<std::pair<Point2LL, Point2LL>> bridges = generateShoreBridges(O, shore_rim_step);
+                    std::vector<std::pair<Point2LL, Point2LL>> bridges = generateShoreBridges(O, shore_rim_step, target_wall_band);
                     if (bridges.empty())
                         continue;
-                    const size_t target_layer = (li > shore_top_layers) ? (li - shore_top_layers) : 0;
                     auto& dst = mesh.fp_shore_bridges[target_layer];
                     dst.insert(dst.end(), bridges.begin(), bridges.end());
                 }
@@ -1223,6 +1638,208 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
         // down from the topmost layer with any boundary geometry — closed parts OR
         // open_polylines) is now computed earlier, above, right before Shore's own pre-pass, so
         // Shore can read mesh.fp_flange_start_layer directly instead of re-deriving open-ness.
+
+        // Punchout (Spec REV 3.3) hole-span pre-pass. Every other FeatherPrint pass treats
+        // each Layer's open_polylines independently; Punchout's blend-toward-the-wall behavior
+        // near a hole's own top/bottom needs to know that Layer n's gap and Layer n+1's gap are
+        // the SAME physical hole. This scans every Layer's ring gaps (same "end of one open
+        // polyline -> start of the next, in ring order" pairing WallsComputation's own Punchout
+        // dispatch uses) and chains them across Layers by nearest endpoint-pair matching.
+        {
+            mesh.fp_punchout_gap_spans.assign(mesh_layer_count, {});
+
+            struct LayerGaps
+            {
+                std::vector<Point2LL> starts, ends;
+            };
+            std::vector<LayerGaps> layer_gaps(mesh_layer_count);
+
+            for (size_t li = 0; li < mesh_layer_count; li++)
+            {
+                const auto& polys = mesh.layers[li].open_polylines;
+                if (polys.empty())
+                    continue;
+
+                coord_t min_x{}, max_x{}, min_y{}, max_y{};
+                bool first_pt = true;
+                for (const auto& poly : polys)
+                    for (const auto& p : poly)
+                    {
+                        if (first_pt) { min_x = max_x = p.X; min_y = max_y = p.Y; first_pt = false; }
+                        if (p.X < min_x) min_x = p.X; if (p.X > max_x) max_x = p.X;
+                        if (p.Y < min_y) min_y = p.Y; if (p.Y > max_y) max_y = p.Y;
+                    }
+                if (first_pt)
+                    continue;
+                const Point2LL centroid((min_x + max_x) / 2, (min_y + max_y) / 2);
+
+                // Orient each polyline consistent with WallsComputation's own Step 2 (CCW
+                // virtual-closed area) — only the endpoints matter here, so reversal is
+                // approximated as swapping front()/back() rather than reversing every point.
+                struct OrderedEnds
+                {
+                    Point2LL first_pt, last_pt;
+                    double angle;
+                };
+                std::vector<OrderedEnds> ordered;
+                for (const auto& poly : polys)
+                {
+                    if (poly.size() < 2)
+                        continue;
+                    Polygon virt;
+                    for (const auto& p : poly) virt.push_back(p);
+                    Point2LL a = poly.front(), b = poly.back();
+                    if (virt.area() < 0.0) std::swap(a, b);
+                    const double dx = static_cast<double>(a.X - centroid.X);
+                    const double dy = static_cast<double>(a.Y - centroid.Y);
+                    ordered.push_back({ a, b, std::atan2(dy, dx) });
+                }
+                if (ordered.empty())
+                    continue;
+                std::sort(ordered.begin(), ordered.end(), [](const OrderedEnds& x, const OrderedEnds& y) { return x.angle < y.angle; });
+
+                for (size_t oi = 0; oi < ordered.size(); oi++)
+                {
+                    layer_gaps[li].starts.push_back(ordered[oi].last_pt);
+                    layer_gaps[li].ends.push_back(ordered[(oi + 1) % ordered.size()].first_pt);
+                }
+            }
+
+            // Chain matching across Layers: a hole's own edges don't move by more than a few
+            // line widths between adjacent Layers on any real part — a generous, explicit,
+            // hardcoded threshold in the same spirit as other tentative constants already used
+            // elsewhere in this codebase (e.g. Splay's own collision multiples of line width).
+            // Purely `n * w`, no fixed-mm floor: an earlier version had a 2mm absolute floor
+            // meant as a degenerate-w safety net, but at a fine 0.2mm line width that floor
+            // (2mm = 10w) actively dominated the intended 8w, widening the effective matching
+            // radius relative to line width and pulling in wrong/farther points than intended —
+            // the same class of bug as resolveFrame's own fixed-mm tangent window, above.
+            const coord_t w = mesh.settings.get<coord_t>("featherprint_line_width");
+            const coord_t match_threshold = 8 * w;
+            const double match_threshold_d2 = 2.0 * static_cast<double>(match_threshold) * static_cast<double>(match_threshold);
+
+            struct ActiveChain
+            {
+                Point2LL last_start, last_end;
+                LayerIndex bottom;
+                std::vector<std::pair<size_t, size_t>> members; // (layer index, gap index within that layer)
+            };
+            std::vector<ActiveChain> active;
+            std::vector<ActiveChain> closed;
+
+            for (size_t li = 0; li < mesh_layer_count; li++)
+            {
+                const size_t n_gaps = layer_gaps[li].starts.size();
+                std::vector<bool> matched(n_gaps, false);
+                std::vector<bool> extended(active.size(), false);
+
+                for (size_t ci = 0; ci < active.size(); ci++)
+                {
+                    double best_d2 = -1.0;
+                    size_t best_gi = std::numeric_limits<size_t>::max();
+                    for (size_t gi = 0; gi < n_gaps; gi++)
+                    {
+                        if (matched[gi])
+                            continue;
+                        const double dx1 = static_cast<double>(active[ci].last_start.X - layer_gaps[li].starts[gi].X);
+                        const double dy1 = static_cast<double>(active[ci].last_start.Y - layer_gaps[li].starts[gi].Y);
+                        const double dx2 = static_cast<double>(active[ci].last_end.X - layer_gaps[li].ends[gi].X);
+                        const double dy2 = static_cast<double>(active[ci].last_end.Y - layer_gaps[li].ends[gi].Y);
+                        const double d2 = dx1 * dx1 + dy1 * dy1 + dx2 * dx2 + dy2 * dy2;
+                        if (best_gi == std::numeric_limits<size_t>::max() || d2 < best_d2) { best_d2 = d2; best_gi = gi; }
+                    }
+                    if (best_gi != std::numeric_limits<size_t>::max() && best_d2 <= match_threshold_d2)
+                    {
+                        matched[best_gi] = true;
+                        extended[ci] = true;
+                        active[ci].last_start = layer_gaps[li].starts[best_gi];
+                        active[ci].last_end = layer_gaps[li].ends[best_gi];
+                        active[ci].members.push_back({ li, best_gi });
+                    }
+                }
+
+                std::vector<ActiveChain> still_active;
+                for (size_t ci = 0; ci < active.size(); ci++)
+                {
+                    if (extended[ci]) still_active.push_back(std::move(active[ci]));
+                    else closed.push_back(std::move(active[ci]));
+                }
+                active = std::move(still_active);
+
+                for (size_t gi = 0; gi < n_gaps; gi++)
+                {
+                    if (matched[gi])
+                        continue;
+                    ActiveChain c;
+                    c.last_start = layer_gaps[li].starts[gi];
+                    c.last_end = layer_gaps[li].ends[gi];
+                    c.bottom = static_cast<LayerIndex>(li);
+                    c.members.push_back({ li, gi });
+                    active.push_back(std::move(c));
+                }
+            }
+            for (auto& c : active) closed.push_back(std::move(c));
+
+            for (const auto& c : closed)
+            {
+                if (c.members.empty())
+                    continue;
+                const LayerIndex top = static_cast<LayerIndex>(c.members.back().first);
+
+                // Contour matching (Spec REV 3.3): sample the real wall immediately below and
+                // immediately above this hole, once per hole (not per member Layer). Left
+                // empty on either side if that side has no valid closed Layer to sample (the
+                // hole reaches the very top/bottom of the mesh) — every consumer downstream
+                // must treat empty as "fall back to a plain straight chord."
+                std::vector<Point2LL> contour_below, contour_above;
+                coord_t z_below = 0, z_above = 0;
+                const int n_samples = mesh.settings.get<int>("featherprint_punchout_contour_samples");
+                const auto& bottom_member = c.members.front();
+                const auto& top_member = c.members.back();
+                const LayerIndex layer_below = c.bottom - 1;
+                const LayerIndex layer_above = top + 1;
+                if (layer_below >= 0)
+                {
+                    contour_below = fpSampleHoleBoundaryContour(
+                        mesh.layers[layer_below],
+                        layer_gaps[bottom_member.first].starts[bottom_member.second],
+                        layer_gaps[bottom_member.first].ends[bottom_member.second],
+                        n_samples);
+                    z_below = mesh.layers[layer_below].printZ;
+                }
+                if (static_cast<size_t>(layer_above) < mesh_layer_count)
+                {
+                    contour_above = fpSampleHoleBoundaryContour(
+                        mesh.layers[layer_above],
+                        layer_gaps[top_member.first].starts[top_member.second],
+                        layer_gaps[top_member.first].ends[top_member.second],
+                        n_samples);
+                    z_above = mesh.layers[layer_above].printZ;
+                }
+                if (contour_below.size() != contour_above.size())
+                {
+                    // Mismatched sample counts (one side unavailable, or a degenerate
+                    // polygon) — no usable correspondence between the two sides, so leave
+                    // both empty rather than pairing up mismatched indices.
+                    contour_below.clear();
+                    contour_above.clear();
+                }
+
+                for (const auto& [li, gi] : c.members)
+                {
+                    SliceMeshStorage::FpPunchoutGapSpan span;
+                    span.start = layer_gaps[li].starts[gi];
+                    span.end = layer_gaps[li].ends[gi];
+                    span.hole_bottom = c.bottom;
+                    span.hole_top = top;
+                    span.contour_below = contour_below;
+                    span.contour_above = contour_above;
+                    span.z_below = z_below;
+                    span.z_above = z_above;
+                    mesh.fp_punchout_gap_spans[li].push_back(span);
+                }
+            }
+        }
     }
 
     // walls
@@ -1465,7 +2082,11 @@ void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
     SliceLayer* layer = &mesh.layers[layer_nr];
     const double fp_phase = (layer_nr < mesh.fp_helix_phase.size()) ? mesh.fp_helix_phase[layer_nr] : 0.0;
     const Point2LL fp_phase_origin = (layer_nr < mesh.fp_phase_origin.size()) ? mesh.fp_phase_origin[layer_nr] : Point2LL(0, 0);
-    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_phase_origin, mesh.fp_r_ref);
+    const std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans
+        = (layer_nr < mesh.fp_punchout_gap_spans.size()) ? mesh.fp_punchout_gap_spans[layer_nr] : std::vector<SliceMeshStorage::FpPunchoutGapSpan>{};
+    const std::vector<Polygon> fp_interior_holes
+        = (layer_nr < mesh.fp_interior_holes.size()) ? mesh.fp_interior_holes[layer_nr] : std::vector<Polygon>{};
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_phase_origin, mesh.fp_r_ref, fp_punchout_gap_spans, fp_interior_holes);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

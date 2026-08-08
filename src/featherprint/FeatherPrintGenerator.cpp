@@ -509,7 +509,7 @@ void FeatherPrintGenerator::appendPolySegment(
 // ============================================================================
 
 FeatherPrintGenerator::TangentFrame FeatherPrintGenerator::resolveFrame(
-    const ArcParam& arc, const Point2LL& centroid, double s)
+    const ArcParam& arc, const Point2LL& centroid, double s, coord_t w)
 {
     (void)centroid; // no longer used for orientation (see the winding-based fix below) — kept
                      // in the signature since every caller already has it in scope regardless.
@@ -529,7 +529,12 @@ FeatherPrintGenerator::TangentFrame FeatherPrintGenerator::resolveFrame(
     // Terminal/Trace anchor on some layers and not others, even though the underlying model
     // geometry is unchanged layer-to-layer. Averaging over a window smooths that out while
     // still tracking genuine, larger-scale skin curvature.
-    constexpr double kTangentWindowHalf = 300.0; // 0.3mm each side
+    // Was a fixed 300.0 (0.3mm each side) regardless of w -- tuned against a 0.4mm line width
+    // (0.75x w there), but that ratio silently DOUBLES to 1.5x w at a 0.2mm line width, over-
+    // smoothing local tangent direction right where Lacing's flat `d < w` collision test is
+    // most sensitive to it. Expressing the window as a fraction of w keeps the same effective
+    // smoothing behavior the original constant was tuned for, at any line width.
+    const double kTangentWindowHalf = 0.75 * static_cast<double>(w);
     Point2LL Plo = arc.pointAt(s - kTangentWindowHalf);
     Point2LL Phi = arc.pointAt(s + kTangentWindowHalf);
     Point2LL Tv = Phi - Plo;
@@ -576,8 +581,8 @@ FeatherPrintGenerator::BlendPlacement FeatherPrintGenerator::buildBlendPlacement
     const double s_s = s_anchor + x_sign * x_s * w;
     const double s_e = s_anchor + x_sign * x_e * w;
     BlendPlacement bp;
-    bp.A = resolveFrame(arc, centroid, s_s);
-    bp.B = resolveFrame(arc, centroid, s_e);
+    bp.A = resolveFrame(arc, centroid, s_s, w);
+    bp.B = resolveFrame(arc, centroid, s_e, w);
     bp.x_s = x_s;
     bp.x_e = x_e;
     bp.x_sign = x_sign;
@@ -704,7 +709,7 @@ bool FeatherPrintGenerator::isThinSection(const ArcParam& arc, const Point2LL& c
     if (D <= 0.0)
         return false;
 
-    const TangentFrame tf = resolveFrame(arc, centroid, s_anchor);
+    const TangentFrame tf = resolveFrame(arc, centroid, s_anchor, w);
     const double sx = static_cast<double>(tf.S.X), sy = static_cast<double>(tf.S.Y);
     const double dirx = tf.nx, diry = tf.ny; // unit inward normal, winding-based (REV 2.3)
     const double ray_len = D * static_cast<double>(w);
@@ -2006,6 +2011,171 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
 
     if (fp_line.size() < 2)
         return {};
+
+    VariableWidthLines result;
+    result.push_back(std::move(fp_line));
+    return result;
+}
+
+// ============================================================================
+// Punchout (Spec REV 3.3) — Punchout Line + Terminal for one hole-gap
+// ============================================================================
+//
+// See the header's doc comment for the full rationale, and WallsComputation.cpp's own
+// "Step 7" comment for how prev_wall_poly/next_wall_poly are identified. In short: they are
+// the two REAL open polylines the caller determined bound this hole in ring order — NOT one
+// real open polyline's own front()/back(), which (once a layer has more than one hole)
+// usually belong to two DIFFERENT holes rather than a matched pair. A previous attempt paired
+// a single open polyline's own two endpoints directly, which — beyond ever having placed
+// geometry against the wrong arc-length parametrization — also bridged across unrelated
+// holes through solid wall whenever a layer had more than one hole open at once. This
+// implementation builds a synthetic ArcParam over the cutback CHORD between P0/P1 and reuses
+// appendTerminal/appendPolySegment against that chord exclusively.
+VariableWidthLines FeatherPrintGenerator::generatePunchout(
+    const OpenPolyline& prev_wall_poly,
+    const OpenPolyline& next_wall_poly,
+    coord_t z,
+    const Settings& settings,
+    const OpenLayerParams& params,
+    const std::vector<Point2LL>& contour_pts,
+    bool half_width_ends)
+{
+    (void)z;
+    if (! settings.get<bool>("featherprint_punchout_enabled"))
+        return {};
+    if (prev_wall_poly.size() < 1 || next_wall_poly.size() < 1)
+        return {};
+
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+    if (w <= 0)
+        return {};
+    const double w_d = static_cast<double>(w);
+
+    // Punchout Terminal reuses the Whip Terminal profile as-is (Spec REV 3.3), assumed to
+    // derive its Width from featherprint_stringer_width — the same setting Whip Terminal
+    // itself uses, since neither has a dedicated Width parameter of its own.
+    const double D  = settings.get<double>("featherprint_feature_depth");
+    const double W  = settings.get<double>("featherprint_stringer_width");
+    const double R2 = W / 2.0;
+    const double R1 = R2 + 0.5; // matches Stringer/Whip's own corrected R1=R2+G
+
+    // The two true hole-edge anchors — P0 is the END of prev_wall_poly (the same point
+    // Whip's Terminal is anchored to at its s_end) and P1 is the START of next_wall_poly
+    // (Whip's s=0 anchor there). These are generally two DIFFERENT real polylines' endpoints,
+    // not one polyline's own front()/back() — see this function's header comment.
+    const Point2LL& P0 = prev_wall_poly.back();
+    const Point2LL& P1 = next_wall_poly.front();
+
+    const double dx = static_cast<double>(P1.X - P0.X);
+    const double dy = static_cast<double>(P1.Y - P0.Y);
+    const double chord_len = std::sqrt(dx * dx + dy * dy);
+    if (chord_len < 1e-6)
+        return {};
+    const double ux = dx / chord_len, uy = dy / chord_len;
+
+    // Cut back along the CHORD (into the hole), never along either real polyline's own
+    // tangent — this is the direct fix for the "outside the hole" defect:
+    // featherprint_punchout_gap is measured in this direction only. This cutback is FIXED —
+    // an earlier attempt scaled it toward zero near a hole's own top/bottom (to weld the
+    // Terminal to the real wall corner), which slid the entire Terminal loop (sized by
+    // D/R1/R2/W) so its anchor coincided with the real Whip Terminal's own anchor at that same
+    // corner; both loops bulge inward from there by a similar depth in roughly the same
+    // direction, so they overlapped. A follow-up attempt fixed the overlap by adding a
+    // separate tangent-matched "weld stub" curve instead of moving the Terminal — that stub
+    // was removed again after real-print testing found it made the Punchout materially harder
+    // to break away, which defeats the point of a removable support feature. The cutback gap
+    // is intentionally left unwelded now; see Contour Matching, below, for how the middle of
+    // the Line still tracks the wall shape without needing the ends themselves to touch it.
+    const coord_t gap = settings.get<coord_t>("featherprint_punchout_gap");
+    const double gap_d = static_cast<double>(gap);
+    if (gap_d * 2.0 >= chord_len)
+        return {}; // hole too narrow for the requested cutback — nothing safe to draw
+
+    const Point2LL Q0(static_cast<coord_t>(std::llround(P0.X + ux * gap_d)), static_cast<coord_t>(std::llround(P0.Y + uy * gap_d)));
+    const Point2LL Q1(static_cast<coord_t>(std::llround(P1.X - ux * gap_d)), static_cast<coord_t>(std::llround(P1.Y - uy * gap_d)));
+
+    // Synthetic open polyline over the cutback chord, in the SAME point order (Q0 first,
+    // Q1 last) as the ring's own forward (CCW) traversal direction — P0 was the END of the
+    // previous arc walking forward, P1 the START of the next. Because resolveFrame's
+    // inward-normal formula (tangent rotated 90 degrees, for is_open which always has
+    // ccw=true) is a purely local computation independent of which polyline it's applied
+    // to, preserving this point order makes the chord's own inward normal automatically
+    // match the wall's ring-wide convention — no separate sign-matching step needed, and no
+    // risk of curling the Terminal back toward the wall. This relies on every real open
+    // polyline already being individually oriented consistent with that same global ring
+    // direction (Step 2 in WallsComputation.cpp), which the ring's own arc-length/Phase
+    // Origin math already assumes elsewhere in this file.
+    OpenPolyline chord_poly;
+    chord_poly.push_back(Q0);
+    chord_poly.push_back(Q1);
+    ArcParam chord_arc = buildArcParamOpen(chord_poly);
+    const double s_end = chord_arc.total;
+    if (s_end < 1e-6)
+        return {};
+
+    const Point2LL& centroid = params.centroid;
+
+    // Terminals need room for both loops plus at least one line width of straight chord
+    // between them; otherwise fall back to a plain straight segment rather than emitting
+    // self-overlapping Terminal geometry into a hole too small for it.
+    const double min_terminal_span = (W + R1) * w_d + w_d;
+    const bool draw_terminals = s_end >= min_terminal_span;
+
+    ExtrusionLine fp_line(/*inset_idx=*/0, /*is_odd=*/false, /*is_closed=*/false);
+
+    double current_s = 0.0;
+    if (draw_terminals)
+    {
+        appendTerminal(fp_line, 0.0, +1.0, chord_arc, centroid, w, D, R1, R2, W, /*reversed=*/true);
+        current_s = W * w_d;
+    }
+
+    // Contour matching (Spec REV 3.3): if the caller supplied a lofted point sequence (see
+    // this function's header comment), the middle of the Line is exactly Start Terminal ->
+    // contour_pts[0..N-1] -> End Terminal, with NO chord walk in between — contour_pts are
+    // already absolute world-space points computed by the caller from the real wall contours
+    // above/below this hole, not positions along chord_arc, so stitching them via the chord's
+    // own coordinate frame would be meaningless. Falls back to the plain straight chord walk
+    // (unchanged from before contour matching existed) when contour_pts is empty, or when the
+    // hole is too narrow to draw Terminals at all (draw_terminals false) — contour_pts assumes
+    // both Terminals are present to hand off to/from, and a hole that narrow is a degenerate
+    // edge case regardless.
+    if (! contour_pts.empty() && draw_terminals)
+    {
+        for (const Point2LL& p : contour_pts)
+            fp_line.junctions_.emplace_back(p, w, 0);
+    }
+    else
+    {
+        const double end_walk_stop = draw_terminals ? s_end - R1 * w_d : s_end;
+        appendPolySegment(fp_line, chord_arc, current_s, end_walk_stop, w, fp_line.empty());
+    }
+
+    if (draw_terminals)
+        appendTerminal(fp_line, s_end, -1.0, chord_arc, centroid, w, D, R1, R2, W, /*reversed=*/false);
+
+    if (fp_line.size() < 2)
+        return {};
+
+    // No weld stub: an earlier revision extended the Terminal's true endpoint (Q0/Q1) toward
+    // the real wall corner (P0/P1) with a tangent-matched curve, tapered in near a hole's own
+    // top/bottom. Removed after real-print testing found it made the Punchout materially
+    // harder to break away — defeating the purpose of a removable support feature. The
+    // intentional gap between Q0/Q1 and P0/P1 (featherprint_punchout_gap, above) is left
+    // unwelded; Contour Matching (contour_pts, below/above) is what still makes the Line's
+    // shape track the wall without needing the ends themselves to touch it.
+
+    // Half-width ends (Spec REV 3.3): the Layer that forms the literal top of the hole's own
+    // span, and the Layer that forms the literal bottom, print this entire Punchout
+    // (Terminals included) at half the nominal line width — a discrete override on those two
+    // Layers only, unrelated to Contour Matching, meant purely to weaken the connection and
+    // make the whole feature easier to snap off. Geometry/shape is unaffected: only the
+    // ExtrusionJunction width field (what actually controls the printed bead width) changes,
+    // so R1/R2/D/W above are still derived from the full nominal w and the profile keeps its
+    // normal proportions — just printed thinner.
+    if (half_width_ends)
+        for (ExtrusionJunction& j : fp_line)
+            j.w_ = std::max<coord_t>(1, w / 2);
 
     VariableWidthLines result;
     result.push_back(std::move(fp_line));

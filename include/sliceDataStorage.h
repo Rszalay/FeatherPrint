@@ -394,6 +394,52 @@ public:
     // print-feature classification, no new machinery.
     std::vector<std::vector<std::pair<Point2LL, Point2LL>>> fp_shore_bridges;
 
+    // FeatherPrint: Interior Opening Carry-Through (Spec REV 3.4 Phase 2). A hole in a
+    // top-/bottom-facing horizontal surface with little or no vertical depth has boundary
+    // edges coplanar with a Z-cutting-plane rather than crossing it, so it never produces an
+    // ordinary sliced polygon anywhere (part->outline, open_polylines) -- confirmed via real
+    // test print, the same fundamental "no 2D per-layer signal" limitation Shore's own REV 3.2
+    // development already hit for a fully-open top. Detected instead from the raw mesh's own
+    // boundary-edge topology (MeshFace::connected_face_index_, computed once at mesh-finish
+    // time, independent of slicing) in FffPolygonGenerator::sliceModel() -- the only point in
+    // the pipeline this data survives, before MeshGroup::clear() discards it. Each entry is a
+    // 2D polygon (the coplanar loop, projected) already confirmed to lie strictly inside that
+    // Layer's own outer contour (not coincident with it -- a loop matching the Layer's own
+    // silhouette is the already-handled "whole face open" case, Flange's/Shore's territory).
+    // Consumed in WallsComputation.cpp alongside part->outline's own hole polygons when
+    // computing inner_area (Phase 1) -- this does not add any new printed Wall/rim/Terminal,
+    // only prevents top/bottom skin fill from painting over the opening.
+    std::vector<std::vector<Polygon>> fp_interior_holes;
+
+    // FeatherPrint: Punchout (Spec REV 3.3) hole-span tracking. Every other FeatherPrint pass
+    // (Whip, Shore) treats each Layer's open_polylines independently -- nothing previously
+    // tracked which open-polyline gap on Layer n is the SAME physical hole as a gap on Layer
+    // n+1. Punchout's blend-toward-the-wall behavior near a hole's own top/bottom needs that
+    // span, so this pre-pass (FffPolygonGenerator.cpp, right after the Shore pre-pass) builds
+    // it: each Layer's ring gaps (same "end of one open polyline -> start of the next, in ring
+    // order" pairing WallsComputation's own Punchout dispatch uses) are chained across Layers
+    // by nearest-endpoint-pair matching, and each chain's first/last Layer index is recorded
+    // on every gap belonging to it.
+    struct FpPunchoutGapSpan
+    {
+        Point2LL start; // end of the "previous" open polyline in ring order, this Layer
+        Point2LL end;   // start of the "next" open polyline in ring order, this Layer
+        LayerIndex hole_bottom{ -1 }; // first Layer index at which this same hole's gap exists
+        LayerIndex hole_top{ -1 };    // last Layer index at which this same hole's gap exists
+
+        // Contour matching: featherprint_punchout_contour_samples points sampled along the
+        // real closed-perimeter wall immediately below (hole_bottom - 1) and immediately
+        // above (hole_top + 1) this hole, ordered from the hole's own start edge to its end
+        // edge so index i means the same relative position in both. Identical across every
+        // Layer belonging to the same hole (populated once per hole in the pre-pass, copied
+        // onto each member). Empty if the hole reaches the very top/bottom of the mesh (no
+        // valid bounding closed Layer on that side) — callers must treat empty as "no contour
+        // data available," falling back to a plain straight chord.
+        std::vector<Point2LL> contour_below, contour_above;
+        coord_t z_below{ 0 }, z_above{ 0 };
+    };
+    std::vector<std::vector<FpPunchoutGapSpan>> fp_punchout_gap_spans;
+
     std::vector<AngleDegrees> infill_angles; //!< a list of angle values which is cycled through to determine the infill angle of each layer
     std::vector<AngleDegrees> roofing_angles; //!< a list of angle values which is cycled through to determine the roofing angle of each layer
     std::vector<AngleDegrees> flooring_angles; //!< a list of angle values which is cycled through to determine the flooring angle of each layer

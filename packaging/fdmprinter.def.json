@@ -2820,6 +2820,41 @@
                     "enabled": "infill_pattern == 'featherprint'",
                     "settable_per_mesh": true,
                     "settable_globally": true
+                },
+                "featherprint_punchout_enabled":
+                {
+                    "label": "FeatherPrint Punchout Enabled",
+                    "description": "Generate a Punchout Line (with Punchout Terminal caps) spanning the gap between the two open ends of every open-polyline layer, printed into the hole to give its eventual flat-topped closure something to rest on. Opt-in per REV 3.3 — whether a given hole needs this support is left to the end user's own judgement, not auto-detected.",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_punchout_gap":
+                {
+                    "label": "FeatherPrint Punchout Gap",
+                    "description": "Distance to cut back the Punchout Line from each end of the hole's open perimeter, clear of the Whip Terminal loop already occupying that position. Measured along the straight chord between the two open ends, staying inside the hole — not along the wall's own perimeter.",
+                    "type": "float",
+                    "unit": "mm",
+                    "default_value": 0.6,
+                    "minimum_value": "0.0",
+                    "maximum_value": "5.0",
+                    "enabled": "infill_pattern == 'featherprint' and featherprint_punchout_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_punchout_contour_samples":
+                {
+                    "label": "FeatherPrint Punchout Contour Samples",
+                    "description": "Number of points sampled along the real wall contour immediately below and immediately above a hole, connected across Layers to shape the Punchout Line's own path through the hole's span — the Line at each Layer follows a linear interpolation of these two bounding contours rather than a plain straight chord, so its shape gradually matches the wall it meets at the hole's own top and bottom.",
+                    "type": "int",
+                    "default_value": 5,
+                    "minimum_value": "2",
+                    "maximum_value": "20",
+                    "enabled": "infill_pattern == 'featherprint' and featherprint_punchout_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
                 }
             }
         },
