@@ -15,7 +15,7 @@ Instead of conventional infill, FeatherPrint produces a single-wall skin reinfor
 
 ## Installation
 
-1. Download **FeatherPrint-0.5.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
+1. Download **FeatherPrint-0.6.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
 2. Run the installer as Administrator
 3. The installer will detect your Cura 5.13.x installation, back up the original engine files, and deploy FeatherPrint
 
@@ -56,6 +56,9 @@ FeatherPrint is an early work-in-progress. The following features are currently 
 - **Splay** — collision widening at stringer/terminal intersections
 - **Anchor Distribution** — continuity-tracking phase placement so stringer anchors track smoothly layer to layer
 - **Thin-Section Pruning** — suppresses stringers/lacing/flare rim on sections too thin to support them
+- **Shore** — bridges internal overhangs (surfaces enclosed by the model's own hollow shell that ordinary tree support can't reach), generated as infill ahead of the true closure so top skin has something to build on
+- **Punchout** *(opt-in)* — a support line + terminal printed into a hole in the model's side wall, so the hole's eventual flat-topped closure has something to rest on; its shape lofts between the real wall contours immediately below and above the hole (Contour Matching) rather than staying a plain straight chord
+- **Interior Opening Carry-Through** — holes in a top- or bottom-facing horizontal surface are correctly left open in the top/bottom skin fill, including holes with little or no vertical depth (down to a hole flush with the build plate itself), rather than silently printed over
 
 The following features are planned but not yet implemented:
 
@@ -63,6 +66,8 @@ The following features are planned but not yet implemented:
 - Gusset, Cuff, Collar (collision features)
 
 Curvature-Weighted Stringer Density (adaptive stringer spacing based on local surface curvature) was implemented and tested but is currently **disabled** pending a more reliable curvature estimation method; stringers use uniform arc-length spacing in the meantime.
+
+A genuinely zero-depth hole (see Interior Opening Carry-Through, above) is correctly left unprinted-over but does not yet get its own printed Wall trace bounding it — flagged as a follow-up, not yet implemented.
 
 ---
 
