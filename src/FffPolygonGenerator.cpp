@@ -1634,6 +1634,100 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
             }
         }
 
+        // Former-band detection pre-pass (Spec REV 3.6). Former bands are tied to Lacing
+        // crossings: because stringer helix phase is ring-wide synchronized (Anchor
+        // Distribution), all Lacing crossings for one helix revolution land on the same Layer
+        // simultaneously, giving a natural periodic spacing with no new spacing setting.
+        // countLacingCollisions() reuses generate()'s own anchor-placement/collision math as a
+        // read-only query on closed Layers; countLacingCollisionsOpen() does the same against
+        // the full virtual ring (real arcs + gap chords) on open-manifold (Whip/hole) Layers —
+        // both are tested so a peak isn't missed just because it happens to land within a
+        // hole's own Z-span. A Former band's ramp can also spill onto adjacent open-manifold
+        // layers from a peak anchored on a closed Layer nearby; either way, generateFormerOpen's
+        // own Cuff logic renders whatever fp_former_ramp says for that Layer.
+        {
+            mesh.fp_former_ramp.assign(mesh_layer_count, -1);
+
+            if (mesh.settings.get<bool>("featherprint_former_enabled"))
+            {
+                const int n_ramp = mesh.settings.get<int>("featherprint_former_ramp_layers");
+                const coord_t former_w = mesh.settings.get<coord_t>("featherprint_line_width");
+
+                std::vector<bool> is_peak_candidate(mesh_layer_count, false);
+                for (size_t li = 0; li < mesh_layer_count; li++)
+                {
+                    const double phase = (li < mesh.fp_helix_phase.size()) ? mesh.fp_helix_phase[li] : 0.0;
+                    const Point2LL origin = (li < mesh.fp_phase_origin.size()) ? mesh.fp_phase_origin[li] : Point2LL(0, 0);
+
+                    Shape outline_li = filteredSliceOutline(mesh.layers[li], former_w);
+                    if (! outline_li.empty())
+                    {
+                        if (FeatherPrintGenerator::countLacingCollisions(outline_li, mesh.settings, phase, origin, mesh.fp_r_ref) >= 1)
+                            is_peak_candidate[li] = true;
+                    }
+                    else if (! mesh.layers[li].open_polylines.empty())
+                    {
+                        // Open-manifold (Whip/hole) Layer: no closed outline exists here at all,
+                        // but a synchronized Lacing crossing can still land on this exact Layer
+                        // if the hole happens to span that Z — skipping these Layers entirely
+                        // (as an earlier version of this pre-pass did) left such a crossing
+                        // never tested, so no Former band ever appeared anywhere near the hole,
+                        // not merely truncated at its edge. See countLacingCollisionsOpen's own
+                        // doc comment.
+                        if (FeatherPrintGenerator::countLacingCollisionsOpen(mesh.layers[li].open_polylines, mesh.settings, phase, origin) >= 1)
+                            is_peak_candidate[li] = true;
+                    }
+                }
+
+                // Cluster adjacent flagged layers (Z-quantization can spread one ring-wide
+                // synchronized crossing across a couple of adjacent layers) into a single peak,
+                // taking the cluster's own midpoint layer as the peak.
+                std::vector<LayerIndex> peaks;
+                for (size_t li = 0; li < mesh_layer_count; li++)
+                {
+                    if (! is_peak_candidate[li])
+                        continue;
+                    size_t cluster_end = li;
+                    while (cluster_end + 1 < mesh_layer_count && is_peak_candidate[cluster_end + 1])
+                        cluster_end++;
+                    peaks.push_back(static_cast<LayerIndex>((li + cluster_end) / 2));
+                    li = cluster_end;
+                }
+
+                // Former Spacing: keep every Nth detected peak, starting with the first (in
+                // ascending Z order, matching the order `peaks` is already built in above),
+                // trading stiffness for mass per the user's own choice. N=1 (default) keeps
+                // every peak, unchanged from prior behavior.
+                const int spacing = mesh.settings.get<int>("featherprint_former_spacing");
+                if (spacing > 1 && ! peaks.empty())
+                {
+                    std::vector<LayerIndex> spaced_peaks;
+                    for (size_t pi = 0; pi < peaks.size(); pi += static_cast<size_t>(spacing))
+                        spaced_peaks.push_back(peaks[pi]);
+                    peaks = std::move(spaced_peaks);
+                }
+
+                // Apply each peak's ramp to fp_former_ramp. Where two peaks' own spans overlap
+                // (Lacing recurring more often than 2n+1 layers apart), taking the max ramp
+                // value at each layer across all peaks merges them into one wider band rather
+                // than attempting two independent overlapping stacks — an explicit, simple
+                // policy choice, not derived from spec text (REV 3.6 doesn't address this case).
+                for (LayerIndex peak : peaks)
+                {
+                    for (int o = 0; o <= n_ramp; o++)
+                    {
+                        const LayerIndex li_minus = peak - o;
+                        const LayerIndex li_plus  = peak + o;
+                        const int ramp_here = n_ramp - o;
+                        if (li_minus >= 0 && li_minus < static_cast<LayerIndex>(mesh_layer_count))
+                            mesh.fp_former_ramp[li_minus] = std::max(mesh.fp_former_ramp[li_minus], ramp_here);
+                        if (li_plus >= 0 && li_plus < static_cast<LayerIndex>(mesh_layer_count) && li_plus != li_minus)
+                            mesh.fp_former_ramp[li_plus] = std::max(mesh.fp_former_ramp[li_plus], ramp_here);
+                    }
+                }
+            }
+        }
+
         // Flange's own start layer (unconditionally spans featherprint_flange_ramp_layers layers
         // down from the topmost layer with any boundary geometry — closed parts OR
         // open_polylines) is now computed earlier, above, right before Shore's own pre-pass, so
@@ -2086,7 +2180,8 @@ void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
         = (layer_nr < mesh.fp_punchout_gap_spans.size()) ? mesh.fp_punchout_gap_spans[layer_nr] : std::vector<SliceMeshStorage::FpPunchoutGapSpan>{};
     const std::vector<Polygon> fp_interior_holes
         = (layer_nr < mesh.fp_interior_holes.size()) ? mesh.fp_interior_holes[layer_nr] : std::vector<Polygon>{};
-    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_phase_origin, mesh.fp_r_ref, fp_punchout_gap_spans, fp_interior_holes);
+    const int fp_former_ramp = (layer_nr < mesh.fp_former_ramp.size()) ? mesh.fp_former_ramp[layer_nr] : -1;
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_former_ramp, fp_phase_origin, mesh.fp_r_ref, fp_punchout_gap_spans, fp_interior_holes);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

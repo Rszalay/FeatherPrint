@@ -320,6 +320,19 @@ public:
     // Set during the helix pre-pass in FffPolygonGenerator.
     LayerIndex fp_flange_start_layer{ -1 };
 
+    // FeatherPrint: Former (Spec REV 3.6) per-layer ramp position, one entry per layer like
+    // fp_helix_phase. -1 = this layer is not part of any Former band. Otherwise the absolute
+    // value of a Former band's own local ramp position at this layer: 0 at the band's first/
+    // last layer (ordinary single Wall, no growth yet) up to n at the band's peak layer,
+    // mirrored symmetrically in Z about the peak (matching REV 3.6's "ramps in both
+    // directions" design) -- generateFormer/generateFormerOpen only need the magnitude, not
+    // which side of the peak a layer falls on, since buildFormerWallStack's own stack shape is
+    // identical on both sides at the same ramp position. Set by the Former-band detection
+    // pre-pass in FffPolygonGenerator (Lacing-collision clustering around each peak), which
+    // runs after the fp_helix_phase/fp_phase_origin pre-pass since it depends on Lacing anchor
+    // positions computed the same way (see countLacingCollisions()).
+    std::vector<int> fp_former_ramp;
+
     // FeatherPrint: per-layer Phase Origin for Anchor Distribution (Spec REV 2.2), one entry
     // per layer like fp_helix_phase. Deviates from REV 2.2's stated "recomputed independently
     // each Layer against one fixed world point" design: testing found that a fixed point

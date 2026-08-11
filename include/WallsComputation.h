@@ -37,6 +37,7 @@ public:
         const LayerIndex layer_nr,
         double fp_helix_phase = 0.0,
         LayerIndex fp_flange_start_layer = -1,
+        int fp_former_ramp = -1,
         Point2LL fp_phase_origin = Point2LL(0, 0),
         double fp_r_ref = 0.0,
         std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans = {},
@@ -65,6 +66,10 @@ private:
     const LayerIndex layer_nr_;
     const double fp_helix_phase_;
     const LayerIndex fp_flange_start_layer_;
+    // Former (Spec REV 3.6) this layer's own ramp position: -1 = not a Former layer, else the
+    // magnitude of the ramp step (0 at a band's own start/end, up to n at its peak) — see
+    // SliceMeshStorage::fp_former_ramp for the full derivation.
+    const int fp_former_ramp_;
     const Point2LL fp_phase_origin_;
     // Curvature-Weighted Stringer Density (Spec REV 2.6): k_ref * R_avg, computed once per
     // mesh (see SliceMeshStorage::fp_r_ref). <= 0 means the feature is inactive for this mesh.

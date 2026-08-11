@@ -2769,6 +2769,38 @@
                     "settable_per_mesh": true,
                     "settable_globally": true
                 },
+                "featherprint_former_enabled":
+                {
+                    "label": "FeatherPrint Former Enabled",
+                    "description": "Generate Former: ramped Wall-stack bands, flush with the outer skin and built up inward (like Flange), centred on Layers where synchronized Stringer helix crossings (Lacing) occur, for transverse bracing. Includes Gusset (Stringer x Former) and Cuff (Former x Whip) automatically wherever they apply.",
+                    "type": "bool",
+                    "default_value": true,
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_former_ramp_layers":
+                {
+                    "label": "FeatherPrint Former Ramp Layers",
+                    "description": "Number of layers over which a Former band ramps up to its peak thickness (and, mirrored, ramps back down). Each layer adds w/2 of thickness, built inward from the flush outer skin surface. A band spans (2 x this + 1) layers in total.",
+                    "type": "int",
+                    "default_value": 6,
+                    "minimum_value": "2",
+                    "enabled": "infill_pattern == 'featherprint' and featherprint_former_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_former_spacing":
+                {
+                    "label": "FeatherPrint Former Spacing",
+                    "description": "Skips Lacing crossings when placing Former bands, trading stiffness for mass. At 1 (default), a Former is generated at every Lacing crossing. At 2, every other crossing generates a Former, starting with the first. At 3, every third, and so on.",
+                    "type": "int",
+                    "default_value": 1,
+                    "minimum_value": "1",
+                    "enabled": "infill_pattern == 'featherprint' and featherprint_former_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
                 "featherprint_feature_depth":
                 {
                     "label": "FeatherPrint Feature Depth",

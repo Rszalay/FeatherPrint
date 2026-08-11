@@ -4,6 +4,7 @@
 
 #include <vector>
 
+#include "geometry/OpenLinesSet.h"
 #include "geometry/OpenPolyline.h"
 #include "geometry/Polygon.h"
 #include "geometry/Polyline.h"
@@ -64,6 +65,55 @@ public:
         Point2LL phase_origin = Point2LL(0, 0),
         double R_ref = 0.0);
 
+    /*!
+     * Former (Spec REV 3.6): a symmetric, ramped Wall stack — grows outward AND inward from
+     * the ordinary single-Wall centreline, up to a peak then back down, rather than Flange's
+     * one-directional ramp from a fixed OML. Not pinned to the model's top; can occur at any
+     * closed-perimeter Layer. `ramp_position` is 0 at the first/last Layer of the band (no
+     * growth yet, ordinary single Wall) through n at the peak Layer — see
+     * buildFormerWallStack(). Gusset (Stringer/Lacing x Former) is embedded exactly like
+     * Flare Rim is for Flange, at every Layer of the band (both ramps), since a Stringer
+     * passing through crosses both.
+     */
+    VariableWidthLines generateFormer(
+        const Shape& outline,
+        const Settings& settings,
+        int ramp_position,
+        double helix_phase = 0.0,
+        Point2LL phase_origin = Point2LL(0, 0),
+        double R_ref = 0.0);
+
+    /*!
+     * Returns the number of Lacing (Stringer x Stringer) collisions this Layer's outline would
+     * produce at the given helix phase — a read-only query reusing the same anchor-placement
+     * machinery generate() uses internally, without emitting any geometry or touching
+     * seamPoint()/innerOffset() state. Used by the Former-band detection pre-pass
+     * (FffPolygonGenerator.cpp) to locate Former peaks (Layers where Lacing fires) without
+     * duplicating the arc-length/anchor math externally — that math depends on this class's
+     * own private ArcParam, so it can't be replicated outside it without either exposing the
+     * whole machinery or accepting the duplication risk; this single-purpose query is the
+     * narrower, safer alternative. Static since it needs no instance state.
+     */
+    static int countLacingCollisions(const Shape& outline, const Settings& settings, double helix_phase, Point2LL phase_origin, double R_ref);
+
+    /*!
+     * Open-manifold counterpart to countLacingCollisions(), for a Layer whose boundary loop is
+     * interrupted (Whip/hole case) rather than a plain closed Shape. Without this, the Former
+     * detection pre-pass was blind to any Lacing crossing whose Z happened to fall within an
+     * open-manifold Layer's own span (a hole in the side wall) — since the pre-pass only tested
+     * closed Layers, a crossing landing there was never evaluated at all, not merely
+     * de-prioritized, so no Former band ever appeared anywhere near that hole even though one
+     * should have. Builds the same full virtual ring (real arcs + gap chords) WallsComputation
+     * itself builds for actual generation (centroid, oriented arcs, cumulative arc-length,
+     * Phase-Origin projection), then runs the same per-arc anchor-placement/collision test
+     * generateFlangeOpen's own Flare-anchor code uses — restricted to anchors that fall within a
+     * real arc's own span (not on a virtual gap chord), matching how real geometry is actually
+     * placed. Curvature-Weighted Stringer Density is not applied here, consistent with
+     * OpenLayerParams' own documented scope narrowing for open-manifold Layers generally.
+     * Returns the number of colliding pairs found across every arc on this Layer.
+     */
+    static int countLacingCollisionsOpen(const OpenLinesSet& open_polylines, const Settings& settings, double helix_phase, Point2LL phase_origin);
+
     // Parameters shared across all open-polyline arcs on the same layer.
     // Computed once from the full virtual ring (all arcs + gap chords) so that
     // every arc uses a consistent perimeter length, reference angle, and centroid.
@@ -105,6 +155,18 @@ public:
      * behaviour generating correctly before layering in Stringer/Lacing integration).
      */
     VariableWidthLines generateFlangeOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_index, double helix_phase, const OpenLayerParams& params);
+
+    /*!
+     * Former's own Miter-equivalent (Cuff, Spec REV 3.6): mechanically identical to
+     * generateFlangeOpen's own Miter handling — outer Wall gets an ordinary Whip Terminal at
+     * each end, continuing the same Terminal column; inner Wall(s), including the innermost
+     * (which also carries Gusset/Flare-Rim insertion), are left open, welded by the outer
+     * Wall's Terminal sweep (print order: inner Walls first, outer Wall last, same as Miter).
+     * REV 3.6 states Cuff introduces no geometry of its own beyond this, matching Miter's own
+     * precedent exactly — this function is deliberately a near-duplicate of
+     * generateFlangeOpen for that reason, not a distinct design.
+     */
+    VariableWidthLines generateFormerOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_position, double helix_phase, const OpenLayerParams& params);
 
     /*!
      * Generate the Punchout Line + Terminal geometry for one hole-gap on an open-manifold
@@ -395,6 +457,24 @@ private:
     // the spec (1.5w at ramp 0, +0.5w total thickness per ramp layer thereafter), returned
     // outer-first (index 0 = outer Wall, back() = innermost Wall).
     static std::vector<FlangeWallDesc> buildFlangeWallStack(int ramp_index, coord_t w);
+
+    // Former's own wall-stack rule (Spec REV 3.6): unlike Flange (grows inward only, from a
+    // fixed OML), Former grows symmetrically outward AND inward from the ordinary single
+    // Wall's own centreline. At ramp_position r (0 = no growth yet, n = peak), each side
+    // grows by r*(w/2) beyond the base Wall, giving total thickness (1+r)*w — REV 3.6's own
+    // peak formula (1+n)w falls out at r=n. Each side's own growth is discretized into Walls
+    // using the same technique buildFlangeWallStack already established (full-width Walls,
+    // one buried half-width Wall when growth isn't a whole multiple of w) — applied
+    // independently per side here, not via a literal call to buildFlangeWallStack itself,
+    // since that function's own ramp_index=0 special case assumes a bare OML with nothing to
+    // grow from on either side, which doesn't match Former's situation (a real base Wall
+    // present on both the outward and inward side already). Burial position is simplified to
+    // "innermost position on its own side" rather than Flange's own "strictly between two
+    // full Walls" rule — Former has no OML/aerodynamic-surface constraint pinning any
+    // particular Wall's exposure, so the exact burial position matters far less here.
+    // Returned outer-first (index 0 = outermost Wall, back() = innermost Wall), same
+    // convention as buildFlangeWallStack.
+    static std::vector<FlangeWallDesc> buildFormerWallStack(int ramp_position, coord_t w);
 
     // Maps a Wall's position in the outer-first wall-stack array (wi: 0=outer..n_walls-1=
     // inner) to the inset_idx that controls its actual print order (ascending inset_idx =

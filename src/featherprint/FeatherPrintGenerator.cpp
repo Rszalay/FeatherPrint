@@ -849,6 +849,34 @@ std::vector<FeatherPrintGenerator::FlangeWallDesc> FeatherPrintGenerator::buildF
     return walls_outer_first;
 }
 
+std::vector<FeatherPrintGenerator::FlangeWallDesc> FeatherPrintGenerator::buildFormerWallStack(int r, coord_t w)
+{
+    // REV 3.6's own revision-history entry (the terse "what changed" summary, not the fuller
+    // Profile/Slice body prose) is explicit: Former "reuses the Flange's own Wall-count/
+    // arrangement rule directly" — the only structural difference from Flange is that the ramp
+    // is mirrored in Z (built up over n Layers to a peak, then back down over n), not that the
+    // Wall stack itself grows outward past the base skin surface. Former's outer face must stay
+    // flush with the OML throughout, exactly like Flange's, for the same reason Flange's own
+    // Profile section gives: "the outer face... does not move at any Layer." The Z-mirroring
+    // is already handled upstream by the detection pre-pass (FffPolygonGenerator.cpp), which
+    // reduces a Layer's own position within a Former band to a single ramp magnitude — 0 at the
+    // band's own start/end, n at the peak — symmetric about the peak by construction. So this
+    // function needs no logic of its own beyond that reduction: it collapses to Flange's own
+    // rule at that magnitude.
+    //
+    // An earlier version of this function instead grew a Wall stack symmetrically both outward
+    // AND inward from the base Wall's own centreline, per a literal reading of this spec
+    // section's fuller Profile/Slice prose ("steps the wall outward by w/2 on each side...
+    // growing the wall symmetrically about the perimeter centreline", "45 degree overhang on
+    // the outer face") — that prose is now understood to be a spec-writing error introduced
+    // when the terse revision-history note was expanded into full body text, contradicting the
+    // revision-history's own "reuses Flange's rule directly" statement, and confirmed wrong by
+    // real-print testing (the Former band visibly sat proud of the surrounding skin instead of
+    // staying flush like Flange). Flagged for a spec correction to the Profile/Slice sections'
+    // wording to match this.
+    return buildFlangeWallStack(r, w);
+}
+
 int FeatherPrintGenerator::flangePrintInsetIdx(int wi, int n_walls)
 {
     if (wi == 0) return 0;               // OML: always last
@@ -1113,6 +1141,402 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
 
         if (! wall_line.empty())
             wall_line.junctions_.push_back(wall_line.junctions_.front());
+        if (wall_line.size() >= 2)
+            result.push_back(std::move(wall_line));
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Former (Spec REV 3.6) — a near-duplicate of generateFlange() by deliberate choice
+// ============================================================================
+//
+// Reuses generateFlange()'s own wall-emission/Gusset(Flare-Rim)-embedding logic essentially
+// verbatim, with buildFlangeWallStack swapped for buildFormerWallStack — the only structural
+// difference is which wall-stack-shape function builds walls_outer_first; everything
+// downstream (Q/oml_shift computation, anchor placement, Flare Rim embedding at the
+// innermost Wall, per-Wall emission order) is identical, since both are pure functions of a
+// {offset,width} Wall list agnostic to how that list was built. Duplicated rather than
+// factored into a shared helper to avoid touching generateFlange()'s own already-tested code
+// path — see this session's plan notes for the explicit risk/safety tradeoff.
+VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, const Settings& settings, int ramp_position, double helix_phase, Point2LL phase_origin, double R_ref)
+{
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+
+    std::vector<FlangeWallDesc> walls_outer_first = buildFormerWallStack(ramp_position, w);
+
+    // Inner-area offset: same convention as generateFlange() — full Wall-stack depth to the
+    // innermost Wall's own inner face.
+    {
+        const FlangeWallDesc& wd_inner = walls_outer_first.back();
+        inner_offset_ = wd_inner.offset + wd_inner.width / 2;
+    }
+
+    // ---- Compute Stringer/Lacing anchor positions on the base perimeter for Gusset (Flare
+    // Rim) insertion — "oml_poly" here is Former's own reference frame: the ordinary,
+    // un-thickened perimeter this band grows from, playing the same role Flange's actual OML
+    // plays for Flare. ----
+    const Polygon* oml_poly = largestPoly(outline);
+    const int N = settings.get<int>("featherprint_stringer_count");
+    const double stringer_flare_W = settings.get<double>("featherprint_stringer_width");
+    const double lacing_flare_W   = settings.get<double>("featherprint_lacing_width");
+
+    struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
+    std::vector<FlareAnchor> flare_anchors;
+
+    double Q = 0.0;
+    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
+        Q += static_cast<double>(walls_outer_first[wi].width) / static_cast<double>(w);
+    const double flare_D = settings.get<double>("featherprint_feature_depth");
+    const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
+    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / static_cast<double>(w);
+    const double flare_r = 0.0;
+
+    if (oml_poly && oml_poly->size() >= 3 && N >= 1)
+    {
+        ArcParam arc_oml = buildArcParam(*oml_poly);
+        const Point2LL centroid = centroidBbox(*oml_poly);
+        const double w_d = static_cast<double>(w);
+        const double helix_frac  = std::fmod(helix_phase, 1.0);
+        const double arc_ref     = arc_oml.nearestArcPos(phase_origin);
+        arc_oml.resample_phase_s = arc_ref;
+        arc_oml.buildWarp(R_ref);
+        const double arc_oml_total_w = arc_oml.cum_warp.empty() ? arc_oml.total : arc_oml.total_warped;
+        const double origin_w    = arc_oml.toWarped(arc_ref);
+        const double ccw_advance_w = std::fmod(helix_frac * arc_oml_total_w + origin_w, arc_oml_total_w);
+        const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_oml_total_w + arc_oml_total_w, arc_oml_total_w);
+
+        struct OmlAnchor { double s; bool is_cw; bool skip{ false }; int pair_idx{ -1 }; };
+        std::vector<OmlAnchor> oml_anchors;
+        oml_anchors.reserve(2 * N);
+        for (int i = 0; i < N; i++)
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + ccw_advance_w, arc_oml_total_w)), false});
+        for (int i = 0; i < N; i++)
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + cw_advance_w,  arc_oml_total_w)), true });
+        std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
+
+        const double collision_w = stringer_flare_W * w_d;
+
+        const int total_anchors = static_cast<int>(oml_anchors.size());
+        for (int i = 0; i < total_anchors; i++)
+        {
+            for (int j = i + 1; j < total_anchors; j++)
+            {
+                if (oml_anchors[j].s - oml_anchors[i].s > 2.0 * collision_w) break;
+                if (oml_anchors[j].is_cw == oml_anchors[i].is_cw) continue;
+                Point2LL pi = arc_oml.pointAt(oml_anchors[i].s);
+                Point2LL pj = arc_oml.pointAt(oml_anchors[j].s);
+                double dx = static_cast<double>(pi.X - pj.X), dy = static_cast<double>(pi.Y - pj.Y);
+                if (std::sqrt(dx * dx + dy * dy) < collision_w)
+                {
+                    oml_anchors[i].skip = oml_anchors[j].skip = true;
+                    oml_anchors[i].pair_idx = j;
+                    oml_anchors[j].pair_idx = i;
+                }
+            }
+        }
+
+        const FlangeWallDesc& wd_inner = walls_outer_first.back();
+        Shape inner_shape = Shape(outline).offset(-wd_inner.offset);
+        const Polygon* inner_poly = largestPoly(inner_shape);
+        if (inner_poly && inner_poly->size() >= 3)
+        {
+            ArcParam arc_inner = buildArcParam(*inner_poly);
+
+            auto addAnchor = [&](double s_oml, double x_sign, double W)
+            {
+                Point2LL pt = arc_oml.pointAt(s_oml);
+                double dx = static_cast<double>(pt.X - centroid.X);
+                double dy = static_cast<double>(pt.Y - centroid.Y);
+                double theta = std::atan2(dy, dx);
+                double R_oml = std::sqrt(dx * dx + dy * dy);
+                if (R_oml < 1.0)
+                    return;
+                const double lx_max = W / 2.0 + flare_r;
+                const double theta_l = theta - lx_max * static_cast<double>(w) / R_oml;
+                const double theta_r = theta + lx_max * static_cast<double>(w) / R_oml;
+                double s_l = arcLengthAtAngle(arc_inner, centroid, theta_l);
+                double s_r = arcLengthAtAngle(arc_inner, centroid, theta_r);
+                if (s_l < 0.0 || s_r < 0.0)
+                    return;
+                flare_anchors.push_back({s_l, s_r, theta, R_oml, x_sign, W});
+            };
+
+            for (int i = 0; i < total_anchors; i++)
+            {
+                const OmlAnchor& oa = oml_anchors[i];
+                if (oa.skip)
+                {
+                    if (oa.pair_idx > i)
+                    {
+                        double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
+                        addAnchor(s_mid, 1.0, lacing_flare_W);
+                    }
+                    continue;
+                }
+                addAnchor(oa.s, 1.0, stringer_flare_W);
+            }
+
+            std::sort(flare_anchors.begin(), flare_anchors.end(),
+                [](const FlareAnchor& a, const FlareAnchor& b){ return a.s_left < b.s_left; });
+        }
+    }
+
+    const int n_walls = static_cast<int>(walls_outer_first.size());
+    VariableWidthLines result;
+
+    for (int wi = n_walls - 1; wi >= 0; wi--)
+    {
+        const FlangeWallDesc& wd      = walls_outer_first[wi];
+        const int       inset_idx = flangePrintInsetIdx(wi, n_walls);
+        const bool      is_innermost = (wi == n_walls - 1);
+
+        Shape offset_shape = Shape(outline).offset(-wd.offset);
+        if (offset_shape.empty()) continue;
+        const Polygon* poly = largestPoly(offset_shape);
+        if (! poly || poly->size() < 3) continue;
+
+        ArcParam ap = buildArcParam(*poly);
+        if (ap.total < 1.0) continue;
+
+        ExtrusionLine wall_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+
+        if (is_innermost && ! flare_anchors.empty())
+        {
+            ArcParam arc_oml = buildArcParam(*oml_poly);
+            const Point2LL centroid = centroidBbox(*oml_poly);
+            double current_s = 0.0;
+            for (const FlareAnchor& fa : flare_anchors)
+            {
+                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
+                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
+                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
+                    continue;
+
+                double s_depart = fa.s_left;
+                if (s_depart < current_s) s_depart = current_s;
+                appendPolySegment(wall_line, ap, current_s, s_depart, wd.width, wall_line.empty());
+
+                appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
+                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
+
+                current_s = std::max(fa.s_right, s_depart);
+            }
+            appendPolySegment(wall_line, ap, current_s, ap.total, wd.width, wall_line.empty());
+        }
+        else
+        {
+            appendPolySegment(wall_line, ap, 0.0, ap.total, wd.width, /*add_start=*/true);
+        }
+
+        if (! wall_line.empty())
+            wall_line.junctions_.push_back(wall_line.junctions_.front());
+        if (wall_line.size() >= 2)
+            result.push_back(std::move(wall_line));
+    }
+
+    return result;
+}
+
+// Former's own open-manifold case (Cuff, Spec REV 3.6) — near-duplicate of
+// generateFlangeOpen() for the same reasons generateFormer() duplicates generateFlange():
+// Cuff is mechanically identical to Miter (outer Wall gets an ordinary Whip Terminal at each
+// end continuing the Terminal column, inner Wall(s) — including the innermost, which also
+// carries Gusset — left open, welded by the outer Wall's Terminal sweep), so this is
+// deliberately not a distinct design, just buildFlangeWallStack swapped for
+// buildFormerWallStack.
+VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
+    const OpenPolyline& open_poly, coord_t z, const Settings& settings,
+    int ramp_position, double helix_phase, const OpenLayerParams& params)
+{
+    (void)z;
+    if (open_poly.size() < 2)
+        return {};
+
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+    if (w <= 0)
+        return {};
+
+    const int N = settings.get<int>("featherprint_stringer_count");
+    const double w_d = static_cast<double>(w);
+
+    const double stringer_D = settings.get<double>("featherprint_feature_depth");
+    const double stringer_W = settings.get<double>("featherprint_stringer_width");
+    const double stringer_R2 = stringer_W / 2.0;
+    const double stringer_R1 = stringer_R2 + 0.5; // matches Stringer Trace's corrected R1=R2+G
+    const double flare_D = stringer_D;
+    // Flare Rim's Width matches the colliding feature's own Width (Spec REV 2.0).
+    const double lacing_flare_W = settings.get<double>("featherprint_lacing_width");
+
+    std::vector<FlangeWallDesc> walls_outer_first = buildFormerWallStack(ramp_position, w);
+    const Point2LL& centroid = params.centroid;
+
+    const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
+    double Q = 0.0;
+    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
+        Q += static_cast<double>(walls_outer_first[wi].width) / w_d;
+    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / w_d;
+    const double flare_r = 0.0;
+
+    // ---- Compute Stringer/Lacing anchors within this arc, for Gusset (Flare Rim) insertion ----
+    ArcParam arc_oml = buildArcParamOpen(open_poly);
+    const double s_end_oml = arc_oml.total;
+
+    struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
+    std::vector<FlareAnchor> flare_anchors;
+
+    if (N >= 1 && s_end_oml > 2.0 * w_d)
+    {
+        const double helix_frac  = std::fmod(helix_phase, 1.0);
+        const double ccw_adv_abs = std::fmod(helix_frac * params.full_ring_total + params.full_ring_arc_ref, params.full_ring_total);
+        const double cw_adv_abs  = std::fmod(params.full_ring_arc_ref - helix_frac * params.full_ring_total + params.full_ring_total, params.full_ring_total);
+
+        struct OmlAnchor { double s; bool is_cw; bool skip{ false }; int pair_idx{ -1 }; };
+        std::vector<OmlAnchor> oml_anchors;
+        oml_anchors.reserve(2 * N);
+        for (int i = 0; i < N; i++)
+        {
+            double s_abs = std::fmod(static_cast<double>(i) / N * params.full_ring_total + ccw_adv_abs, params.full_ring_total);
+            double s_local = s_abs - params.arc_start_in_ring;
+            if (s_local > w_d && s_local < s_end_oml - w_d)
+                oml_anchors.push_back({ s_local, false });
+        }
+        for (int i = 0; i < N; i++)
+        {
+            double s_abs = std::fmod(static_cast<double>(i) / N * params.full_ring_total + cw_adv_abs, params.full_ring_total);
+            double s_local = s_abs - params.arc_start_in_ring;
+            if (s_local > w_d && s_local < s_end_oml - w_d)
+                oml_anchors.push_back({ s_local, true });
+        }
+        std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
+
+        const double collision_w = stringer_W * w_d;
+        const int total_anchors = static_cast<int>(oml_anchors.size());
+        for (int i = 0; i < total_anchors; i++)
+        {
+            for (int j = i + 1; j < total_anchors; j++)
+            {
+                if (oml_anchors[j].s - oml_anchors[i].s > 2.0 * collision_w) break;
+                if (oml_anchors[j].is_cw == oml_anchors[i].is_cw) continue;
+                Point2LL pi = arc_oml.pointAt(oml_anchors[i].s);
+                Point2LL pj = arc_oml.pointAt(oml_anchors[j].s);
+                double dx = static_cast<double>(pi.X - pj.X), dy = static_cast<double>(pi.Y - pj.Y);
+                if (std::sqrt(dx * dx + dy * dy) < collision_w)
+                {
+                    oml_anchors[i].skip = oml_anchors[j].skip = true;
+                    oml_anchors[i].pair_idx = j;
+                    oml_anchors[j].pair_idx = i;
+                }
+            }
+        }
+
+        OpenPolyline inner_poly = radialOffsetOpen(open_poly, centroid, wd_inner_layer.offset);
+        if (inner_poly.size() >= 2)
+        {
+            ArcParam arc_inner = buildArcParamOpen(inner_poly);
+
+            auto addAnchor = [&](double s_oml, double x_sign, double W)
+            {
+                Point2LL pt = arc_oml.pointAt(s_oml);
+                double dx = static_cast<double>(pt.X - centroid.X);
+                double dy = static_cast<double>(pt.Y - centroid.Y);
+                double theta = std::atan2(dy, dx);
+                double R_oml = std::sqrt(dx * dx + dy * dy);
+                if (R_oml < 1.0) return;
+                const double lx_max = W / 2.0 + flare_r;
+                const double theta_l = theta - lx_max * w_d / R_oml;
+                const double theta_r = theta + lx_max * w_d / R_oml;
+                double s_l = arcLengthAtAngle(arc_inner, centroid, theta_l);
+                double s_r = arcLengthAtAngle(arc_inner, centroid, theta_r);
+                if (s_l < 0.0 || s_r < 0.0)
+                    return;
+                flare_anchors.push_back({ s_l, s_r, theta, R_oml, x_sign, W });
+            };
+
+            for (int i = 0; i < total_anchors; i++)
+            {
+                const OmlAnchor& oa = oml_anchors[i];
+                if (oa.skip)
+                {
+                    if (oa.pair_idx > i)
+                    {
+                        double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
+                        addAnchor(s_mid, 1.0, lacing_flare_W);
+                    }
+                    continue;
+                }
+                addAnchor(oa.s, 1.0, stringer_W);
+            }
+            std::sort(flare_anchors.begin(), flare_anchors.end(),
+                [](const FlareAnchor& a, const FlareAnchor& b){ return a.s_left < b.s_left; });
+        }
+    }
+
+    const int n_walls = static_cast<int>(walls_outer_first.size());
+    VariableWidthLines result;
+
+    for (int wi = n_walls - 1; wi >= 0; wi--) // inner->outer emission order, matching generateFormer
+    {
+        const FlangeWallDesc& wd = walls_outer_first[wi];
+        const bool is_outer = (wi == 0);
+        const bool is_innermost = (wi == n_walls - 1);
+
+        OpenPolyline offset_poly = radialOffsetOpen(open_poly, centroid, wd.offset);
+        if (offset_poly.size() < 2) continue;
+
+        ArcParam arc_w = buildArcParamOpen(offset_poly);
+        const double s_end = arc_w.total;
+        if (s_end < 2.0 * w_d) continue;
+
+        ExtrusionLine wall_line(flangePrintInsetIdx(wi, n_walls), /*is_odd=*/false, /*is_closed=*/false);
+
+        if (is_outer)
+        {
+            // Outer Wall: ordinary Whip Terminal at both ends, continuing the same Terminal
+            // column as ordinary Whip layers around the Former band (Cuff = Miter rule).
+            {
+                const size_t start1 = wall_line.junctions_.size();
+                appendTerminal(wall_line, 0.0, +1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/true);
+                for (size_t i = start1; i < wall_line.junctions_.size(); i++)
+                    wall_line.junctions_[i].w_ = wd.width;
+            }
+            appendPolySegment(wall_line, arc_w, stringer_W * w_d, s_end - stringer_R1 * w_d, wd.width, wall_line.empty());
+            {
+                const size_t start2 = wall_line.junctions_.size();
+                appendTerminal(wall_line, s_end, -1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/false);
+                for (size_t i = start2; i < wall_line.junctions_.size(); i++)
+                    wall_line.junctions_[i].w_ = wd.width;
+            }
+        }
+        else if (is_innermost && ! flare_anchors.empty())
+        {
+            // Innermost Wall: left open at both ends per the Cuff/Miter rule, with a Gusset
+            // (Flare Rim) channel embedded at each Stringer/Lacing anchor along the way.
+            double current_s = 0.0;
+            for (const FlareAnchor& fa : flare_anchors)
+            {
+                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
+                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
+                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
+                    continue;
+
+                double s_depart = std::min(std::max(fa.s_left, current_s), s_end);
+                appendPolySegment(wall_line, arc_w, current_s, s_depart, wd.width, wall_line.empty());
+
+                appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
+                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
+
+                current_s = std::min(std::max(fa.s_right, s_depart), s_end);
+            }
+            appendPolySegment(wall_line, arc_w, current_s, s_end, wd.width, wall_line.empty());
+        }
+        else
+        {
+            // Buried middle Walls: left open at both ends per the Cuff/Miter rule, no Gusset.
+            appendPolySegment(wall_line, arc_w, 0.0, s_end, wd.width, /*add_start=*/true);
+        }
+
         if (wall_line.size() >= 2)
             result.push_back(std::move(wall_line));
     }
@@ -1547,6 +1971,259 @@ void FeatherPrintGenerator::appendFlareRim(
     appendCanonicalArc(line, W / 2.0 - R1, y_base, R1, 90.0, 0.0, true, 4, bp, w, true);
     // Line-out: P4(W/2,drop) -> End(W/2,0)
     line.junctions_.emplace_back(bp.place(W / 2.0, y_top, w), w, 0);
+}
+
+// ============================================================================
+// Lacing collision counting (Former-band detection support, Spec REV 3.6)
+// ============================================================================
+//
+// Deliberately a separate, narrower function rather than a refactor of generate()'s own
+// anchor/collision block into a shared helper: generate() is stable, already-tested code, and
+// this query only needs a yes/no-plus-count answer, not the anchor list or any geometry.
+// Duplicates the same anchor-placement and d < w collision test generate() uses internally
+// (including the wraparound-seam handling), since that math depends on this class's own
+// private ArcParam and can't be replicated outside it without exposing the whole machinery.
+int FeatherPrintGenerator::countLacingCollisions(const Shape& outline, const Settings& settings, double helix_phase, Point2LL phase_origin, double R_ref)
+{
+    const Polygon* outer = largestPoly(outline);
+    if (! outer || outer->size() < 3)
+        return 0;
+
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+    if (w <= 0)
+        return 0;
+
+    const int N = settings.get<int>("featherprint_stringer_count");
+    if (N < 1)
+        return 0;
+
+    ArcParam arc = buildArcParam(*outer);
+    if (arc.total < 4.0 * w)
+        return 0;
+
+    const double helix_frac = std::fmod(helix_phase, 1.0);
+    const double arc_ref    = arc.nearestArcPos(phase_origin);
+    arc.resample_phase_s = arc_ref;
+    arc.buildWarp(R_ref);
+    const double arc_total_w = (arc.cum_warp.empty()) ? arc.total : arc.total_warped;
+    const double origin_w = arc.toWarped(arc_ref);
+    const double ccw_advance_w = std::fmod(helix_frac * arc_total_w + origin_w, arc_total_w);
+    const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_total_w + arc_total_w, arc_total_w);
+    const double w_d = static_cast<double>(w);
+
+    struct SimpleAnchor { double s; bool is_cw; };
+    std::vector<SimpleAnchor> anchors;
+    anchors.reserve(2 * N);
+    for (int i = 0; i < N; i++)
+        anchors.push_back({ arc.fromWarped(std::fmod(static_cast<double>(i) / N * arc_total_w + ccw_advance_w, arc_total_w)), false });
+    for (int i = 0; i < N; i++)
+        anchors.push_back({ arc.fromWarped(std::fmod(static_cast<double>(i) / N * arc_total_w + cw_advance_w, arc_total_w)), true });
+    std::sort(anchors.begin(), anchors.end(), [](const SimpleAnchor& a, const SimpleAnchor& b) { return a.s < b.s; });
+
+    const int total_anchors = static_cast<int>(anchors.size());
+    const double collision_w = w_d;
+
+    struct AnchorRef { double s; bool is_cw; int orig_idx; };
+    std::vector<AnchorRef> ext;
+    ext.reserve(total_anchors * 2);
+    for (int i = 0; i < total_anchors; i++)
+        ext.push_back({ anchors[i].s, anchors[i].is_cw, i });
+    for (int i = 0; i < total_anchors; i++)
+        if (anchors[i].s < 2.0 * collision_w)
+            ext.push_back({ anchors[i].s + arc.total, anchors[i].is_cw, i });
+    std::sort(ext.begin(), ext.end(), [](const AnchorRef& a, const AnchorRef& b) { return a.s < b.s; });
+
+    std::vector<bool> collided(total_anchors, false);
+    const int total_ext = static_cast<int>(ext.size());
+    for (int i = 0; i < total_ext; i++)
+    {
+        for (int j = i + 1; j < total_ext; j++)
+        {
+            if (ext[j].s - ext[i].s > 2.0 * collision_w) break;
+            if (ext[j].orig_idx == ext[i].orig_idx) continue;
+            if (ext[j].is_cw == ext[i].is_cw) continue;
+            Point2LL pi = arc.pointAt(ext[i].s);
+            Point2LL pj = arc.pointAt(ext[j].s);
+            double dx = static_cast<double>(pi.X - pj.X);
+            double dy = static_cast<double>(pi.Y - pj.Y);
+            if (std::sqrt(dx * dx + dy * dy) < collision_w)
+            {
+                collided[ext[i].orig_idx] = true;
+                collided[ext[j].orig_idx] = true;
+            }
+        }
+    }
+
+    int count = 0;
+    for (bool c : collided)
+        if (c) count++;
+    return count / 2; // each collision flags both partners; count pairs, not anchors
+}
+
+int FeatherPrintGenerator::countLacingCollisionsOpen(const OpenLinesSet& open_polylines, const Settings& settings, double helix_phase, Point2LL phase_origin)
+{
+    if (open_polylines.empty())
+        return 0;
+
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+    if (w <= 0)
+        return 0;
+    const int N = settings.get<int>("featherprint_stringer_count");
+    if (N < 1)
+        return 0;
+    const double w_d = static_cast<double>(w);
+    const double stringer_W = settings.get<double>("featherprint_stringer_width");
+
+    // ---- Step 1: unified bounding-box centroid across all open polylines (mirrors
+    // WallsComputation::generateWalls's own Step 1). ----
+    coord_t uc_min_x{}, uc_max_x{}, uc_min_y{}, uc_max_y{};
+    bool have_pt = false;
+    for (const OpenPolyline& poly : open_polylines)
+        for (const Point2LL& p : poly)
+        {
+            if (! have_pt) { uc_min_x = uc_max_x = p.X; uc_min_y = uc_max_y = p.Y; have_pt = true; }
+            if (p.X < uc_min_x) uc_min_x = p.X; if (p.X > uc_max_x) uc_max_x = p.X;
+            if (p.Y < uc_min_y) uc_min_y = p.Y; if (p.Y > uc_max_y) uc_max_y = p.Y;
+        }
+    if (! have_pt)
+        return 0;
+    const Point2LL centroid((uc_min_x + uc_max_x) / 2, (uc_min_y + uc_max_y) / 2);
+
+    // ---- Step 2: orient each arc CCW (mirrors Step 2). ----
+    struct OrientedArc { OpenPolyline poly; double start_angle{}; };
+    std::vector<OrientedArc> arcs;
+    for (const OpenPolyline& poly : open_polylines)
+    {
+        if (poly.size() < 2)
+            continue;
+        Polygon virt;
+        for (const auto& p : poly) virt.push_back(p);
+        OrientedArc oa;
+        if (virt.area() < 0.0)
+        {
+            oa.poly.getPoints().resize(poly.size());
+            std::reverse_copy(poly.begin(), poly.end(), oa.poly.getPoints().begin());
+        }
+        else
+        {
+            oa.poly.getPoints().assign(poly.begin(), poly.end());
+        }
+        double dx = static_cast<double>(oa.poly[0].X - centroid.X);
+        double dy = static_cast<double>(oa.poly[0].Y - centroid.Y);
+        oa.start_angle = std::atan2(dy, dx);
+        arcs.push_back(std::move(oa));
+    }
+    if (arcs.empty())
+        return 0;
+    std::sort(arcs.begin(), arcs.end(), [](const OrientedArc& a, const OrientedArc& b) { return a.start_angle < b.start_angle; });
+
+    // ---- Step 3: full virtual ring (mirrors Step 3). ----
+    Polygon full_ring;
+    std::vector<size_t> arc_vertex_start(arcs.size());
+    for (size_t i = 0; i < arcs.size(); i++)
+    {
+        arc_vertex_start[i] = full_ring.size();
+        for (const auto& p : arcs[i].poly)
+            full_ring.push_back(p);
+    }
+    const size_t n_ring = full_ring.size();
+    if (n_ring < 2)
+        return 0;
+    std::vector<double> cum_len(n_ring, 0.0);
+    for (size_t i = 1; i < n_ring; i++)
+    {
+        double dx = full_ring[i].X - full_ring[i - 1].X;
+        double dy = full_ring[i].Y - full_ring[i - 1].Y;
+        cum_len[i] = cum_len[i - 1] + std::sqrt(dx * dx + dy * dy);
+    }
+    double full_ring_total;
+    {
+        double dx = full_ring[0].X - full_ring[n_ring - 1].X;
+        double dy = full_ring[0].Y - full_ring[n_ring - 1].Y;
+        full_ring_total = cum_len[n_ring - 1] + std::sqrt(dx * dx + dy * dy);
+    }
+    if (full_ring_total < 1.0)
+        return 0;
+
+    // ---- Step 4: Phase Origin projection onto the full ring (mirrors Step 5). ----
+    double full_ring_arc_ref = 0.0;
+    {
+        double best_d2 = -1.0;
+        for (size_t i = 0; i < n_ring; i++)
+        {
+            size_t j = (i + 1) % n_ring;
+            double ax = static_cast<double>(full_ring[i].X), ay = static_cast<double>(full_ring[i].Y);
+            double ex = static_cast<double>(full_ring[j].X - full_ring[i].X);
+            double ey = static_cast<double>(full_ring[j].Y - full_ring[i].Y);
+            double seg_len2 = ex * ex + ey * ey;
+            double t = (seg_len2 > 1e-9)
+                ? ((static_cast<double>(phase_origin.X) - ax) * ex + (static_cast<double>(phase_origin.Y) - ay) * ey) / seg_len2
+                : 0.0;
+            t = std::max(0.0, std::min(1.0, t));
+            double px = ax + t * ex, py = ay + t * ey;
+            double dx = static_cast<double>(phase_origin.X) - px;
+            double dy = static_cast<double>(phase_origin.Y) - py;
+            double d2 = dx * dx + dy * dy;
+            if (best_d2 < 0.0 || d2 < best_d2)
+            {
+                best_d2 = d2;
+                double seg_end = (j == 0) ? full_ring_total : cum_len[j];
+                full_ring_arc_ref = cum_len[i] + t * (seg_end - cum_len[i]);
+            }
+        }
+    }
+
+    // ---- Step 5: per-arc anchor placement + collision counting (mirrors generateFlangeOpen's
+    // own Flare-anchor collision block), summed across every arc on this Layer. ----
+    const double helix_frac  = std::fmod(helix_phase, 1.0);
+    const double ccw_adv_abs = std::fmod(helix_frac * full_ring_total + full_ring_arc_ref, full_ring_total);
+    const double cw_adv_abs  = std::fmod(full_ring_arc_ref - helix_frac * full_ring_total + full_ring_total, full_ring_total);
+    const double collision_w = stringer_W * w_d;
+
+    int total_collisions = 0;
+    for (size_t ai = 0; ai < arcs.size(); ai++)
+    {
+        ArcParam arc_oml = buildArcParamOpen(arcs[ai].poly);
+        const double s_end_oml = arc_oml.total;
+        if (s_end_oml <= 2.0 * w_d)
+            continue;
+        const double arc_start_in_ring = cum_len[arc_vertex_start[ai]];
+
+        struct OmlAnchor { double s; bool is_cw; };
+        std::vector<OmlAnchor> oml_anchors;
+        oml_anchors.reserve(2 * N);
+        for (int i = 0; i < N; i++)
+        {
+            double s_abs = std::fmod(static_cast<double>(i) / N * full_ring_total + ccw_adv_abs, full_ring_total);
+            double s_local = s_abs - arc_start_in_ring;
+            if (s_local > w_d && s_local < s_end_oml - w_d)
+                oml_anchors.push_back({ s_local, false });
+        }
+        for (int i = 0; i < N; i++)
+        {
+            double s_abs = std::fmod(static_cast<double>(i) / N * full_ring_total + cw_adv_abs, full_ring_total);
+            double s_local = s_abs - arc_start_in_ring;
+            if (s_local > w_d && s_local < s_end_oml - w_d)
+                oml_anchors.push_back({ s_local, true });
+        }
+        std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b) { return a.s < b.s; });
+
+        const int total_anchors = static_cast<int>(oml_anchors.size());
+        for (int i = 0; i < total_anchors; i++)
+        {
+            for (int j = i + 1; j < total_anchors; j++)
+            {
+                if (oml_anchors[j].s - oml_anchors[i].s > 2.0 * collision_w) break;
+                if (oml_anchors[j].is_cw == oml_anchors[i].is_cw) continue;
+                Point2LL pi = arc_oml.pointAt(oml_anchors[i].s);
+                Point2LL pj = arc_oml.pointAt(oml_anchors[j].s);
+                double dx = static_cast<double>(pi.X - pj.X), dy = static_cast<double>(pi.Y - pj.Y);
+                if (std::sqrt(dx * dx + dy * dy) < collision_w)
+                    total_collisions++;
+            }
+        }
+    }
+    return total_collisions;
 }
 
 // ============================================================================
