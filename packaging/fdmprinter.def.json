@@ -2801,6 +2801,27 @@
                     "settable_per_mesh": true,
                     "settable_globally": true
                 },
+                "featherprint_collar_enabled":
+                {
+                    "label": "FeatherPrint Collar Enabled",
+                    "description": "Generate Collar: a Former-style reinforcement band at every Whip Terminal (both ends of every hole/slot, and the model's own top/bottom where no Flange is present), reusing Former's wall-stack/peak-thickness rule directly. Replaces the placeholder Whip support stubs wherever it applies. Includes Placket (Collar x Whip) automatically.",
+                    "type": "bool",
+                    "default_value": true,
+                    "enabled": "infill_pattern == 'featherprint'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "featherprint_collar_layers":
+                {
+                    "label": "FeatherPrint Collar Layers",
+                    "description": "Number of layers over which a Collar band ramps up to its peak thickness on the solid side, and back down on the far side (continuing into the boundary's own open span). Mirrors featherprint_former_ramp_layers exactly.",
+                    "type": "int",
+                    "default_value": 6,
+                    "minimum_value": "2",
+                    "enabled": "infill_pattern == 'featherprint' and featherprint_collar_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
                 "featherprint_feature_depth":
                 {
                     "label": "FeatherPrint Feature Depth",

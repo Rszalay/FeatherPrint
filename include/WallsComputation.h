@@ -38,6 +38,7 @@ public:
         double fp_helix_phase = 0.0,
         LayerIndex fp_flange_start_layer = -1,
         int fp_former_ramp = -1,
+        int fp_collar_ramp = -1,
         Point2LL fp_phase_origin = Point2LL(0, 0),
         double fp_r_ref = 0.0,
         std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans = {},
@@ -70,6 +71,14 @@ private:
     // magnitude of the ramp step (0 at a band's own start/end, up to n at its peak) — see
     // SliceMeshStorage::fp_former_ramp for the full derivation.
     const int fp_former_ramp_;
+    // Collar (Spec REV 4.0) this layer's own ramp position — same shape/semantics as
+    // fp_former_ramp_ above, and dispatched through the exact same generateFormer()/
+    // generateFormerOpen() calls (see SliceMeshStorage::fp_collar_ramp for the full
+    // derivation). Feature priority (Flange > Collar > Former) is already fully resolved
+    // upstream by the pre-pass's own whole-band deletion, so at most one of fp_collar_ramp_/
+    // fp_former_ramp_ is ever >= 0 on a non-Flange Layer — the dispatch guards below are
+    // defensive redundancy, not load-bearing.
+    const int fp_collar_ramp_;
     const Point2LL fp_phase_origin_;
     // Curvature-Weighted Stringer Density (Spec REV 2.6): k_ref * R_avg, computed once per
     // mesh (see SliceMeshStorage::fp_r_ref). <= 0 means the feature is inactive for this mesh.

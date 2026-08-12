@@ -333,6 +333,20 @@ public:
     // positions computed the same way (see countLacingCollisions()).
     std::vector<int> fp_former_ramp;
 
+    // FeatherPrint: Collar (Spec REV 4.0) per-layer ramp position, identical shape/semantics to
+    // fp_former_ramp above (-1 = not in a band, else the ramp magnitude). Collar reuses
+    // Former's own Wall-stack mechanism (buildFormerWallStack/generateFormer/
+    // generateFormerOpen) completely unmodified -- only WHERE its peaks land differs: not a
+    // Lacing crossing, but the last fully-closed Layer before a boundary edge's own opening
+    // (lower Collar) and the first fully-closed Layer after it closes again (upper Collar), one
+    // pair per distinct hole/slot. Set by a dedicated pre-pass in FffPolygonGenerator.cpp,
+    // downstream of the Punchout hole-span pre-pass (reuses fp_punchout_gap_spans' own
+    // hole_bottom/hole_top chaining to find each boundary edge's own Z-span, independent of
+    // whether Punchout itself is enabled). Feature priority (Flange > Collar > Former) is
+    // enforced by a whole-band deletion pass immediately afterward -- see that pass's own
+    // comment for why per-Layer truncation isn't sufficient.
+    std::vector<int> fp_collar_ramp;
+
     // FeatherPrint: per-layer Phase Origin for Anchor Distribution (Spec REV 2.2), one entry
     // per layer like fp_helix_phase. Deviates from REV 2.2's stated "recomputed independently
     // each Layer against one fixed world point" design: testing found that a fixed point

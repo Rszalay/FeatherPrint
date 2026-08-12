@@ -5,10 +5,12 @@
 #include <atomic>
 #include <cmath>
 #include <fstream> // ifstream.good()
+#include <functional>
 #include <map> // multimap (ordered map allowing duplicate keys)
 #include <numbers>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1129,6 +1131,55 @@ std::vector<Point2LL> fpSampleHoleBoundaryContour(const SliceLayer& layer, const
     return fpSampleShorterArc(*poly, cum_len, total, s0, s1, n);
 }
 
+// Spreads a set of peak Layers into a ramp table: ramp_table[peak] = n_ramp, tapering by 1
+// per Layer moving away from each peak in either direction, floored at 0 at n_ramp Layers out.
+// Where two peaks' own spans overlap (Layer count between them shorter than 2*n_ramp+1), the
+// max ramp value at each Layer is taken, merging them into one wider band rather than two
+// independent overlapping stacks. Shared by both the Former pre-pass (peaks = Lacing
+// crossings) and the Collar pre-pass (peaks = boundary-edge Z-span endpoints) — see each
+// pre-pass's own comment for how its own peaks are found; this function only does the
+// index-arithmetic spreading, identical either way.
+void fpSpreadRampFromPeaks(const std::vector<LayerIndex>& peaks, int n_ramp, size_t mesh_layer_count, std::vector<int>& ramp_table)
+{
+    for (LayerIndex peak : peaks)
+    {
+        for (int o = 0; o <= n_ramp; o++)
+        {
+            const LayerIndex li_minus = peak - o;
+            const LayerIndex li_plus  = peak + o;
+            const int ramp_here = n_ramp - o;
+            if (li_minus >= 0 && li_minus < static_cast<LayerIndex>(mesh_layer_count))
+                ramp_table[li_minus] = std::max(ramp_table[li_minus], ramp_here);
+            if (li_plus >= 0 && li_plus < static_cast<LayerIndex>(mesh_layer_count) && li_plus != li_minus)
+                ramp_table[li_plus] = std::max(ramp_table[li_plus], ramp_here);
+        }
+    }
+}
+
+// Feature priority (Spec REV 4.0): deletes each ENTIRE maximal contiguous run of ramp >= 0 in
+// ramp_table wherever any Layer in that run is "blocked" -- whole-band deletion, not
+// truncation, per spec's explicit wording for Flange > Collar > Former. A run is already a
+// correctly max-merged band by construction (fpSpreadRampFromPeaks's own overlap handling), so
+// finding maximal runs here is sufficient without re-deriving band identity another way.
+void fpDeleteBandsWhereBlocked(std::vector<int>& ramp_table, size_t mesh_layer_count, const std::function<bool(size_t)>& blocked)
+{
+    size_t li = 0;
+    while (li < mesh_layer_count)
+    {
+        if (ramp_table[li] < 0) { li++; continue; }
+        size_t run_end = li;
+        while (run_end + 1 < mesh_layer_count && ramp_table[run_end + 1] >= 0)
+            run_end++;
+        bool overlap = false;
+        for (size_t k = li; k <= run_end; k++)
+            if (blocked(k)) { overlap = true; break; }
+        if (overlap)
+            for (size_t k = li; k <= run_end; k++)
+                ramp_table[k] = -1;
+        li = run_end + 1;
+    }
+}
+
 } // namespace
 
 void FffPolygonGenerator::processBasicWallsSkinInfill(
@@ -1712,19 +1763,9 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 // value at each layer across all peaks merges them into one wider band rather
                 // than attempting two independent overlapping stacks — an explicit, simple
                 // policy choice, not derived from spec text (REV 3.6 doesn't address this case).
-                for (LayerIndex peak : peaks)
-                {
-                    for (int o = 0; o <= n_ramp; o++)
-                    {
-                        const LayerIndex li_minus = peak - o;
-                        const LayerIndex li_plus  = peak + o;
-                        const int ramp_here = n_ramp - o;
-                        if (li_minus >= 0 && li_minus < static_cast<LayerIndex>(mesh_layer_count))
-                            mesh.fp_former_ramp[li_minus] = std::max(mesh.fp_former_ramp[li_minus], ramp_here);
-                        if (li_plus >= 0 && li_plus < static_cast<LayerIndex>(mesh_layer_count) && li_plus != li_minus)
-                            mesh.fp_former_ramp[li_plus] = std::max(mesh.fp_former_ramp[li_plus], ramp_here);
-                    }
-                }
+                // Shared with the Collar pre-pass below (Spec REV 4.0), which reuses this same
+                // spreading/overlap logic against a different set of peaks.
+                fpSpreadRampFromPeaks(peaks, n_ramp, mesh_layer_count, mesh.fp_former_ramp);
             }
         }
 
@@ -1934,6 +1975,67 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 }
             }
         }
+    }
+
+    // Collar detection pre-pass (Spec REV 4.0). A Collar reuses Former's own
+    // buildFormerWallStack/generateFormer(Open) mechanism completely unmodified (see
+    // generateFormer's own doc comment) — the only new thing is WHERE its peaks land: not a
+    // Lacing crossing, but the last fully-closed Layer before a boundary edge's own opening
+    // (lower Collar) and the first fully-closed Layer after it closes again (upper Collar), one
+    // pair per distinct hole/slot. "Fully closed" here means with respect to THIS boundary
+    // edge specifically — the same local-position reading Miter/Cuff already use elsewhere, not
+    // a ring-wide requirement. Reuses fp_punchout_gap_spans' own hole_bottom/hole_top chaining
+    // (computed above, independent of whether Punchout itself is enabled) rather than
+    // re-deriving hole extents from open_polylines directly.
+    {
+        mesh.fp_collar_ramp.assign(mesh_layer_count, -1);
+
+        if (mesh.settings.get<bool>("featherprint_collar_enabled"))
+        {
+            const int n_ramp = mesh.settings.get<int>("featherprint_collar_layers");
+
+            // Distinct (hole_bottom, hole_top) pairs across every Layer's own gap list. Two
+            // different holes that happen to share the exact same Z-span legitimately want the
+            // same Collar peaks anyway — Collar is a ring-wide Wall stack, not a per-hole
+            // shape — so plain pair de-duplication is exact, not an approximation.
+            std::set<std::pair<LayerIndex, LayerIndex>> hole_spans;
+            for (size_t li = 0; li < mesh_layer_count; li++)
+                for (const SliceMeshStorage::FpPunchoutGapSpan& gap : mesh.fp_punchout_gap_spans[li])
+                    if (gap.hole_bottom >= 0 && gap.hole_top >= gap.hole_bottom)
+                        hole_spans.insert({ gap.hole_bottom, gap.hole_top });
+
+            std::vector<LayerIndex> peaks;
+            for (const auto& span : hole_spans)
+            {
+                const LayerIndex bottom = span.first;
+                const LayerIndex top = span.second;
+                if (bottom > 0)
+                    peaks.push_back(bottom - 1); // lower Collar
+                if (static_cast<size_t>(top + 1) < mesh_layer_count)
+                    peaks.push_back(top + 1); // upper Collar
+            }
+
+            fpSpreadRampFromPeaks(peaks, n_ramp, mesh_layer_count, mesh.fp_collar_ramp);
+        }
+    }
+
+    // Feature priority (Spec REV 4.0): Flange > Collar > Former. Where a lower-priority
+    // feature's band would otherwise overlap a higher-priority one at ANY Layer, the entire
+    // band — every Layer of it, not just the overlapping ones — is deleted. This also corrects
+    // a pre-existing gap: Flange > Former priority previously existed only as a per-Layer
+    // runtime truncation in WallsComputation.cpp's own dispatch, leaving the rest of an
+    // overlapping Former band generated with a bite taken out of it rather than deleted whole.
+    {
+        const LayerIndex flange_start = mesh.fp_flange_start_layer;
+        auto in_flange_zone = [flange_start](size_t li)
+        { return flange_start >= 0 && static_cast<LayerIndex>(li) >= flange_start; };
+
+        fpDeleteBandsWhereBlocked(mesh.fp_collar_ramp, mesh_layer_count, in_flange_zone);
+
+        const std::vector<int>& collar_ramp = mesh.fp_collar_ramp; // captured by reference below
+        auto blocks_former = [&collar_ramp, in_flange_zone](size_t li)
+        { return in_flange_zone(li) || collar_ramp[li] >= 0; };
+        fpDeleteBandsWhereBlocked(mesh.fp_former_ramp, mesh_layer_count, blocks_former);
     }
 
     // walls
@@ -2181,7 +2283,8 @@ void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
     const std::vector<Polygon> fp_interior_holes
         = (layer_nr < mesh.fp_interior_holes.size()) ? mesh.fp_interior_holes[layer_nr] : std::vector<Polygon>{};
     const int fp_former_ramp = (layer_nr < mesh.fp_former_ramp.size()) ? mesh.fp_former_ramp[layer_nr] : -1;
-    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_former_ramp, fp_phase_origin, mesh.fp_r_ref, fp_punchout_gap_spans, fp_interior_holes);
+    const int fp_collar_ramp = (layer_nr < mesh.fp_collar_ramp.size()) ? mesh.fp_collar_ramp[layer_nr] : -1;
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_former_ramp, fp_collar_ramp, fp_phase_origin, mesh.fp_r_ref, fp_punchout_gap_spans, fp_interior_holes);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

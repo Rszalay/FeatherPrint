@@ -66,14 +66,22 @@ public:
         double R_ref = 0.0);
 
     /*!
-     * Former (Spec REV 3.6): a symmetric, ramped Wall stack — grows outward AND inward from
-     * the ordinary single-Wall centreline, up to a peak then back down, rather than Flange's
-     * one-directional ramp from a fixed OML. Not pinned to the model's top; can occur at any
+     * Former (Spec REV 3.6, as corrected REV 3.7): a ramped Wall stack that builds up to a peak
+     * then back down, mirrored in z, rather than Flange's one-directional ramp from a fixed
+     * OML — but like Flange, the outer face stays flush with the OML throughout; all added
+     * thickness builds inward (`buildFormerWallStack()` is a thin wrapper around
+     * `buildFlangeWallStack()`, unmodified). Not pinned to the model's top; can occur at any
      * closed-perimeter Layer. `ramp_position` is 0 at the first/last Layer of the band (no
      * growth yet, ordinary single Wall) through n at the peak Layer — see
      * buildFormerWallStack(). Gusset (Stringer/Lacing x Former) is embedded exactly like
      * Flare Rim is for Flange, at every Layer of the band (both ramps), since a Stringer
      * passing through crosses both.
+     *
+     * Also used, unmodified, for Collar (Spec REV 4.0): Collar is a Former-style band whose
+     * `ramp_position` comes from a different pre-pass (peaks at boundary-edge Z-spans instead
+     * of Lacing crossings — see SliceMeshStorage::fp_collar_ramp) rather than different
+     * geometry. This function has no notion of which feature is calling it; both just pass a
+     * ramp magnitude.
      */
     VariableWidthLines generateFormer(
         const Shape& outline,
@@ -165,6 +173,14 @@ public:
      * REV 3.6 states Cuff introduces no geometry of its own beyond this, matching Miter's own
      * precedent exactly — this function is deliberately a near-duplicate of
      * generateFlangeOpen for that reason, not a distinct design.
+     *
+     * Also used, unmodified, for Placket (Collar x Whip, Spec REV 4.0): a Collar band's own
+     * ramp continuing past a boundary Layer into the hole's open span is exactly this
+     * situation — a tapering multi-Wall ring meeting a locally open arc — and Placket's own
+     * spec text says it reuses Miter's mechanism exactly, substituting the Collar's own
+     * (Layer-by-Layer decreasing) Wall count for the Flange's fixed one. That decrease falls
+     * out for free from `ramp_position` shrinking Layer by Layer as the Collar pre-pass's own
+     * ramp tapers — no separate Placket code path exists or is needed.
      */
     VariableWidthLines generateFormerOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_position, double helix_phase, const OpenLayerParams& params);
 
@@ -458,22 +474,18 @@ private:
     // outer-first (index 0 = outer Wall, back() = innermost Wall).
     static std::vector<FlangeWallDesc> buildFlangeWallStack(int ramp_index, coord_t w);
 
-    // Former's own wall-stack rule (Spec REV 3.6): unlike Flange (grows inward only, from a
-    // fixed OML), Former grows symmetrically outward AND inward from the ordinary single
-    // Wall's own centreline. At ramp_position r (0 = no growth yet, n = peak), each side
-    // grows by r*(w/2) beyond the base Wall, giving total thickness (1+r)*w — REV 3.6's own
-    // peak formula (1+n)w falls out at r=n. Each side's own growth is discretized into Walls
-    // using the same technique buildFlangeWallStack already established (full-width Walls,
-    // one buried half-width Wall when growth isn't a whole multiple of w) — applied
-    // independently per side here, not via a literal call to buildFlangeWallStack itself,
-    // since that function's own ramp_index=0 special case assumes a bare OML with nothing to
-    // grow from on either side, which doesn't match Former's situation (a real base Wall
-    // present on both the outward and inward side already). Burial position is simplified to
-    // "innermost position on its own side" rather than Flange's own "strictly between two
-    // full Walls" rule — Former has no OML/aerodynamic-surface constraint pinning any
-    // particular Wall's exposure, so the exact burial position matters far less here.
-    // Returned outer-first (index 0 = outermost Wall, back() = innermost Wall), same
-    // convention as buildFlangeWallStack.
+    // Former's own wall-stack rule (Spec REV 3.6, as corrected REV 3.7): a thin wrapper
+    // calling buildFlangeWallStack(ramp_position, w) directly, unmodified. Former's outer face
+    // stays flush with the OML throughout, exactly like Flange's — the only structural
+    // difference from Flange is that the caller (FffPolygonGenerator's own pre-pass) mirrors
+    // ramp_position in z about a peak, rather than ramping one-directionally, so this function
+    // itself needs no ramp-shape logic of its own. (An earlier version of this function grew
+    // the stack symmetrically outward AND inward from the base Wall's own centreline, per a
+    // since-corrected misreading of REV 3.6's own Profile text — see REV 3.7's as-built entry
+    // — which produced a Former band visibly sitting proud of the surrounding skin.)
+    //
+    // Also used, unmodified, for Collar (Spec REV 4.0) — see generateFormer()'s own doc
+    // comment for how Collar reuses this whole chain.
     static std::vector<FlangeWallDesc> buildFormerWallStack(int ramp_position, coord_t w);
 
     // Maps a Wall's position in the outer-first wall-stack array (wi: 0=outer..n_walls-1=

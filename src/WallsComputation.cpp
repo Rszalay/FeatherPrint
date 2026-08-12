@@ -39,6 +39,7 @@ WallsComputation::WallsComputation(
     double fp_helix_phase,
     LayerIndex fp_flange_start_layer,
     int fp_former_ramp,
+    int fp_collar_ramp,
     Point2LL fp_phase_origin,
     double fp_r_ref,
     std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans,
@@ -48,6 +49,7 @@ WallsComputation::WallsComputation(
     , fp_helix_phase_(fp_helix_phase)
     , fp_flange_start_layer_(fp_flange_start_layer)
     , fp_former_ramp_(fp_former_ramp)
+    , fp_collar_ramp_(fp_collar_ramp)
     , fp_phase_origin_(fp_phase_origin)
     , fp_r_ref_(fp_r_ref)
     , fp_punchout_gap_spans_(std::move(fp_punchout_gap_spans))
@@ -84,15 +86,22 @@ void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_t
             FeatherPrintGenerator fp;
             const bool is_flange_layer = (fp_flange_start_layer_ >= 0
                                           && layer_nr_ >= fp_flange_start_layer_);
-            // Flange takes priority if a layer is ever flagged as both (edge case at the very
-            // top of a short model — Flange is a top-of-model zone, Former bands are interior,
-            // so this isn't expected in practice).
-            const bool is_former_layer = (! is_flange_layer && fp_former_ramp_ >= 0);
+            // Feature priority (Spec REV 4.0): Flange > Collar > Former, already fully
+            // resolved upstream by the detection pre-pass's own whole-band deletion (see
+            // fp_collar_ramp_'s own doc comment) — these guards are defensive redundancy.
+            const bool is_collar_layer = (! is_flange_layer && fp_collar_ramp_ >= 0);
+            const bool is_former_layer = (! is_flange_layer && ! is_collar_layer && fp_former_ramp_ >= 0);
             VariableWidthLines wl;
             if (is_flange_layer)
             {
                 const int ramp_index = static_cast<int>(layer_nr_ - fp_flange_start_layer_);
                 wl = fp.generateFlange(gen_outline, settings_, ramp_index, fp_helix_phase_, fp_phase_origin_, fp_r_ref_);
+            }
+            else if (is_collar_layer)
+            {
+                // Collar reuses generateFormer() completely unmodified — see its own doc
+                // comment for why this is correct, not a placeholder.
+                wl = fp.generateFormer(gen_outline, settings_, fp_collar_ramp_, fp_helix_phase_, fp_phase_origin_, fp_r_ref_);
             }
             else if (is_former_layer)
             {
@@ -400,12 +409,24 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             params.arc_start_in_ring  = cum_len[arc_vertex_start[ai]];
 
             const bool is_flange_layer = (fp_flange_start_layer_ >= 0 && layer_nr_ >= fp_flange_start_layer_);
-            const bool is_former_layer = (! is_flange_layer && fp_former_ramp_ >= 0);
+            const bool is_collar_layer = (! is_flange_layer && fp_collar_ramp_ >= 0);
+            const bool is_former_layer = (! is_flange_layer && ! is_collar_layer && fp_former_ramp_ >= 0);
             VariableWidthLines wl;
             if (is_flange_layer)
             {
                 const int ramp_index = static_cast<int>(layer_nr_ - fp_flange_start_layer_);
                 wl = fp.generateFlangeOpen(arcs[ai].poly, layer->printZ, settings_, ramp_index, fp_helix_phase_, params);
+            }
+            else if (is_collar_layer)
+            {
+                // Collar reuses generateFormerOpen() completely unmodified — this call IS
+                // Placket (Collar x Whip): generateFormerOpen already applies Cuff's own
+                // Miter-derived open-arc handling (outer Wall's Terminal welds the open inner
+                // Wall ends), which is exactly what Placket's own spec text calls for. The
+                // "decreasing Wall count through the taper" Placket describes falls out for
+                // free from fp_collar_ramp_ shrinking Layer by Layer as the pre-pass's own
+                // ramp moves further into the boundary's open span — no extra code needed.
+                wl = fp.generateFormerOpen(arcs[ai].poly, layer->printZ, settings_, fp_collar_ramp_, fp_helix_phase_, params);
             }
             else if (is_former_layer)
             {
@@ -438,6 +459,14 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             synthetic.print_outline  = synthetic.outline;
             synthetic.inner_area     = Shape{};
             synthetic.wall_toolpaths = { std::move(wl) };
+            // Without this, SkinInfillAreaComputation::getOutlineOnLayer's own bbox-hit test
+            // (src/skin.cpp) never matches this part against any neighboring Layer's part,
+            // since AABB's default state is invalid/uninitialized — every open-manifold Layer
+            // then looks like it has zero material anywhere, and calculateTopSkin/
+            // calculateBottomSkin paint the ENTIRE inner_area of a nearby closed Layer as skin
+            // instead of leaving just the hole open. Matches the stock convention every other
+            // SliceLayerPart-creation site already follows (see layerPart.cpp).
+            synthetic.boundaryBox.calculate(synthetic.outline);
             layer->parts.push_back(std::move(synthetic));
         }
 
@@ -533,6 +562,8 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
                 synthetic.print_outline  = synthetic.outline;
                 synthetic.inner_area     = Shape{};
                 synthetic.wall_toolpaths = { std::move(punchout_wl) };
+                // See the identical fix/comment on the ordinary arc-loop synthetic part above.
+                synthetic.boundaryBox.calculate(synthetic.outline);
                 layer->parts.push_back(std::move(synthetic));
             }
         }

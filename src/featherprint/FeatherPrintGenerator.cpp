@@ -2752,24 +2752,77 @@ VariableWidthLines FeatherPrintGenerator::generatePunchout(
 
     // Cut back along the CHORD (into the hole), never along either real polyline's own
     // tangent — this is the direct fix for the "outside the hole" defect:
-    // featherprint_punchout_gap is measured in this direction only. This cutback is FIXED —
-    // an earlier attempt scaled it toward zero near a hole's own top/bottom (to weld the
-    // Terminal to the real wall corner), which slid the entire Terminal loop (sized by
-    // D/R1/R2/W) so its anchor coincided with the real Whip Terminal's own anchor at that same
-    // corner; both loops bulge inward from there by a similar depth in roughly the same
-    // direction, so they overlapped. A follow-up attempt fixed the overlap by adding a
-    // separate tangent-matched "weld stub" curve instead of moving the Terminal — that stub
-    // was removed again after real-print testing found it made the Punchout materially harder
-    // to break away, which defeats the point of a removable support feature. The cutback gap
-    // is intentionally left unwelded now; see Contour Matching, below, for how the middle of
-    // the Line still tracks the wall shape without needing the ends themselves to touch it.
+    // featherprint_punchout_gap is measured in this direction only. This cutback is a FLOOR,
+    // not a fixed value — see the Angle-Adaptive Gap block just below for why. An earlier
+    // attempt scaled it toward zero near a hole's own top/bottom (to weld the Terminal to the
+    // real wall corner), which slid the entire Terminal loop (sized by D/R1/R2/W) so its
+    // anchor coincided with the real Whip Terminal's own anchor at that same corner; both
+    // loops bulge inward from there by a similar depth in roughly the same direction, so they
+    // overlapped. A follow-up attempt fixed the overlap by adding a separate tangent-matched
+    // "weld stub" curve instead of moving the Terminal — that stub was removed again after
+    // real-print testing found it made the Punchout materially harder to break away, which
+    // defeats the point of a removable support feature. The cutback gap is intentionally left
+    // unwelded now; see Contour Matching, below, for how the middle of the Line still tracks
+    // the wall shape without needing the ends themselves to touch it.
     const coord_t gap = settings.get<coord_t>("featherprint_punchout_gap");
     const double gap_d = static_cast<double>(gap);
-    if (gap_d * 2.0 >= chord_len)
-        return {}; // hole too narrow for the requested cutback — nothing safe to draw
 
-    const Point2LL Q0(static_cast<coord_t>(std::llround(P0.X + ux * gap_d)), static_cast<coord_t>(std::llround(P0.Y + uy * gap_d)));
-    const Point2LL Q1(static_cast<coord_t>(std::llround(P1.X - ux * gap_d)), static_cast<coord_t>(std::llround(P1.Y - uy * gap_d)));
+    // Angle-Adaptive Gap: found via real-print testing on a hole with an angled edge — the
+    // Punchout ended up sitting directly on the sidewall. Root cause: the real Whip Terminal
+    // at P0/P1 (generated separately, anchored right there) recedes AWAY from the hole along
+    // that wall's own local tangent in the ordinary case — a hole is just a gap in the wall's
+    // own path, so the wall's tangent there runs nearly parallel to the chord, and the
+    // Terminal's local +x axis (mapped by its own x_sign, per appendTerminal's own doc: -1 at
+    // an end endpoint like P0, +1 at a start endpoint like P1) points back into solid
+    // material, well clear of a flat gap tuned for that case. When the hole's edge is angled,
+    // that tangent diverges from the chord direction, and the Terminal's own canonical (W, D)
+    // bounding corner partly projects INTO the chord instead of fully receding.
+    //
+    // Fix: project each Terminal's own bounding corner (placed in world space the same way
+    // appendTerminal itself does — x_sign*tangent*W + inward_normal*D from the anchor) onto
+    // the chord direction TOWARD that Terminal's own hole side, and grow that end's own
+    // cutback to at least clear it (plus one line width of margin). This is a floor via
+    // std::max against the nominal setting, so the ordinary (near-parallel) case — where the
+    // projection comes out negative, meaning the Terminal recedes away from the chord — is
+    // completely unaffected; the gap only ever grows, never shrinks below what was asked for.
+    auto tangentAt = [](const OpenPolyline& poly, bool at_end) -> std::pair<double, double>
+    {
+        if (poly.size() < 2)
+            return { 0.0, 0.0 }; // degenerate polyline — caller falls back to the floor gap only
+        const Point2LL& a = at_end ? poly[poly.size() - 2] : poly[0];
+        const Point2LL& b = at_end ? poly[poly.size() - 1] : poly[1];
+        double tx = static_cast<double>(b.X - a.X), ty = static_cast<double>(b.Y - a.Y);
+        const double tlen = std::sqrt(tx * tx + ty * ty);
+        if (tlen < 1e-6)
+            return { 0.0, 0.0 };
+        return { tx / tlen, ty / tlen };
+    };
+
+    double gap0_d = gap_d, gap1_d = gap_d;
+    {
+        const auto [t0x, t0y] = tangentAt(prev_wall_poly, /*at_end=*/true);
+        const auto [t1x, t1y] = tangentAt(next_wall_poly, /*at_end=*/false);
+        // Tangent rotated +90 degrees = inward normal — same convention resolveFrame uses
+        // elsewhere (an open polyline's arc.ccw is always true in this codebase).
+        const double n0x = -t0y, n0y = t0x;
+        const double n1x = -t1y, n1y = t1x;
+
+        // Terminal at P0 (x_sign=-1): bounding corner is P0 + (-T0)*W*w + N0*D*w. Projected
+        // onto +C (the direction from P0 toward P1, i.e. toward the hole from this side):
+        const double intrusion0 = -W * w_d * (t0x * ux + t0y * uy) + D * w_d * (n0x * ux + n0y * uy);
+        // Terminal at P1 (x_sign=+1): bounding corner is P1 + T1*W*w + N1*D*w. Projected onto
+        // -C (the direction from P1 toward P0, i.e. toward the hole from this side):
+        const double intrusion1 = -W * w_d * (t1x * ux + t1y * uy) - D * w_d * (n1x * ux + n1y * uy);
+
+        gap0_d = std::max(gap_d, intrusion0 + w_d);
+        gap1_d = std::max(gap_d, intrusion1 + w_d);
+    }
+
+    if (gap0_d + gap1_d >= chord_len)
+        return {}; // hole too narrow for the requested (possibly angle-grown) cutback — nothing safe to draw
+
+    const Point2LL Q0(static_cast<coord_t>(std::llround(P0.X + ux * gap0_d)), static_cast<coord_t>(std::llround(P0.Y + uy * gap0_d)));
+    const Point2LL Q1(static_cast<coord_t>(std::llround(P1.X - ux * gap1_d)), static_cast<coord_t>(std::llround(P1.Y - uy * gap1_d)));
 
     // Synthetic open polyline over the cutback chord, in the SAME point order (Q0 first,
     // Q1 last) as the ring's own forward (CCW) traversal direction — P0 was the END of the
