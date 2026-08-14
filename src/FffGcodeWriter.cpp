@@ -1843,7 +1843,20 @@ void FffGcodeWriter::addMeshLayerToGCode(
 
     for (const PathOrdering<SliceLayerPart*>& path : part_order_optimizer.paths_)
     {
-        addMeshPartToGCode(storage, mesh, extruder_nr, mesh_config, *path.vertices_, gcode_layer);
+        SliceLayerPart& part = *path.vertices_;
+        // FeatherPrint synthetic open-manifold parts (Whip/Former/Collar arcs, Punchout gaps,
+        // Shelf) mark themselves so the travel move into them always retracts+z-hops, even
+        // when short -- otherwise a short travel between adjacent segments can drag the
+        // just-printed wall (no real comb boundary exists for these synthetic parts). Whatever
+        // travel InsetOrderOptimizer/addWalls issues internally afterward becomes a
+        // zero/near-zero move to the same point, since the nozzle is already there.
+        if (part.fp_force_retract_before
+            && ! part.wall_toolpaths.empty() && ! part.wall_toolpaths.front().empty()
+            && ! part.wall_toolpaths.front().front().junctions_.empty())
+        {
+            gcode_layer.addTravel(part.wall_toolpaths.front().front().junctions_.front().p_, ForceRetract::ALWAYS);
+        }
+        addMeshPartToGCode(storage, mesh, extruder_nr, mesh_config, part, gcode_layer);
     }
 
     // Shore (Internal Overhang Bridging, Spec REV 3.1): emitted once per mesh per layer here

@@ -40,6 +40,7 @@ WallsComputation::WallsComputation(
     LayerIndex fp_flange_start_layer,
     int fp_former_ramp,
     int fp_collar_ramp,
+    int fp_collar_ramp_next,
     Point2LL fp_phase_origin,
     double fp_r_ref,
     std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans,
@@ -50,6 +51,7 @@ WallsComputation::WallsComputation(
     , fp_flange_start_layer_(fp_flange_start_layer)
     , fp_former_ramp_(fp_former_ramp)
     , fp_collar_ramp_(fp_collar_ramp)
+    , fp_collar_ramp_next_(fp_collar_ramp_next)
     , fp_phase_origin_(fp_phase_origin)
     , fp_r_ref_(fp_r_ref)
     , fp_punchout_gap_spans_(std::move(fp_punchout_gap_spans))
@@ -467,6 +469,7 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             // instead of leaving just the hole open. Matches the stock convention every other
             // SliceLayerPart-creation site already follows (see layerPart.cpp).
             synthetic.boundaryBox.calculate(synthetic.outline);
+            synthetic.fp_force_retract_before = true;
             layer->parts.push_back(std::move(synthetic));
         }
 
@@ -502,10 +505,12 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
                 // own doc comment): it made the Punchout harder to break away.
                 std::vector<Point2LL> contour_pts;
                 bool half_width_ends = false;
+                // Hoisted out of the block below (Spec REV 4.2) so Shelf's own gating check,
+                // after generatePunchout() is called, can still read this gap's hole_top.
+                const SliceMeshStorage::FpPunchoutGapSpan* best = nullptr;
                 if (! fp_punchout_gap_spans_.empty())
                 {
                     double best_d2 = -1.0;
-                    const SliceMeshStorage::FpPunchoutGapSpan* best = nullptr;
                     for (const auto& span : fp_punchout_gap_spans_)
                     {
                         const double dx1 = static_cast<double>(span.start.X - gap_start.X);
@@ -544,7 +549,8 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
                         half_width_ends = true;
                 }
 
-                VariableWidthLines punchout_wl = fp_punchout.generatePunchout(prev_wall_poly, next_wall_poly, layer->printZ, settings_, gap_params, contour_pts, half_width_ends);
+                Point2LL shelf_q0, shelf_q1;
+                VariableWidthLines punchout_wl = fp_punchout.generatePunchout(prev_wall_poly, next_wall_poly, layer->printZ, settings_, gap_params, contour_pts, half_width_ends, &shelf_q0, &shelf_q1);
                 if (punchout_wl.empty()) continue;
 
                 coord_t min_x = std::min(gap_start.X, gap_end.X), max_x = std::max(gap_start.X, gap_end.X);
@@ -556,15 +562,49 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
                 bbox_poly.push_back(Point2LL(min_x, max_y));
                 Shape bbox_shape;
                 bbox_shape.push_back(bbox_poly);
+                // Kept as a named copy (not moved into `synthetic` below) since Shelf's own
+                // synthetic part, further down, reuses the same bbox span.
+                const SingleShape gap_bbox_single(std::move(bbox_shape));
 
                 SliceLayerPart synthetic;
-                synthetic.outline        = SingleShape(std::move(bbox_shape));
+                synthetic.outline        = gap_bbox_single;
                 synthetic.print_outline  = synthetic.outline;
                 synthetic.inner_area     = Shape{};
                 synthetic.wall_toolpaths = { std::move(punchout_wl) };
                 // See the identical fix/comment on the ordinary arc-loop synthetic part above.
                 synthetic.boundaryBox.calculate(synthetic.outline);
+                synthetic.fp_force_retract_before = true;
                 layer->parts.push_back(std::move(synthetic));
+
+                // Shelf (Spec REV 4.2): mandatory support for the upper Collar's own
+                // peak-thickness Wall stack, which sits directly above this hole's own local
+                // arc-opening one Layer above its topmost Layer. Gated on this being that exact
+                // topmost Layer AND the Collar band immediately above genuinely peaking there
+                // (fp_collar_ramp_next_ reaches featherprint_collar_layers only at a true peak —
+                // see fp_collar_ramp_next_'s own doc comment) — not merely Collar being enabled,
+                // since that band may have been deleted entirely by the Flange>Collar priority
+                // rule. Reuses shelf_q0/shelf_q1 — the SAME cutback points generatePunchout()
+                // just computed above, where the real Punchout Terminal loops are anchored — so
+                // Shelf's own loops land clear of them rather than re-deriving an approximation.
+                if (settings_.get<bool>("featherprint_collar_enabled") && best != nullptr && layer_nr_ == best->hole_top)
+                {
+                    const int collar_ramp_peak = settings_.get<int>("featherprint_collar_layers");
+                    if (fp_collar_ramp_next_ == collar_ramp_peak)
+                    {
+                        VariableWidthLines shelf_wl = fp_punchout.generateShelf(shelf_q0, shelf_q1, centroid, settings_, collar_ramp_peak);
+                        if (! shelf_wl.empty())
+                        {
+                            SliceLayerPart shelf_part;
+                            shelf_part.outline        = gap_bbox_single; // same bbox span as the Punchout Line this Shelf belongs to
+                            shelf_part.print_outline  = shelf_part.outline;
+                            shelf_part.inner_area     = Shape{};
+                            shelf_part.wall_toolpaths = { std::move(shelf_wl) };
+                            shelf_part.boundaryBox.calculate(shelf_part.outline);
+                            shelf_part.fp_force_retract_before = true;
+                            layer->parts.push_back(std::move(shelf_part));
+                        }
+                    }
+                }
             }
         }
     }

@@ -232,8 +232,43 @@ public:
      * spec, to weaken those connections and make the whole feature easier to break away.
      * Geometry is unaffected (R1/R2/D/W are still derived from the full nominal width, so the
      * profile keeps its normal proportions) — only the printed bead width changes.
+     *
+     * out_q0/out_q1, if non-null, receive the actual (angle-adaptive-gap-adjusted) cutback
+     * points Q0/Q1 this call computed — the same points the real Punchout Terminal loops are
+     * anchored to. Added for Shelf (Spec REV 4.2, see generateShelf() below), which needs to
+     * place its own loops clear of those exact points, not re-derive its own approximation of
+     * them (the two would drift out of sync with any future change to the gap logic here).
+     * Left untouched (not zeroed) if this call returns empty before Q0/Q1 are computed.
      */
-    VariableWidthLines generatePunchout(const OpenPolyline& prev_wall_poly, const OpenPolyline& next_wall_poly, coord_t z, const Settings& settings, const OpenLayerParams& params, const std::vector<Point2LL>& contour_pts = {}, bool half_width_ends = false);
+    VariableWidthLines generatePunchout(const OpenPolyline& prev_wall_poly, const OpenPolyline& next_wall_poly, coord_t z, const Settings& settings, const OpenLayerParams& params, const std::vector<Point2LL>& contour_pts = {}, bool half_width_ends = false, Point2LL* out_q0 = nullptr, Point2LL* out_q1 = nullptr);
+
+    /*!
+     * Shelf (Spec REV 4.2): mandatory support for the upper Collar's own peak-thickness Wall
+     * stack, which sits directly above a hole's own local arc-opening at the hole's topmost
+     * Layer — the one place along the ring where the Placket taper's usual assumption (the
+     * still-closed remainder of the ring can carry the Wall stack gradually into the open
+     * span) doesn't hold, since the hole removes exactly that supporting material. Reuses the
+     * Stringer Trace's own loop/crossover profile (appendTrace()) — not a flat surface,
+     * deliberately, so the support stays as breakable as the rest of Punchout (see this
+     * function's own Reach/loop-count derivation in the .cpp for why loops, not a solid shelf).
+     *
+     * Q0/Q1 must be the exact same cutback points generatePunchout() computed for this same
+     * hole/Layer (see its own out_q0/out_q1 parameters) — the real Punchout Terminal is
+     * anchored there, not at the raw wall corners, so Shelf's own loops need the same reference
+     * points to actually stay clear of it.
+     *
+     * collar_ramp_peak is the ramp position (== featherprint_collar_layers) the upper Collar
+     * band one Layer above will peak at — used to derive each loop's own inward Reach via
+     * buildFormerWallStack(collar_ramp_peak, w)'s own innermost Wall offset, less Lw/2. The
+     * caller is responsible for only calling this when that Collar band genuinely peaks there
+     * (see SliceMeshStorage::fp_collar_ramp) — this function does not re-check that itself.
+     *
+     * Loop count is floor(available_span / (featherprint_stringer_width * w)), evenly spaced,
+     * where available_span excludes the same end zones generatePunchout()'s own Terminals
+     * occupy (matching its own W/R1-based boundary convention exactly, not re-derived).
+     * Returns empty if the available span holds fewer than one loop.
+     */
+    VariableWidthLines generateShelf(const Point2LL& Q0, const Point2LL& Q1, const Point2LL& centroid, const Settings& settings, int collar_ramp_peak);
 
     /*!
      * Returns the world-space position of the seam (helix 0 departure) for this layer.

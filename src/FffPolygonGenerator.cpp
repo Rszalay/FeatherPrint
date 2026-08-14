@@ -2284,7 +2284,8 @@ void FffPolygonGenerator::processWalls(SliceMeshStorage& mesh, size_t layer_nr)
         = (layer_nr < mesh.fp_interior_holes.size()) ? mesh.fp_interior_holes[layer_nr] : std::vector<Polygon>{};
     const int fp_former_ramp = (layer_nr < mesh.fp_former_ramp.size()) ? mesh.fp_former_ramp[layer_nr] : -1;
     const int fp_collar_ramp = (layer_nr < mesh.fp_collar_ramp.size()) ? mesh.fp_collar_ramp[layer_nr] : -1;
-    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_former_ramp, fp_collar_ramp, fp_phase_origin, mesh.fp_r_ref, fp_punchout_gap_spans, fp_interior_holes);
+    const int fp_collar_ramp_next = (layer_nr + 1 < mesh.fp_collar_ramp.size()) ? mesh.fp_collar_ramp[layer_nr + 1] : -1;
+    WallsComputation walls_computation(mesh.settings, layer_nr, fp_phase, mesh.fp_flange_start_layer, fp_former_ramp, fp_collar_ramp, fp_collar_ramp_next, fp_phase_origin, mesh.fp_r_ref, fp_punchout_gap_spans, fp_interior_holes);
     walls_computation.generateWalls(layer, SectionType::WALL);
 }
 

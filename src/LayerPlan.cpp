@@ -516,6 +516,15 @@ GCodePath& LayerPlan::addTravel(const Point2LL& p, const ForceRetract force_retr
         path->perform_z_hop = retraction_enable && mesh_or_extruder_settings.get<bool>("retraction_hop_enabled");
     }
 
+    if (force_retract == ForceRetract::ALWAYS)
+    {
+        // Overrides everything above (min-travel-distance skip, combing) -- used only for
+        // FeatherPrint synthetic-part transitions, where a short travel between open-manifold
+        // segments would otherwise go unretracted/unhopped and drag the just-printed wall.
+        path->retract = true;
+        path->perform_z_hop = mesh_or_extruder_settings.get<bool>("retraction_hop_enabled");
+    }
+
     // must start new travel path as retraction can be enabled or not depending on path length, etc.
     forceNewPathStart();
 

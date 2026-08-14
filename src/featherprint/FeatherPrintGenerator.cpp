@@ -2625,6 +2625,20 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
         }
     }
 
+    // Combined-fit guard: on a short open segment (e.g. a slot edge sitting on a small
+    // radius), the per-end checks above can each pass independently while the two Terminals'
+    // own walk-in spans overlap, so they draw anyway and meet in the middle -- visually
+    // closing a gap that's supposed to stay open. Mirrors generatePunchout()'s own joint
+    // min_terminal_span/draw_terminals guard (see that function's comment) rather than
+    // deciding each end in isolation. Suppress BOTH terminals together when they wouldn't fit;
+    // the existing plain-walk appendPolySegment calls below already cover the fallback.
+    const double min_both_terminal_span = (stringer_W + stringer_R1 + start_splay_L + end_splay_L) * w_d * 2.0 + w_d;
+    if (s_end < min_both_terminal_span)
+    {
+        draw_start_terminal = false;
+        draw_end_terminal   = false;
+    }
+
     // Open ExtrusionLine: walk from s=0 to s=s_end with embedded Traces/Lacings.
     // Uses arc_open throughout — arc_v was only needed for anchor placement.
     ExtrusionLine fp_line(/*inset_idx=*/0, /*is_odd=*/false, /*is_closed=*/false);
@@ -2715,7 +2729,9 @@ VariableWidthLines FeatherPrintGenerator::generatePunchout(
     const Settings& settings,
     const OpenLayerParams& params,
     const std::vector<Point2LL>& contour_pts,
-    bool half_width_ends)
+    bool half_width_ends,
+    Point2LL* out_q0,
+    Point2LL* out_q1)
 {
     (void)z;
     if (! settings.get<bool>("featherprint_punchout_enabled"))
@@ -2823,6 +2839,11 @@ VariableWidthLines FeatherPrintGenerator::generatePunchout(
 
     const Point2LL Q0(static_cast<coord_t>(std::llround(P0.X + ux * gap0_d)), static_cast<coord_t>(std::llround(P0.Y + uy * gap0_d)));
     const Point2LL Q1(static_cast<coord_t>(std::llround(P1.X - ux * gap1_d)), static_cast<coord_t>(std::llround(P1.Y - uy * gap1_d)));
+    // Report the real cutback points for Shelf (Spec REV 4.2) — see this function's own
+    // out_q0/out_q1 doc comment. Populated as soon as Q0/Q1 are known, even if this call later
+    // returns an empty VariableWidthLines for some other reason downstream.
+    if (out_q0) *out_q0 = Q0;
+    if (out_q1) *out_q1 = Q1;
 
     // Synthetic open polyline over the cutback chord, in the SAME point order (Q0 first,
     // Q1 last) as the ring's own forward (CCW) traversal direction — P0 was the END of the
@@ -2906,6 +2927,80 @@ VariableWidthLines FeatherPrintGenerator::generatePunchout(
     if (half_width_ends)
         for (ExtrusionJunction& j : fp_line)
             j.w_ = std::max<coord_t>(1, w / 2);
+
+    VariableWidthLines result;
+    result.push_back(std::move(fp_line));
+    return result;
+}
+
+VariableWidthLines FeatherPrintGenerator::generateShelf(const Point2LL& Q0, const Point2LL& Q1, const Point2LL& centroid, const Settings& settings, int collar_ramp_peak)
+{
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+    if (w <= 0)
+        return {};
+    const double w_d = static_cast<double>(w);
+
+    // Punchout Terminal's own W/R1/R2 (see generatePunchout()'s own use of the same values) --
+    // reused verbatim, not re-derived, so the "available span" boundary below matches exactly
+    // where the real Terminal geometry sits.
+    const double stringer_W = settings.get<double>("featherprint_stringer_width");
+    const double stringer_R2 = stringer_W / 2.0;
+    const double stringer_R1 = stringer_R2 + 0.5;
+
+    OpenPolyline chord_poly;
+    chord_poly.push_back(Q0);
+    chord_poly.push_back(Q1);
+    ArcParam chord_arc = buildArcParamOpen(chord_poly);
+    const double s_end = chord_arc.total;
+    if (s_end < 2.0 * w_d)
+        return {};
+
+    const double span_start = stringer_W * w_d;
+    const double span_end = s_end - stringer_R1 * w_d;
+    const double available_span = span_end - span_start;
+    if (available_span <= 0.0)
+        return {};
+
+    const int loop_count = static_cast<int>(std::floor(available_span / (stringer_W * w_d)));
+    if (loop_count < 1)
+        return {}; // hole too narrow for even one loop
+
+    // Reach: the innermost Wall of the SAME Wall stack the upper Collar band above will use at
+    // its own peak (buildFormerWallStack is Former's own rule, reused unmodified by Collar --
+    // see buildFormerWallStack's own doc comment), less Lw/2 -- close enough to give that Wall
+    // real contact to build on, without extending fully to or past it.
+    const std::vector<FlangeWallDesc> collar_stack = buildFormerWallStack(collar_ramp_peak, w);
+    if (collar_stack.empty())
+        return {};
+    const FlangeWallDesc& innermost = collar_stack.back();
+    const double reach_w = (static_cast<double>(innermost.offset) + static_cast<double>(innermost.width) / 2.0) / w_d;
+    const double D_shelf = reach_w - 0.5;
+    if (D_shelf <= 0.0)
+        return {}; // Collar band too thin at this ramp position to leave any real reach for a loop
+
+    const double step = available_span / static_cast<double>(loop_count);
+
+    // Each loop is one Stringer Trace crossover (appendTrace), laid out side by side along the
+    // chord rather than stacked helically across Layers -- deliberately not a flat shelf (see
+    // this feature's own spec doc comment on generateShelf, above): a row of small, localized
+    // weld points gives the Collar's own Wall stack enough distributed contact to hold the
+    // overhang during printing, while staying as breakable as the rest of Punchout. is_cw is
+    // fixed false for every loop -- Shelf has no CCW/CW helix-pairing concept the way a real
+    // Stringer does, so there is nothing to mirror.
+    ExtrusionLine fp_line(/*inset_idx=*/0, /*is_odd=*/false, /*is_closed=*/false);
+    double current_s = span_start;
+    for (int i = 0; i < loop_count; i++)
+    {
+        const double s_anchor = span_start + (static_cast<double>(i) + 0.5) * step;
+        const double s_depart = std::max(current_s, s_anchor - w_d);
+        appendPolySegment(fp_line, chord_arc, current_s, s_depart, w, fp_line.empty());
+        appendTrace(fp_line, s_anchor, centroid, chord_arc, /*is_cw=*/false, w, D_shelf, stringer_W, false);
+        current_s = s_anchor + w_d;
+    }
+    appendPolySegment(fp_line, chord_arc, current_s, span_end, w, fp_line.empty());
+
+    if (fp_line.size() < 2)
+        return {};
 
     VariableWidthLines result;
     result.push_back(std::move(fp_line));

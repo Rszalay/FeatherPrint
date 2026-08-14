@@ -58,6 +58,9 @@ public:
     AABB boundaryBox; //!< The boundaryBox is an axis-aligned boundary box which is used to quickly check for possible
                       //!< collision between different parts on different layers. It's an optimization used during
                       //!< skin calculations.
+    bool fp_force_retract_before = false; //!< FeatherPrint synthetic open-manifold parts (Whip/Former/Collar arcs,
+                      //!< Punchout gaps, Shelf) set this so the travel move into this part always retracts+z-hops,
+                      //!< regardless of distance -- see FffGcodeWriter::addMeshLayerToGCode.
     SingleShape outline; //!< The outline is the first member that is filled, and it's filled with polygons that match
                          //!< a cross-section of the 3D model.
     Shape print_outline; //!< An approximation to the outline of what's actually printed, based on the outer wall.

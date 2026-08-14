@@ -39,6 +39,7 @@ public:
         LayerIndex fp_flange_start_layer = -1,
         int fp_former_ramp = -1,
         int fp_collar_ramp = -1,
+        int fp_collar_ramp_next = -1,
         Point2LL fp_phase_origin = Point2LL(0, 0),
         double fp_r_ref = 0.0,
         std::vector<SliceMeshStorage::FpPunchoutGapSpan> fp_punchout_gap_spans = {},
@@ -79,6 +80,10 @@ private:
     // fp_former_ramp_ is ever >= 0 on a non-Flange Layer — the dispatch guards below are
     // defensive redundancy, not load-bearing.
     const int fp_collar_ramp_;
+    // Collar ramp position one Layer ABOVE this one (Spec REV 4.2) -- used only by Shelf's own
+    // gating check (does an upper Collar band genuinely peak immediately above this hole's own
+    // topmost Layer?). -1 if out of range or not applicable. See SliceMeshStorage::fp_collar_ramp.
+    const int fp_collar_ramp_next_;
     const Point2LL fp_phase_origin_;
     // Curvature-Weighted Stringer Density (Spec REV 2.6): k_ref * R_avg, computed once per
     // mesh (see SliceMeshStorage::fp_r_ref). <= 0 means the feature is inactive for this mesh.
