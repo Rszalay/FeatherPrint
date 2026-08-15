@@ -1488,18 +1488,33 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
         {
             // Outer Wall: ordinary Whip Terminal at both ends, continuing the same Terminal
             // column as ordinary Whip layers around the Former band (Cuff = Miter rule).
+            //
+            // Combined-fit guard (Aug 2026): mirrors generateOpen()'s own joint
+            // min_terminal_span/draw_terminals guard (see that function's comment) — on a
+            // short band-meets-Whip arc, drawing both Terminals unconditionally let them walk
+            // past each other and overlap. Suppress both together when they wouldn't fit,
+            // falling back to a plain walk instead (same fallback the buried-middle-Wall case
+            // below already uses).
+            const double min_terminal_span = (stringer_W + stringer_R1) * w_d * 2.0 + w_d;
+            if (s_end >= min_terminal_span)
             {
-                const size_t start1 = wall_line.junctions_.size();
-                appendTerminal(wall_line, 0.0, +1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/true);
-                for (size_t i = start1; i < wall_line.junctions_.size(); i++)
-                    wall_line.junctions_[i].w_ = wd.width;
+                {
+                    const size_t start1 = wall_line.junctions_.size();
+                    appendTerminal(wall_line, 0.0, +1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/true);
+                    for (size_t i = start1; i < wall_line.junctions_.size(); i++)
+                        wall_line.junctions_[i].w_ = wd.width;
+                }
+                appendPolySegment(wall_line, arc_w, stringer_W * w_d, s_end - stringer_R1 * w_d, wd.width, wall_line.empty());
+                {
+                    const size_t start2 = wall_line.junctions_.size();
+                    appendTerminal(wall_line, s_end, -1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/false);
+                    for (size_t i = start2; i < wall_line.junctions_.size(); i++)
+                        wall_line.junctions_[i].w_ = wd.width;
+                }
             }
-            appendPolySegment(wall_line, arc_w, stringer_W * w_d, s_end - stringer_R1 * w_d, wd.width, wall_line.empty());
+            else
             {
-                const size_t start2 = wall_line.junctions_.size();
-                appendTerminal(wall_line, s_end, -1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/false);
-                for (size_t i = start2; i < wall_line.junctions_.size(); i++)
-                    wall_line.junctions_[i].w_ = wd.width;
+                appendPolySegment(wall_line, arc_w, 0.0, s_end, wd.width, /*add_start=*/true);
             }
         }
         else if (is_innermost && ! flare_anchors.empty())
@@ -1713,18 +1728,32 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
             // size there, opening a gap against the full-size Terminal in the ordinary Whip
             // layer immediately below. Scale by w (matching every other Terminal call site) and
             // only apply wd.width to the emitted junctions' own printed bead width afterward.
+            //
+            // Combined-fit guard (Aug 2026): mirrors generateOpen()'s own joint
+            // min_terminal_span/draw_terminals guard (see that function's comment) — on a
+            // short Miter arc, drawing both Terminals unconditionally let them walk past each
+            // other and overlap. Suppress both together when they wouldn't fit, falling back
+            // to a plain walk instead (same fallback the buried-middle-Wall case below uses).
+            const double min_terminal_span = (stringer_W + stringer_R1) * w_d * 2.0 + w_d;
+            if (s_end >= min_terminal_span)
             {
-                const size_t start1 = wall_line.junctions_.size();
-                appendTerminal(wall_line, 0.0, +1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/true);
-                for (size_t i = start1; i < wall_line.junctions_.size(); i++)
-                    wall_line.junctions_[i].w_ = wd.width;
+                {
+                    const size_t start1 = wall_line.junctions_.size();
+                    appendTerminal(wall_line, 0.0, +1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/true);
+                    for (size_t i = start1; i < wall_line.junctions_.size(); i++)
+                        wall_line.junctions_[i].w_ = wd.width;
+                }
+                appendPolySegment(wall_line, arc_w, stringer_W * w_d, s_end - stringer_R1 * w_d, wd.width, wall_line.empty());
+                {
+                    const size_t start2 = wall_line.junctions_.size();
+                    appendTerminal(wall_line, s_end, -1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/false);
+                    for (size_t i = start2; i < wall_line.junctions_.size(); i++)
+                        wall_line.junctions_[i].w_ = wd.width;
+                }
             }
-            appendPolySegment(wall_line, arc_w, stringer_W * w_d, s_end - stringer_R1 * w_d, wd.width, wall_line.empty());
+            else
             {
-                const size_t start2 = wall_line.junctions_.size();
-                appendTerminal(wall_line, s_end, -1.0, arc_w, centroid, w, stringer_D, stringer_R1, stringer_R2, stringer_W, /*reversed=*/false);
-                for (size_t i = start2; i < wall_line.junctions_.size(); i++)
-                    wall_line.junctions_[i].w_ = wd.width;
+                appendPolySegment(wall_line, arc_w, 0.0, s_end, wd.width, /*add_start=*/true);
             }
         }
         else if (is_innermost && ! flare_anchors.empty())

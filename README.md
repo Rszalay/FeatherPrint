@@ -15,7 +15,7 @@ Instead of conventional infill, FeatherPrint produces a single-wall skin reinfor
 
 ## Installation
 
-1. Download **FeatherPrint-0.7.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
+1. Download **FeatherPrint-0.8.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
 2. Run the installer as Administrator
 3. The installer will detect your Cura 5.13.x installation, back up the original engine files, and deploy FeatherPrint
 
@@ -60,10 +60,8 @@ FeatherPrint is an early work-in-progress. The following features are currently 
 - **Punchout** *(opt-in)* — a support line + terminal printed into a hole in the model's side wall, so the hole's eventual flat-topped closure has something to rest on; its shape lofts between the real wall contours immediately below and above the hole (Contour Matching) rather than staying a plain straight chord
 - **Interior Opening Carry-Through** — holes in a top- or bottom-facing horizontal surface are correctly left open in the top/bottom skin fill, including holes with little or no vertical depth (down to a hole flush with the build plate itself), rather than silently printed over
 - **Former / Gusset / Cuff** — symmetric wall-stack bands, flush with the outer skin, generated at each synchronized stringer helix crossing (Lacing) for transverse bracing; Gusset integrates the crossing stringer into the band, and Cuff resolves a band meeting an open mesh boundary edge. **Former Spacing** lets you skip crossings (e.g. every other one) to trade stiffness for mass.
-
-The following features are planned but not yet implemented:
-
-- Collar (Flange-style reinforcement at every Whip Terminal)
+- **Collar / Placket** — a Former-style reinforcement band at every Whip Terminal (both ends of every hole/slot, and the model's own top/bottom where no Flange is present); Placket resolves a Collar band's own taper meeting an open mesh boundary edge, the same way Cuff does for Former.
+- **Shelf** — a row of small support loops printed at a hole's own topmost Layer, wherever Punchout and Collar are both active, so the upper Collar band above the hole has something to build on instead of printing directly over open air.
 
 Curvature-Weighted Stringer Density (adaptive stringer spacing based on local surface curvature) was implemented and tested but is currently **disabled** pending a more reliable curvature estimation method; stringers use uniform arc-length spacing in the meantime.
 
