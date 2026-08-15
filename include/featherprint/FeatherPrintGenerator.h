@@ -536,12 +536,14 @@ private:
     // when there are 2 or fewer Walls (no middle Walls to reorder around).
     static int flangePrintInsetIdx(int wi, int n_walls);
 
-    // Approximates a perpendicular polygon offset by moving each point radially toward/away
-    // from the centroid by `offset` (inward positive) — consistent with the same
-    // radial-from-centroid approximation the Conformal Placement Transform already uses
-    // everywhere else, and the only practical option for offsetting an OPEN polyline (Clipper
-    // offsetting is only defined for closed Shapes).
-    static OpenPolyline radialOffsetOpen(const OpenPolyline& poly, const Point2LL& centroid, coord_t offset);
+    // Perpendicular offset of an open polyline, point by point, along EACH point's own local
+    // inward normal (resolveFrame's smoothed-tangent-window + global-winding normal) rather than
+    // toward a single Layer-wide centroid -- see resolveFrame's own doc comment for why the
+    // radial-toward-centroid approximation this replaces (Aug 2026) breaks down on an elongated
+    // or off-axis hole, letting Wall material extend into the hole instead of retreating into
+    // solid material. arc must already be built from `poly` (buildArcParamOpen(poly)) -- callers
+    // already have this in scope for other purposes and should reuse it, not rebuild it.
+    static OpenPolyline normalOffsetOpen(const ArcParam& arc, const Point2LL& centroid, coord_t offset, coord_t w);
 
     static void appendPolySegment(ExtrusionLine& line, const ArcParam& arc,
                                   double s0, double s1, coord_t w, bool add_start);

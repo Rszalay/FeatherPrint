@@ -1141,6 +1141,11 @@ std::vector<Point2LL> fpSampleHoleBoundaryContour(const SliceLayer& layer, const
 // index-arithmetic spreading, identical either way.
 void fpSpreadRampFromPeaks(const std::vector<LayerIndex>& peaks, int n_ramp, size_t mesh_layer_count, std::vector<int>& ramp_table)
 {
+    // Defensive clamp (Aug 2026): mesh_layer_count is threaded in separately from ramp_table's
+    // own size rather than derived from it, so a caller-side mismatch (ramp_table sized/assigned
+    // against a different count than the one passed here) would otherwise index past the vector's
+    // real bounds -- trust whichever is smaller so this can never read/write out of bounds.
+    mesh_layer_count = std::min(mesh_layer_count, ramp_table.size());
     for (LayerIndex peak : peaks)
     {
         for (int o = 0; o <= n_ramp; o++)
@@ -1163,6 +1168,8 @@ void fpSpreadRampFromPeaks(const std::vector<LayerIndex>& peaks, int n_ramp, siz
 // finding maximal runs here is sufficient without re-deriving band identity another way.
 void fpDeleteBandsWhereBlocked(std::vector<int>& ramp_table, size_t mesh_layer_count, const std::function<bool(size_t)>& blocked)
 {
+    // Defensive clamp (Aug 2026) -- see fpSpreadRampFromPeaks's own identical clamp for why.
+    mesh_layer_count = std::min(mesh_layer_count, ramp_table.size());
     size_t li = 0;
     while (li < mesh_layer_count)
     {
@@ -1567,7 +1574,11 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                     break;
                 }
             }
-            if (mesh.settings.get<bool>("featherprint_flange_enabled") && flange_last_geom >= 0)
+            // Belt-and-suspenders (Aug 2026) -- see the identical check/comment on Former's own
+            // detection pre-pass, above, for why this is explicit and local rather than relying
+            // solely on the outer infill_pattern gate.
+            if (mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT
+                && mesh.settings.get<bool>("featherprint_flange_enabled") && flange_last_geom >= 0)
             {
                 mesh.fp_flange_start_layer = static_cast<LayerIndex>(
                     std::max(LayerIndex(0), flange_last_geom - static_cast<LayerIndex>(n_flange) + 1));
@@ -1699,7 +1710,14 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
         {
             mesh.fp_former_ramp.assign(mesh_layer_count, -1);
 
-            if (mesh.settings.get<bool>("featherprint_former_enabled"))
+            // Belt-and-suspenders (Aug 2026): this whole pre-pass already only runs inside the
+            // outer infill_pattern == FEATHERPRINT gate, but featherprint_former_enabled's own
+            // "enabled" condition in fdmprinter.def.json only greys the control out in Cura's
+            // UI -- it does not clear the setting's own stored value -- so require FeatherPrint
+            // to genuinely be the active infill pattern here too, explicitly and locally, rather
+            // than relying solely on the outer gate.
+            if (mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT
+                && mesh.settings.get<bool>("featherprint_former_enabled"))
             {
                 const int n_ramp = mesh.settings.get<int>("featherprint_former_ramp_layers");
                 const coord_t former_w = mesh.settings.get<coord_t>("featherprint_line_width");
@@ -1990,7 +2008,11 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
     {
         mesh.fp_collar_ramp.assign(mesh_layer_count, -1);
 
-        if (mesh.settings.get<bool>("featherprint_collar_enabled"))
+        // Belt-and-suspenders (Aug 2026) -- see the identical check/comment on Former's own
+        // detection pre-pass, above, for why this is explicit and local rather than relying
+        // solely on the outer infill_pattern gate.
+        if (mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::FEATHERPRINT
+            && mesh.settings.get<bool>("featherprint_collar_enabled"))
         {
             const int n_ramp = mesh.settings.get<int>("featherprint_collar_layers");
 
@@ -2034,7 +2056,7 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
 
         const std::vector<int>& collar_ramp = mesh.fp_collar_ramp; // captured by reference below
         auto blocks_former = [&collar_ramp, in_flange_zone](size_t li)
-        { return in_flange_zone(li) || collar_ramp[li] >= 0; };
+        { return in_flange_zone(li) || (li < collar_ramp.size() && collar_ramp[li] >= 0); };
         fpDeleteBandsWhereBlocked(mesh.fp_former_ramp, mesh_layer_count, blocks_former);
     }
 

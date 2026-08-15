@@ -884,23 +884,16 @@ int FeatherPrintGenerator::flangePrintInsetIdx(int wi, int n_walls)
     return wi + 1;                       // buried middle Walls: earliest, order among themselves doesn't matter
 }
 
-OpenPolyline FeatherPrintGenerator::radialOffsetOpen(const OpenPolyline& poly, const Point2LL& centroid, coord_t offset)
+OpenPolyline FeatherPrintGenerator::normalOffsetOpen(const ArcParam& arc, const Point2LL& centroid, coord_t offset, coord_t w)
 {
     OpenPolyline result;
-    for (const Point2LL& p : poly)
+    const double offset_d = static_cast<double>(offset);
+    for (double s : arc.cum_len)
     {
-        double dx = static_cast<double>(p.X - centroid.X);
-        double dy = static_cast<double>(p.Y - centroid.Y);
-        double R = std::sqrt(dx * dx + dy * dy);
-        if (R < 1.0)
-        {
-            result.push_back(p);
-            continue;
-        }
-        double scale = (R - static_cast<double>(offset)) / R;
+        const TangentFrame tf = resolveFrame(arc, centroid, s, w);
         result.push_back(Point2LL(
-            centroid.X + static_cast<coord_t>(dx * scale),
-            centroid.Y + static_cast<coord_t>(dy * scale)));
+            tf.S.X + static_cast<coord_t>(std::llround(tf.nx * offset_d)),
+            tf.S.Y + static_cast<coord_t>(std::llround(tf.ny * offset_d))));
     }
     return result;
 }
@@ -1431,7 +1424,7 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
             }
         }
 
-        OpenPolyline inner_poly = radialOffsetOpen(open_poly, centroid, wd_inner_layer.offset);
+        OpenPolyline inner_poly = normalOffsetOpen(arc_oml, centroid, wd_inner_layer.offset, w);
         if (inner_poly.size() >= 2)
         {
             ArcParam arc_inner = buildArcParamOpen(inner_poly);
@@ -1482,7 +1475,7 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
         const bool is_outer = (wi == 0);
         const bool is_innermost = (wi == n_walls - 1);
 
-        OpenPolyline offset_poly = radialOffsetOpen(open_poly, centroid, wd.offset);
+        OpenPolyline offset_poly = normalOffsetOpen(arc_oml, centroid, wd.offset, w);
         if (offset_poly.size() < 2) continue;
 
         ArcParam arc_w = buildArcParamOpen(offset_poly);
@@ -1648,7 +1641,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
             }
         }
 
-        OpenPolyline inner_poly = radialOffsetOpen(open_poly, centroid, wd_inner_layer.offset);
+        OpenPolyline inner_poly = normalOffsetOpen(arc_oml, centroid, wd_inner_layer.offset, w);
         if (inner_poly.size() >= 2)
         {
             ArcParam arc_inner = buildArcParamOpen(inner_poly);
@@ -1699,7 +1692,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
         const bool is_outer = (wi == 0);
         const bool is_innermost = (wi == n_walls - 1);
 
-        OpenPolyline offset_poly = radialOffsetOpen(open_poly, centroid, wd.offset);
+        OpenPolyline offset_poly = normalOffsetOpen(arc_oml, centroid, wd.offset, w);
         if (offset_poly.size() < 2) continue;
 
         ArcParam arc_w = buildArcParamOpen(offset_poly);
@@ -2450,9 +2443,8 @@ VariableWidthLines FeatherPrintGenerator::generate(
 // ============================================================================
 //
 // R1,R2 match Stringer's (passed in). Point Table (+Y inward): Start(R1,0) P1(0,R1)
-//   P2(0,D-R2) P3(R2,D) P4(W-R2,D) P5(W,D-R2) End(W,0) — End.y taken as 0, reading the WIP
-//   doc's literal "Lw/2" as a transcription slip: y=0 is what returns the path to the
-//   perimeter, matching Start's y=0 and the older spec's "returns to the perimeter surface."
+//   P2(0,D-R2) P3(R2,D) P4(W-R2,D) P5(W,D-R2) End(W,Lw/2) — End.y = 0.5 in w-units, per Spec
+//   REV 2.0: the return point lands near, not exactly on, the perimeter (see Line3, below).
 //   Centres: C1(R1,R1) C2(R2,D-R2) C3(W-R2,D-R2).
 // Path: Arc1 Start->P1 R1 CW c=C1; Line1 P1->P2; Arc2 P2->P3 R2 CW c=C2;
 //       Line2 P3->P4 (splay_L widens this span); Arc3 P4->P5 R2 CW c=C3; Line3 P5->End.
@@ -2600,9 +2592,9 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
     }
 
     // Terminal–stringer collision detection (Splay feature).
-    // Any stringer within 4w of an endpoint is too close for the standard Terminal loop
+    // Any stringer within 3w of an endpoint is too close for the standard Terminal loop
     // to fit. Rather than suppressing the terminal, we widen it with the Splay insertion
-    // (a horizontal segment of length L·w at the loop bottom, L = max(0, d/w - 2)).
+    // (a horizontal segment of length L·w at the loop bottom, L = max(0, d/w - 1)).
     // The stringer trace itself is still suppressed (skip=true) because it is geometrically
     // subsumed by the widened terminal.
     bool draw_start_terminal = (s_end >= 2.0 * w_d);
