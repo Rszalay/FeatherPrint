@@ -417,7 +417,7 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             if (is_flange_layer)
             {
                 const int ramp_index = static_cast<int>(layer_nr_ - fp_flange_start_layer_);
-                wl = fp.generateFlangeOpen(arcs[ai].poly, layer->printZ, settings_, ramp_index, fp_helix_phase_, params);
+                wl = fp.generateFlangeOpen(arcs[ai].poly, layer->printZ, settings_, ramp_index, fp_helix_phase_, params, static_cast<int>(layer_nr_));
             }
             else if (is_collar_layer)
             {
@@ -428,11 +428,11 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
                 // "decreasing Wall count through the taper" Placket describes falls out for
                 // free from fp_collar_ramp_ shrinking Layer by Layer as the pre-pass's own
                 // ramp moves further into the boundary's open span — no extra code needed.
-                wl = fp.generateFormerOpen(arcs[ai].poly, layer->printZ, settings_, fp_collar_ramp_, fp_helix_phase_, params);
+                wl = fp.generateFormerOpen(arcs[ai].poly, layer->printZ, settings_, fp_collar_ramp_, fp_helix_phase_, params, static_cast<int>(layer_nr_));
             }
             else if (is_former_layer)
             {
-                wl = fp.generateFormerOpen(arcs[ai].poly, layer->printZ, settings_, fp_former_ramp_, fp_helix_phase_, params);
+                wl = fp.generateFormerOpen(arcs[ai].poly, layer->printZ, settings_, fp_former_ramp_, fp_helix_phase_, params, static_cast<int>(layer_nr_));
             }
             else
             {

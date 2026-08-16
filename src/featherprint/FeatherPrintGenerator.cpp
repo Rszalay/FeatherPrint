@@ -8,6 +8,7 @@
 #include <numbers>
 
 #include "utils/AABB.h"
+#include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
 namespace cura
@@ -1398,6 +1399,254 @@ VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, c
     return result;
 }
 
+// ============================================================================
+// Collision Pruning (Spec REV 4.5) Part 2 — signed-area self-intersection pruning for open-arc
+// Wall stacks (generateFormerOpen()/generateFlangeOpen())
+// ============================================================================
+//
+// Former/Flange/Collar Walls offset inward from the OML with nothing bounding how deep that
+// offset can go. At a thin neck (narrower than twice a Wall's own offset), the naive per-point
+// offset (normalOffsetOpen()) produces a candidate path that folds back on itself; the folded-
+// back region is a genuine, substantial NEGATIVE (reversed-winding) area within the Wall's own
+// self-intersecting polygon -- not a small toolpath artifact. Detection and classification both
+// operate on the actual candidate polyline: find where it crosses (or runs collinear with) itself,
+// then classify each candidate loop by its own signed area relative to the Wall's overall
+// winding direction. Opposite winding, non-negligible magnitude = genuine excess material, prune
+// it. Same winding = a valid nested sub-loop (e.g. a far lobe's own valid Wall material,
+// disconnected from the near lobe by the neck) -- keep it, but as its own separate ring, since
+// the neck is too thin for one continuous Wall to span both lobes.
+namespace
+{
+
+// Endpoint-exclusive segment/segment intersection (A->B vs C->D). Returns the crossing point.
+bool segSegIntersectOpen(const Point2LL& A, const Point2LL& B, const Point2LL& C, const Point2LL& D, Point2LL& p_out)
+{
+    const double ax = static_cast<double>(A.X), ay = static_cast<double>(A.Y);
+    const double bx = static_cast<double>(B.X), by = static_cast<double>(B.Y);
+    const double cx = static_cast<double>(C.X), cy = static_cast<double>(C.Y);
+    const double dx = static_cast<double>(D.X), dy = static_cast<double>(D.Y);
+    const double rx = bx - ax, ry = by - ay;
+    const double sx = dx - cx, sy = dy - cy;
+    const double denom = rx * sy - ry * sx;
+    if (std::abs(denom) < 1e-9)
+        return false;
+    const double t = ((cx - ax) * sy - (cy - ay) * sx) / denom;
+    const double u = ((cx - ax) * ry - (cy - ay) * rx) / denom;
+    if (t < 1e-6 || t > 1.0 - 1e-6 || u < 1e-6 || u > 1.0 - 1e-6)
+        return false;
+    p_out = Point2LL(static_cast<coord_t>(std::lround(ax + t * rx)), static_cast<coord_t>(std::lround(ay + t * ry)));
+    return true;
+}
+
+// Detects a collinear (parallel or anti-parallel) overlap between segments A->B and C->D within
+// a tight lateral tolerance -- needed because a genuine fold at a symmetric/axis-aligned neck can
+// land two doubled segments exactly collinear, touching without ever crossing transversally
+// (confirmed in the 16 Aug analysis on a synthetic axis-aligned test piece; real, organically
+// curved model geometry generally produces ordinary transversal crossings instead, but this
+// closes the gap rather than leaving it to chance). On success, returns the two points bounding
+// the overlap interval, expressed along A->B's own parameterization.
+bool collinearOverlap(const Point2LL& A, const Point2LL& B, const Point2LL& C, const Point2LL& D, Point2LL& p_start, Point2LL& p_end)
+{
+    const double abx = static_cast<double>(B.X - A.X), aby = static_cast<double>(B.Y - A.Y);
+    const double ab_len = std::hypot(abx, aby);
+    if (ab_len < 1e-6)
+        return false;
+    const double ux = abx / ab_len, uy = aby / ab_len;
+
+    const double cdx = static_cast<double>(D.X - C.X), cdy = static_cast<double>(D.Y - C.Y);
+    const double cd_len = std::hypot(cdx, cdy);
+    if (cd_len < 1e-6)
+        return false;
+    const double vx = cdx / cd_len, vy = cdy / cd_len;
+
+    if (std::abs(ux * vx + uy * vy) < 0.999)
+        return false; // not parallel or anti-parallel enough
+
+    const double acx = static_cast<double>(C.X - A.X), acy = static_cast<double>(C.Y - A.Y);
+    const double lateral = std::abs(acx * uy - acy * ux);
+    constexpr double kLateralToleranceUm = 1.0; // coord_t is already in microns
+    if (lateral > kLateralToleranceUm)
+        return false;
+
+    const double tC = acx * ux + acy * uy;
+    const double adx = static_cast<double>(D.X - A.X), ady = static_cast<double>(D.Y - A.Y);
+    const double tD = adx * ux + ady * uy;
+    const double lo = std::max(0.0, std::min(tC, tD));
+    const double hi = std::min(ab_len, std::max(tC, tD));
+    if (hi - lo < 1e-3)
+        return false; // no real overlap
+
+    p_start = Point2LL(A.X + static_cast<coord_t>(std::lround(ux * lo)), A.Y + static_cast<coord_t>(std::lround(uy * lo)));
+    p_end = Point2LL(A.X + static_cast<coord_t>(std::lround(ux * hi)), A.Y + static_cast<coord_t>(std::lround(uy * hi)));
+    return true;
+}
+
+// Shoelace signed area (twice the true area; sign gives winding direction) of a closed point
+// sequence, wrapping the last point back to the first.
+double signedAreaX2(const std::vector<Point2LL>& poly)
+{
+    double area2 = 0.0;
+    const int m = static_cast<int>(poly.size());
+    for (int a = 0; a < m; a++)
+    {
+        const int b = (a + 1) % m;
+        area2 += static_cast<double>(poly[a].X) * static_cast<double>(poly[b].Y) - static_cast<double>(poly[b].X) * static_cast<double>(poly[a].Y);
+    }
+    return area2;
+}
+
+struct SelfEvent
+{
+    int i, k; // bounding segment indices, i+2 <= k (non-adjacent)
+    Point2LL p_entry, p_exit; // p_entry == p_exit for a transversal crossing
+};
+
+std::vector<SelfEvent> findSelfEvents(const std::vector<Point2LL>& pts)
+{
+    std::vector<SelfEvent> events;
+    const int n = static_cast<int>(pts.size());
+    if (n < 4)
+        return events;
+    for (int i = 0; i < n - 1; i++)
+    {
+        for (int k = i + 2; k < n - 1; k++)
+        {
+            Point2LL X;
+            if (segSegIntersectOpen(pts[i], pts[i + 1], pts[k], pts[k + 1], X))
+            {
+                events.push_back({ i, k, X, X });
+                continue;
+            }
+            Point2LL p_start, p_end;
+            if (collinearOverlap(pts[i], pts[i + 1], pts[k], pts[k + 1], p_start, p_end))
+                events.push_back({ i, k, p_start, p_end });
+        }
+    }
+    return events;
+}
+
+// Innermost-first, then smallest-span: an event whose span contains no other event's own
+// bounding index strictly inside it sorts first. Picking a containing (outer) event before the
+// nested one it contains would classify the whole combined region by the wrong signed area --
+// the specific failure mode the 16 Aug analysis identified in earlier redundancy-test attempts.
+void sortInnermostFirst(std::vector<SelfEvent>& events)
+{
+    std::sort(events.begin(), events.end(), [&events](const SelfEvent& a, const SelfEvent& b)
+    {
+        auto containsOther = [&events](const SelfEvent& e)
+        {
+            for (const SelfEvent& o : events)
+            {
+                if (&o == &e)
+                    continue;
+                if ((o.i > e.i && o.i < e.k) || (o.k > e.i && o.k < e.k))
+                    return true;
+            }
+            return false;
+        };
+        const bool a_contains = containsOther(a);
+        const bool b_contains = containsOther(b);
+        if (a_contains != b_contains)
+            return ! a_contains;
+        return (a.k - a.i) < (b.k - b.i);
+    });
+}
+
+} // namespace
+
+FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w, const char* diag_tag)
+{
+    std::vector<Point2LL> pts = pts_in;
+    std::vector<std::vector<Point2LL>> extra_rings;
+    const double w_d = static_cast<double>(w);
+    const double floor_area2 = 2.0 * (2.0 * w_d) * (2.0 * w_d); // (2w)^2-scale noise floor, not a size judgment
+    const double parent_sign = ccw_ref ? 1.0 : -1.0;
+
+    constexpr int kMaxPasses = 32;
+    for (int pass = 0; pass < kMaxPasses; pass++)
+    {
+        std::vector<SelfEvent> events = findSelfEvents(pts);
+        if (events.empty())
+        {
+            if (diag_tag && pass == 0) spdlog::info("FP-DIAG SelfArea {} n={} events=0", diag_tag, static_cast<int>(pts.size()));
+            break;
+        }
+        sortInnermostFirst(events);
+
+        bool acted = false;
+        for (const SelfEvent& ev : events)
+        {
+            std::vector<Point2LL> loop;
+            loop.push_back(ev.p_entry);
+            for (int m = ev.i + 1; m <= ev.k; m++)
+                loop.push_back(pts[m]);
+            loop.push_back(ev.p_exit);
+            if (loop.size() < 3)
+                continue;
+            const double area2 = signedAreaX2(loop);
+            const bool is_tangency = ev.p_entry.X != ev.p_exit.X || ev.p_entry.Y != ev.p_exit.Y;
+            if (diag_tag && pass == 0 && (&ev - &events[0]) < 12)
+                spdlog::info("FP-DIAG SelfArea {} pass={} cand i={} k={} {} area2={:.0f} floor2={:.0f} {}", diag_tag, pass, ev.i, ev.k,
+                    is_tangency ? "tangency" : "crossing", area2, floor_area2, (std::abs(area2) < floor_area2) ? "noise" : ((area2 >= 0.0) == (parent_sign >= 0.0) ? "extract" : "prune"));
+            if (std::abs(area2) < floor_area2)
+                continue; // noise/tangency scale -- leave this pair's geometry untouched, try the next candidate
+
+            const double loop_sign = area2 >= 0.0 ? 1.0 : -1.0;
+            const int n = static_cast<int>(pts.size());
+            const bool distinct_endpoints = is_tangency;
+
+            if (loop_sign != parent_sign)
+            {
+                // Reversed winding: genuine excess material -- discard the loop, reconnect
+                // directly at the crossing point(s).
+                std::vector<Point2LL> next;
+                next.reserve(n);
+                for (int m = 0; m <= ev.i; m++)
+                    next.push_back(pts[m]);
+                next.push_back(ev.p_entry);
+                if (distinct_endpoints)
+                    next.push_back(ev.p_exit);
+                for (int m = ev.k + 1; m < n; m++)
+                    next.push_back(pts[m]);
+                pts = std::move(next);
+            }
+            else
+            {
+                // Same winding: a valid nested sub-loop (e.g. a far lobe's own Wall material) --
+                // extract it as its own closed ring rather than discarding it; the neck is too
+                // thin for one continuous Wall to reach both sides.
+                std::vector<Point2LL> ring;
+                ring.push_back(ev.p_entry);
+                for (int m = ev.i + 1; m <= ev.k; m++)
+                    ring.push_back(pts[m]);
+                if (distinct_endpoints)
+                    ring.push_back(ev.p_exit);
+                extra_rings.push_back(std::move(ring));
+
+                std::vector<Point2LL> next;
+                next.reserve(n);
+                for (int m = 0; m <= ev.i; m++)
+                    next.push_back(pts[m]);
+                next.push_back(ev.p_entry);
+                if (distinct_endpoints)
+                    next.push_back(ev.p_exit);
+                for (int m = ev.k + 1; m < n; m++)
+                    next.push_back(pts[m]);
+                pts = std::move(next);
+            }
+            acted = true;
+            break;
+        }
+        if (! acted)
+            break; // every remaining event is noise-scale -- done
+    }
+
+    if (diag_tag)
+        spdlog::info("FP-DIAG SelfArea {} done n_in={} n_out={} extra_rings={}", diag_tag, static_cast<int>(pts_in.size()), static_cast<int>(pts.size()), static_cast<int>(extra_rings.size()));
+
+    return { std::move(pts), std::move(extra_rings) };
+}
+
 // Former's own open-manifold case (Cuff, Spec REV 3.6) — near-duplicate of
 // generateFlangeOpen() for the same reasons generateFormer() duplicates generateFlange():
 // Cuff is mechanically identical to Miter (outer Wall gets an ordinary Whip Terminal at each
@@ -1407,7 +1656,7 @@ VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, c
 // buildFormerWallStack.
 VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
     const OpenPolyline& open_poly, coord_t z, const Settings& settings,
-    int ramp_position, double helix_phase, const OpenLayerParams& params)
+    int ramp_position, double helix_phase, const OpenLayerParams& params, int diag_layer_nr)
 {
     (void)z;
     if (open_poly.size() < 2)
@@ -1544,6 +1793,39 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
         OpenPolyline offset_poly = normalOffsetOpen(arc_oml, centroid, wd.offset, w);
         if (offset_poly.size() < 2) continue;
 
+        // Collision Pruning (Spec REV 4.5) Part 2 -- the outer (wi==0) Wall sits at OML depth
+        // and cannot geometrically produce a genuine reversed loop (that requires reach past
+        // the medial axis -- a section thinner than about a line width, which the Skin itself
+        // already fails before this Wall could); skip it, matching the same exclusion and
+        // rationale the 15 Aug session's Skin-crossing pass already established for this Wall.
+        if (! is_outer)
+        {
+            std::vector<Point2LL> raw_pts(offset_poly.begin(), offset_poly.end());
+            const std::string diag_tag = fmt::format("FormerOpen layer={} ramp={} wi={}/{} offset={}", diag_layer_nr, ramp_position, wi, n_walls, wd.offset);
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w, diag_tag.c_str());
+            offset_poly = OpenPolyline();
+            for (const Point2LL& p : pr.main_line)
+                offset_poly.push_back(p);
+            for (auto& ring : pr.extra_rings)
+            {
+                if (ring.size() < 3)
+                    continue;
+                Polygon ring_poly;
+                for (const Point2LL& p : ring)
+                    ring_poly.push_back(p);
+                ArcParam ring_ap = buildArcParam(ring_poly);
+                if (ring_ap.total < 1.0)
+                    continue;
+                ExtrusionLine ring_line(flangePrintInsetIdx(wi, n_walls), /*is_odd=*/false, /*is_closed=*/true);
+                appendPolySegment(ring_line, ring_ap, 0.0, ring_ap.total, wd.width, /*add_start=*/true);
+                if (! ring_line.empty())
+                    ring_line.junctions_.push_back(ring_line.junctions_.front());
+                if (ring_line.size() >= 2)
+                    result.push_back(std::move(ring_line));
+            }
+        }
+        if (offset_poly.size() < 2) continue;
+
         ArcParam arc_w = buildArcParamOpen(offset_poly);
         const double s_end = arc_w.total;
         if (s_end < 2.0 * w_d) continue;
@@ -1628,7 +1910,7 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
 // this arc's own (linear, non-wrapping) arc-length parameterization.
 VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
     const OpenPolyline& open_poly, coord_t z, const Settings& settings,
-    int ramp_index, double helix_phase, const OpenLayerParams& params)
+    int ramp_index, double helix_phase, const OpenLayerParams& params, int diag_layer_nr)
 {
     (void)z;
     if (open_poly.size() < 2)
@@ -1776,13 +2058,43 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
         OpenPolyline offset_poly = normalOffsetOpen(arc_oml, centroid, wd.offset, w);
         if (offset_poly.size() < 2) continue;
 
+        // Collision Pruning (Spec REV 4.5) Part 2 -- see generateFormerOpen()'s identical block
+        // for the full rationale (including why wi==0 is excluded).
+        if (! is_outer)
+        {
+            std::vector<Point2LL> raw_pts(offset_poly.begin(), offset_poly.end());
+            const std::string diag_tag = fmt::format("FlangeOpen layer={} ramp={} wi={}/{} offset={}", diag_layer_nr, ramp_index, wi, n_walls, wd.offset);
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w, diag_tag.c_str());
+            offset_poly = OpenPolyline();
+            for (const Point2LL& p : pr.main_line)
+                offset_poly.push_back(p);
+            for (auto& ring : pr.extra_rings)
+            {
+                if (ring.size() < 3)
+                    continue;
+                Polygon ring_poly;
+                for (const Point2LL& p : ring)
+                    ring_poly.push_back(p);
+                ArcParam ring_ap = buildArcParam(ring_poly);
+                if (ring_ap.total < 1.0)
+                    continue;
+                ExtrusionLine ring_line(flangePrintInsetIdx(wi, n_walls), /*is_odd=*/false, /*is_closed=*/true);
+                appendPolySegment(ring_line, ring_ap, 0.0, ring_ap.total, wd.width, /*add_start=*/true);
+                if (! ring_line.empty())
+                    ring_line.junctions_.push_back(ring_line.junctions_.front());
+                if (ring_line.size() >= 2)
+                    result.push_back(std::move(ring_line));
+            }
+        }
+        if (offset_poly.size() < 2) continue;
+
         ArcParam arc_w = buildArcParamOpen(offset_poly);
         const double s_end = arc_w.total;
         if (s_end < 2.0 * w_d) continue;
 
         ExtrusionLine wall_line(flangePrintInsetIdx(wi, n_walls), /*is_odd=*/false, /*is_closed=*/false);
 
-        if (is_outer)
+    if (is_outer)
         {
             // Outer Wall: ordinary Whip Terminal at both ends, continuing the same Terminal
             // column as ordinary Whip layers below the Flange (Miter rule).

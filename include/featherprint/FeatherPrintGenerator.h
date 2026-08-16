@@ -162,7 +162,7 @@ public:
      * Does not yet insert Flare Rims (first pass: get the wall-stack + Miter terminal
      * behaviour generating correctly before layering in Stringer/Lacing integration).
      */
-    VariableWidthLines generateFlangeOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_index, double helix_phase, const OpenLayerParams& params);
+    VariableWidthLines generateFlangeOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_index, double helix_phase, const OpenLayerParams& params, int diag_layer_nr = 0);
 
     /*!
      * Former's own Miter-equivalent (Cuff, Spec REV 3.6): mechanically identical to
@@ -182,7 +182,7 @@ public:
      * out for free from `ramp_position` shrinking Layer by Layer as the Collar pre-pass's own
      * ramp tapers — no separate Placket code path exists or is needed.
      */
-    VariableWidthLines generateFormerOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_position, double helix_phase, const OpenLayerParams& params);
+    VariableWidthLines generateFormerOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_position, double helix_phase, const OpenLayerParams& params, int diag_layer_nr = 0);
 
     /*!
      * Generate the Punchout Line + Terminal geometry for one hole-gap on an open-manifold
@@ -574,6 +574,22 @@ private:
     // tentative starting points per the spec, not settled values — flagged for revisiting
     // once tested against real parts.
     static bool isThinSection(const ArcParam& arc, const Point2LL& centroid, double s_anchor, double D, coord_t w);
+
+    // Collision Pruning (Spec REV 4.5) Part 2 — signed-area self-intersection pruning for an
+    // open-arc Wall's own candidate polyline (generateFormerOpen()/generateFlangeOpen()). At a
+    // thin neck the naive per-point offset (normalOffsetOpen()) can fold back on itself; the
+    // folded region is a genuine, substantial negative (reversed-winding) area, not a small
+    // toolpath artifact (see the .cpp definition's own doc comment for the full rationale).
+    // main_line: the pruned candidate path, same two original free ends unless entirely
+    // consumed. extra_rings: zero or more same-winding nested sub-loops (e.g. a far lobe's own
+    // valid Wall material, disconnected from the main path by the neck) that must still be
+    // emitted, just as their own separate closed rings.
+    struct PruneResult
+    {
+        std::vector<Point2LL> main_line;
+        std::vector<std::vector<Point2LL>> extra_rings;
+    };
+    static PruneResult pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w, const char* diag_tag = nullptr);
 
     // Stringer Trace — Spec REV 2.0 (corrected). G=0.5 (fixed default, not user-exposed),
     // R2 = featherprint_stringer_width/2, R1 = R2+G, D = featherprint_feature_depth (shared).
