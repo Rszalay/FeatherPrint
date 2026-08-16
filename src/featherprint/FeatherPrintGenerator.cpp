@@ -8,7 +8,6 @@
 #include <numbers>
 
 #include "utils/AABB.h"
-#include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
 namespace cura
@@ -1071,7 +1070,7 @@ void sortInnermostFirst(std::vector<SelfEvent>& events)
 
 } // namespace
 
-FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w, const char* diag_tag)
+FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w)
 {
     std::vector<Point2LL> pts = pts_in;
     std::vector<std::vector<Point2LL>> extra_rings;
@@ -1084,10 +1083,7 @@ FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersections
     {
         std::vector<SelfEvent> events = findSelfEvents(pts);
         if (events.empty())
-        {
-            if (diag_tag && pass == 0) spdlog::info("FP-DIAG SelfArea {} n={} events=0", diag_tag, static_cast<int>(pts.size()));
             break;
-        }
         sortInnermostFirst(events);
 
         bool acted = false;
@@ -1102,9 +1098,6 @@ FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersections
                 continue;
             const double area2 = signedAreaX2(loop);
             const bool is_tangency = ev.p_entry.X != ev.p_exit.X || ev.p_entry.Y != ev.p_exit.Y;
-            if (diag_tag && pass == 0 && (&ev - &events[0]) < 12)
-                spdlog::info("FP-DIAG SelfArea {} pass={} cand i={} k={} {} area2={:.0f} floor2={:.0f} {}", diag_tag, pass, ev.i, ev.k,
-                    is_tangency ? "tangency" : "crossing", area2, floor_area2, (std::abs(area2) < floor_area2) ? "noise" : ((area2 >= 0.0) == (parent_sign >= 0.0) ? "extract" : "prune"));
             if (std::abs(area2) < floor_area2)
                 continue; // noise/tangency scale -- leave this pair's geometry untouched, try the next candidate
 
@@ -1157,9 +1150,6 @@ FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersections
         if (! acted)
             break; // every remaining event is noise-scale -- done
     }
-
-    if (diag_tag)
-        spdlog::info("FP-DIAG SelfArea {} done n_in={} n_out={} extra_rings={}", diag_tag, static_cast<int>(pts_in.size()), static_cast<int>(pts.size()), static_cast<int>(extra_rings.size()));
 
     return { std::move(pts), std::move(extra_rings) };
 }
@@ -1216,21 +1206,17 @@ std::vector<SkinEvent> findSkinCrossings(const std::vector<Point2LL>& wall_pts, 
 }
 } // namespace
 
-std::vector<Point2LL> FeatherPrintGenerator::pruneAgainstSkinPoints(std::vector<Point2LL> pts, bool wall_closed, const std::vector<Point2LL>& skin_pts, bool skin_closed, const char* diag_tag)
+std::vector<Point2LL> FeatherPrintGenerator::pruneAgainstSkinPoints(std::vector<Point2LL> pts, bool wall_closed, const std::vector<Point2LL>& skin_pts, bool skin_closed)
 {
     if (skin_pts.size() < 2)
         return pts;
 
     constexpr int kMaxPasses = 32;
-    int prunes = 0;
     for (int pass = 0; pass < kMaxPasses; pass++)
     {
         std::vector<SkinEvent> events = findSkinCrossings(pts, wall_closed, skin_pts, skin_closed);
         if (events.size() < 2)
-        {
-            if (diag_tag) spdlog::info("FP-DIAG SkinArea {} n={} events={} prunes={}", diag_tag, static_cast<int>(pts.size()), static_cast<int>(events.size()), prunes);
             break;
-        }
         const SkinEvent& e1 = events[0];
         const SkinEvent& e2 = events[1];
         if (e2.wall_seg <= e1.wall_seg + 1)
@@ -1246,8 +1232,6 @@ std::vector<Point2LL> FeatherPrintGenerator::pruneAgainstSkinPoints(std::vector<
         for (int m = e2.wall_seg + 1; m < n; m++)
             next.push_back(pts[m]);
         pts = std::move(next);
-        prunes++;
-        if (diag_tag) spdlog::info("FP-DIAG SkinArea {} pass={} splice seg={}..{} prunes={}", diag_tag, pass, e1.wall_seg, e2.wall_seg, prunes);
     }
     return pts;
 }
@@ -1456,9 +1440,8 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
         {
             std::vector<Point2LL> raw_pts(poly->begin(), poly->end());
             const bool ccw_ref = poly->area() >= 0.0;
-            const std::string diag_tag = fmt::format("Flange ramp={} wi={}/{} offset={}", ramp_index, wi, n_walls, wd.offset);
-            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, ccw_ref, w, diag_tag.c_str());
-            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/true, skin_pts, /*skin_closed=*/true, diag_tag.c_str());
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, ccw_ref, w);
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/true, skin_pts, /*skin_closed=*/true);
             pruned_poly = Polygon();
             for (const Point2LL& p : pr.main_line)
                 pruned_poly.push_back(p);
@@ -1720,9 +1703,8 @@ VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, c
         {
             std::vector<Point2LL> raw_pts(poly->begin(), poly->end());
             const bool ccw_ref = poly->area() >= 0.0;
-            const std::string diag_tag = fmt::format("Former ramp={} wi={}/{} offset={}", ramp_position, wi, n_walls, wd.offset);
-            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, ccw_ref, w, diag_tag.c_str());
-            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/true, skin_pts, /*skin_closed=*/true, diag_tag.c_str());
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, ccw_ref, w);
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/true, skin_pts, /*skin_closed=*/true);
             pruned_poly = Polygon();
             for (const Point2LL& p : pr.main_line)
                 pruned_poly.push_back(p);
@@ -1813,7 +1795,7 @@ VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, c
 // buildFormerWallStack.
 VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
     const OpenPolyline& open_poly, coord_t z, const Settings& settings,
-    int ramp_position, double helix_phase, const OpenLayerParams& params, int diag_layer_nr)
+    int ramp_position, double helix_phase, const OpenLayerParams& params)
 {
     (void)z;
     if (open_poly.size() < 2)
@@ -1968,9 +1950,8 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
         if (! is_outer)
         {
             std::vector<Point2LL> raw_pts(offset_poly.begin(), offset_poly.end());
-            const std::string diag_tag = fmt::format("FormerOpen layer={} ramp={} wi={}/{} offset={}", diag_layer_nr, ramp_position, wi, n_walls, wd.offset);
-            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w, diag_tag.c_str());
-            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/false, skin_pts, /*skin_closed=*/false, diag_tag.c_str());
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w);
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/false, skin_pts, /*skin_closed=*/false);
             offset_poly = OpenPolyline();
             for (const Point2LL& p : pr.main_line)
                 offset_poly.push_back(p);
@@ -2078,7 +2059,7 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
 // this arc's own (linear, non-wrapping) arc-length parameterization.
 VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
     const OpenPolyline& open_poly, coord_t z, const Settings& settings,
-    int ramp_index, double helix_phase, const OpenLayerParams& params, int diag_layer_nr)
+    int ramp_index, double helix_phase, const OpenLayerParams& params)
 {
     (void)z;
     if (open_poly.size() < 2)
@@ -2239,9 +2220,8 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
         if (! is_outer)
         {
             std::vector<Point2LL> raw_pts(offset_poly.begin(), offset_poly.end());
-            const std::string diag_tag = fmt::format("FlangeOpen layer={} ramp={} wi={}/{} offset={}", diag_layer_nr, ramp_index, wi, n_walls, wd.offset);
-            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w, diag_tag.c_str());
-            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/false, skin_pts, /*skin_closed=*/false, diag_tag.c_str());
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w);
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/false, skin_pts, /*skin_closed=*/false);
             offset_poly = OpenPolyline();
             for (const Point2LL& p : pr.main_line)
                 offset_poly.push_back(p);

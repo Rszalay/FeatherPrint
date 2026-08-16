@@ -162,7 +162,7 @@ public:
      * Does not yet insert Flare Rims (first pass: get the wall-stack + Miter terminal
      * behaviour generating correctly before layering in Stringer/Lacing integration).
      */
-    VariableWidthLines generateFlangeOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_index, double helix_phase, const OpenLayerParams& params, int diag_layer_nr = 0);
+    VariableWidthLines generateFlangeOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_index, double helix_phase, const OpenLayerParams& params);
 
     /*!
      * Former's own Miter-equivalent (Cuff, Spec REV 3.6): mechanically identical to
@@ -182,7 +182,7 @@ public:
      * out for free from `ramp_position` shrinking Layer by Layer as the Collar pre-pass's own
      * ramp tapers — no separate Placket code path exists or is needed.
      */
-    VariableWidthLines generateFormerOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_position, double helix_phase, const OpenLayerParams& params, int diag_layer_nr = 0);
+    VariableWidthLines generateFormerOpen(const OpenPolyline& open_poly, coord_t z, const Settings& settings, int ramp_position, double helix_phase, const OpenLayerParams& params);
 
     /*!
      * Generate the Punchout Line + Terminal geometry for one hole-gap on an open-manifold
@@ -589,7 +589,7 @@ private:
         std::vector<Point2LL> main_line;
         std::vector<std::vector<Point2LL>> extra_rings;
     };
-    static PruneResult pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w, const char* diag_tag = nullptr);
+    static PruneResult pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w);
 
     // Collision Pruning (Spec REV 4.5) Part 3 — Skin-crossing pass. Tests the Wall's own
     // candidate path against a separate reference curve (the plain ordinary Skin ring); any
@@ -599,7 +599,7 @@ private:
     // serve both the closed-ring generators (Polygon Skin) and the open-arc ones (OpenPolyline
     // Skin, built via normalOffsetOpen() like the Walls themselves — never Shape::offset(),
     // which can silently "bridge" across the same thin necks this pass exists to catch).
-    static std::vector<Point2LL> pruneAgainstSkinPoints(std::vector<Point2LL> pts, bool wall_closed, const std::vector<Point2LL>& skin_pts, bool skin_closed, const char* diag_tag = nullptr);
+    static std::vector<Point2LL> pruneAgainstSkinPoints(std::vector<Point2LL> pts, bool wall_closed, const std::vector<Point2LL>& skin_pts, bool skin_closed);
 
     // Stringer Trace — Spec REV 2.0 (corrected). G=0.5 (fixed default, not user-exposed),
     // R2 = featherprint_stringer_width/2, R1 = R2+G, D = featherprint_feature_depth (shared).
