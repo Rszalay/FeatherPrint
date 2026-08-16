@@ -1152,6 +1152,34 @@ VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, c
             wall_line.junctions_.push_back(wall_line.junctions_.front());
         if (wall_line.size() >= 2)
             result.push_back(std::move(wall_line));
+
+        // Collision Pruning (Spec REV 4.5) Part 1: at a thin neck, Shape::offset() can split
+        // this Wall's own output into multiple separate polygons, one per lobe -- largestPoly()
+        // above only ever walks the largest, silently leaving every other lobe with no Wall at
+        // all at this depth. Emit every other surviving component too, as a plain perimeter
+        // walk (no Flare Rim/Gusset -- per-component anchor placement is out of scope for this
+        // pass; a lobe with a Wall and no Gusset is strictly better than getting no Wall at all,
+        // which was the prior behavior). min_component_area is a (2w)^2 noise floor, not a size
+        // judgment about real defects -- it exists only to skip genuine offset slivers.
+        const double min_component_area = (2.0 * static_cast<double>(w)) * (2.0 * static_cast<double>(w));
+        for (const Polygon& other_poly : offset_shape)
+        {
+            if (&other_poly == poly)
+                continue; // primary (largest) component already emitted above
+            if (other_poly.size() < 3 || std::abs(other_poly.area()) < min_component_area)
+                continue;
+
+            ArcParam other_ap = buildArcParam(other_poly);
+            if (other_ap.total < 1.0)
+                continue;
+
+            ExtrusionLine other_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+            appendPolySegment(other_line, other_ap, 0.0, other_ap.total, wd.width, /*add_start=*/true);
+            if (! other_line.empty())
+                other_line.junctions_.push_back(other_line.junctions_.front());
+            if (other_line.size() >= 2)
+                result.push_back(std::move(other_line));
+        }
     }
 
     return result;
@@ -1343,6 +1371,28 @@ VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, c
             wall_line.junctions_.push_back(wall_line.junctions_.front());
         if (wall_line.size() >= 2)
             result.push_back(std::move(wall_line));
+
+        // Collision Pruning (Spec REV 4.5) Part 1 -- see generateFlange()'s identical block for
+        // the full rationale.
+        const double min_component_area = (2.0 * static_cast<double>(w)) * (2.0 * static_cast<double>(w));
+        for (const Polygon& other_poly : offset_shape)
+        {
+            if (&other_poly == poly)
+                continue;
+            if (other_poly.size() < 3 || std::abs(other_poly.area()) < min_component_area)
+                continue;
+
+            ArcParam other_ap = buildArcParam(other_poly);
+            if (other_ap.total < 1.0)
+                continue;
+
+            ExtrusionLine other_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+            appendPolySegment(other_line, other_ap, 0.0, other_ap.total, wd.width, /*add_start=*/true);
+            if (! other_line.empty())
+                other_line.junctions_.push_back(other_line.junctions_.front());
+            if (other_line.size() >= 2)
+                result.push_back(std::move(other_line));
+        }
     }
 
     return result;
