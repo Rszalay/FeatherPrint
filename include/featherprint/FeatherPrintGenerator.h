@@ -591,6 +591,16 @@ private:
     };
     static PruneResult pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w, const char* diag_tag = nullptr);
 
+    // Collision Pruning (Spec REV 4.5) Part 3 — Skin-crossing pass. Tests the Wall's own
+    // candidate path against a separate reference curve (the plain ordinary Skin ring); any
+    // crossing is a genuine defect (no winding/area ambiguity, unlike the self-pass above, since
+    // the Skin is the actual boundary of legitimate local material). Prunes the excursion
+    // between each pair of consecutive crossings. wall_closed/skin_closed let one implementation
+    // serve both the closed-ring generators (Polygon Skin) and the open-arc ones (OpenPolyline
+    // Skin, built via normalOffsetOpen() like the Walls themselves — never Shape::offset(),
+    // which can silently "bridge" across the same thin necks this pass exists to catch).
+    static std::vector<Point2LL> pruneAgainstSkinPoints(std::vector<Point2LL> pts, bool wall_closed, const std::vector<Point2LL>& skin_pts, bool skin_closed, const char* diag_tag = nullptr);
+
     // Stringer Trace — Spec REV 2.0 (corrected). G=0.5 (fixed default, not user-exposed),
     // R2 = featherprint_stringer_width/2, R1 = R2+G, D = featherprint_feature_depth (shared).
     // Point Table: Anchor(0,0) Start(-G,0) P1(R2,R1) P2(R2,D-R2) P3(-R2,D-R2) P4(-R2,R1) End(G,0).

@@ -915,493 +915,10 @@ OpenPolyline FeatherPrintGenerator::normalOffsetOpen(const ArcParam& arc, const 
     return result;
 }
 
-VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase, Point2LL phase_origin, double R_ref)
-{
-    const coord_t w = settings.get<coord_t>("featherprint_line_width");
-
-    std::vector<FlangeWallDesc> walls_outer_first = buildFlangeWallStack(ramp_index, w);
-
-    // Inner-area offset (see innerOffset()'s doc comment): the full Wall-stack depth to the
-    // innermost Wall's own INNER face (offset + half its own width), i.e. the region actually
-    // enclosed by the printed material at this Flange Layer.
-    {
-        const FlangeWallDesc& wd_inner = walls_outer_first.back();
-        inner_offset_ = wd_inner.offset + wd_inner.width / 2;
-    }
-
-    // ---- Compute Stringer/Lacing anchor positions on OML for Flare Rim insertion ----
-    const Polygon* oml_poly = largestPoly(outline);
-    const int N = settings.get<int>("featherprint_stringer_count");
-    // Flare Rim's Width matches the colliding feature's own Width (Spec REV 2.0), not a
-    // fixed literal.
-    const double stringer_flare_W = settings.get<double>("featherprint_stringer_width");
-    const double lacing_flare_W   = settings.get<double>("featherprint_lacing_width");
-
-    // theta/R_oml are evaluated on the OML (per spec, the Flare Rim is anchored there, not on
-    // the innermost wall); s_left/s_right cut the innermost wall's own perimeter walk at the
-    // exact theta the Flare Rim's own two endpoints land on (not an arc-length approximation),
-    // so the ordinary-wall walk and the Flare Rim's first/last emitted points coincide.
-    struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
-    std::vector<FlareAnchor> flare_anchors;
-
-    // Q per the WIP Parametric Canonical Toolpaths doc's Flare Rim table is the "Wall Number".
-    // A plain Wall COUNT under-charges any ramp layer whose stack includes a half-width Wall
-    // (the outer half-wall at ramp 0, or a buried half-wall at even ramp indices >= 2) — e.g.
-    // ramp 2's 3-Wall stack (full+half+full = 2.5w) would score the same Q=3 as ramp 3's
-    // 3-Wall stack (full+full+full = 3.0w), even though ramp 2's stack is only 2.5w thick.
-    // Sum each Wall's own width instead, giving the stack's true thickness in w-units. The
-    // innermost Wall itself is excluded from the sum — oml_shift already anchors Start/End at
-    // the innermost Wall's own centreline, so Q should only cover the Walls OUTSIDE it (already
-    // consumed depth before the Rim's own channel begins); including the innermost Wall's own
-    // width double-counted it, undershooting R1 by one Wall's width.
-    double Q = 0.0;
-    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
-        Q += static_cast<double>(walls_outer_first[wi].width) / static_cast<double>(w);
-    const double flare_D = settings.get<double>("featherprint_feature_depth");
-    const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
-    // Start/End (canonical y=0) must land where the surrounding ordinary innermost-Wall path
-    // actually runs — the innermost Wall's own offset from the OML — not at the OML itself.
-    // The previous version of this shift used the OUTER Wall's (near-zero) offset, which is
-    // only the right correction for arc_oml/oml_poly's own frame vs the true OML centreline;
-    // it left Start/End sitting essentially AT the OML while the ordinary wall_line segments
-    // on either side run at the innermost Wall's real (much deeper) offset, producing a large
-    // spurious jump/zigzag at every Flare anchor instead of a smooth local fillet.
-    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / static_cast<double>(w);
-    // The new single-fillet Flare Rim profile doesn't extend past its declared flat span
-    // W/2 (unlike the old dovetail's r-widened extent) — no extra collision widening needed.
-    const double flare_r = 0.0;
-
-    if (oml_poly && oml_poly->size() >= 3 && N >= 1)
-    {
-        ArcParam arc_oml = buildArcParam(*oml_poly);
-        const Point2LL centroid = centroidBbox(*oml_poly);
-        const double w_d = static_cast<double>(w);
-        const double helix_frac  = std::fmod(helix_phase, 1.0);
-        const double arc_ref     = arc_oml.nearestArcPos(phase_origin);
-        // Phase-lock the curvature-resampling grid to Phase Origin BEFORE buildWarp triggers
-        // ensureResampled -- see ArcParam::resample_phase_s's declaration for why this order
-        // matters (an unlocked grid reintroduces vertex-reindexing instability).
-        arc_oml.resample_phase_s = arc_ref;
-        arc_oml.buildWarp(R_ref); // Curvature-Weighted Stringer Density (REV 2.6); no-op if R_ref <= 0
-        const double arc_oml_total_w = arc_oml.cum_warp.empty() ? arc_oml.total : arc_oml.total_warped;
-        const double origin_w    = arc_oml.toWarped(arc_ref);
-        const double ccw_advance_w = std::fmod(helix_frac * arc_oml_total_w + origin_w, arc_oml_total_w);
-        const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_oml_total_w + arc_oml_total_w, arc_oml_total_w);
-
-        // OML anchor positions, CCW+CW interleaved and sorted by arc position so adjacent
-        // opposite-direction anchors can be tested for a Lacing collision (same pattern as
-        // the main generate() collision pass). Distributed in warped space (REV 2.6), then
-        // inverted back to real arc-length via fromWarped -- everything downstream of this
-        // (collision detection, Flare Rim placement) operates on real s exactly as before.
-        struct OmlAnchor { double s; bool is_cw; bool skip{ false }; int pair_idx{ -1 }; };
-        std::vector<OmlAnchor> oml_anchors;
-        oml_anchors.reserve(2 * N);
-        for (int i = 0; i < N; i++)
-            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + ccw_advance_w, arc_oml_total_w)), false});
-        for (int i = 0; i < N; i++)
-            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + cw_advance_w,  arc_oml_total_w)), true });
-        std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
-
-        // Two Stringer anchors must merge into one Lacing Rim once their *widened* Flare Rim
-        // footprints (each spanning the Stringer's own Flare Rim Width, wider than the plain
-        // 1w Stringer Trace cutout) would physically overlap — not just when the
-        // plain-Trace threshold (w) is crossed. Using the unwidened threshold here left
-        // near-tip layers (small circumference, closely packed anchors) with two separate,
-        // overlapping/crossing Flare Rims instead of one merged Lacing Rim.
-        const double collision_w = stringer_flare_W * w_d;
-
-        const int total_anchors = static_cast<int>(oml_anchors.size());
-        for (int i = 0; i < total_anchors; i++)
-        {
-            for (int j = i + 1; j < total_anchors; j++)
-            {
-                if (oml_anchors[j].s - oml_anchors[i].s > 2.0 * collision_w) break;
-                if (oml_anchors[j].is_cw == oml_anchors[i].is_cw) continue;
-                Point2LL pi = arc_oml.pointAt(oml_anchors[i].s);
-                Point2LL pj = arc_oml.pointAt(oml_anchors[j].s);
-                double dx = static_cast<double>(pi.X - pj.X), dy = static_cast<double>(pi.Y - pj.Y);
-                if (std::sqrt(dx * dx + dy * dy) < collision_w)
-                {
-                    oml_anchors[i].skip = oml_anchors[j].skip = true;
-                    oml_anchors[i].pair_idx = j;
-                    oml_anchors[j].pair_idx = i;
-                }
-            }
-        }
-
-        // Compute innermost wall offset shape so we can project anchors onto it (for the
-        // wall-walk cutout only — the Flare Rim's own geometry is anchored on the OML).
-        const FlangeWallDesc& wd_inner = walls_outer_first.back();
-        Shape inner_shape = Shape(outline).offset(-wd_inner.offset);
-        const Polygon* inner_poly = largestPoly(inner_shape);
-        if (inner_poly && inner_poly->size() >= 3)
-        {
-            ArcParam arc_inner = buildArcParam(*inner_poly);
-
-            auto addAnchor = [&](double s_oml, double x_sign, double W)
-            {
-                Point2LL pt = arc_oml.pointAt(s_oml);
-                double dx = static_cast<double>(pt.X - centroid.X);
-                double dy = static_cast<double>(pt.Y - centroid.Y);
-                double theta = std::atan2(dy, dx);
-                double R_oml = std::sqrt(dx * dx + dy * dy);
-                if (R_oml < 1.0)
-                    return;
-                // Project the Flare Rim's actual left/right endpoints (lx = ∓(W/2+flare_r),
-                // per the transform's angular formula theta = theta_anchor + x_sign*lx*w/R_a)
-                // onto the innermost wall, not just the anchor's own theta — this is what
-                // appendFlareRim will itself emit as its first/last points, so the
-                // ordinary-wall walk must stop exactly there.
-                const double lx_max = W / 2.0 + flare_r;
-                const double theta_l = theta - lx_max * static_cast<double>(w) / R_oml;
-                const double theta_r = theta + lx_max * static_cast<double>(w) / R_oml;
-                double s_l = arcLengthAtAngle(arc_inner, centroid, theta_l);
-                double s_r = arcLengthAtAngle(arc_inner, centroid, theta_r);
-                if (s_l < 0.0 || s_r < 0.0)
-                    return; // anchor doesn't project onto the innermost wall at all
-                flare_anchors.push_back({s_l, s_r, theta, R_oml, x_sign, W});
-            };
-
-            for (int i = 0; i < total_anchors; i++)
-            {
-                const OmlAnchor& oa = oml_anchors[i];
-                if (oa.skip)
-                {
-                    if (oa.pair_idx > i)
-                    {
-                        // Lacing anchor: midpoint between the two colliding Stringer anchors,
-                        // symmetric profile (x_sign=+1), W = the Lacing's own Width setting.
-                        double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
-                        addAnchor(s_mid, 1.0, lacing_flare_W);
-                    }
-                    continue;
-                }
-                // Ordinary Stringer anchor: the Flare Rim's dovetail profile is left-right
-                // symmetric (unlike the ordinary teardrop Trace), so it needs no CW/CCW
-                // mirror — x_sign=-1 would instead reverse the low-s->high-s traversal
-                // direction the wall-walk cutout (s_left/s_right) assumes, stitching it in
-                // backwards for CW anchors. W = the Stringer's own Width setting.
-                addAnchor(oa.s, 1.0, stringer_flare_W);
-            }
-
-            std::sort(flare_anchors.begin(), flare_anchors.end(),
-                [](const FlareAnchor& a, const FlareAnchor& b){ return a.s_left < b.s_left; });
-        }
-    }
-
-    // ---- Emit walls: innermost first (inset_idx = n_walls-1), outermost last (inset_idx = 0) ----
-    const int n_walls = static_cast<int>(walls_outer_first.size());
-    VariableWidthLines result;
-
-    for (int wi = n_walls - 1; wi >= 0; wi--) // inner→outer emission order
-    {
-        const FlangeWallDesc& wd      = walls_outer_first[wi];
-        const int       inset_idx = flangePrintInsetIdx(wi, n_walls);
-        const bool      is_innermost = (wi == n_walls - 1);
-
-        Shape offset_shape = Shape(outline).offset(-wd.offset);
-        if (offset_shape.empty()) continue;
-        const Polygon* poly = largestPoly(offset_shape);
-        if (! poly || poly->size() < 3) continue;
-
-        ArcParam ap = buildArcParam(*poly);
-        if (ap.total < 1.0) continue;
-
-        ExtrusionLine wall_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
-
-        if (is_innermost && ! flare_anchors.empty())
-        {
-            // Flare Rim: innermost-wall perimeter walk with a Flare Rim channel embedded at
-            // each Stringer/Lacing anchor. The channel geometry itself is anchored on the OML
-            // (arc_oml recomputed below) per spec, not on this offset wall's own surface.
-            ArcParam arc_oml = buildArcParam(*oml_poly);
-            const Point2LL centroid = centroidBbox(*oml_poly);
-            double current_s = 0.0;
-            for (const FlareAnchor& fa : flare_anchors)
-            {
-                // Thin-Section Pruning (Spec REV 2.4) — see generate()'s own comment for the
-                // full rationale. Flare's own anchor is angle-based (out of REV 2.2/2.3's
-                // arc-length scope, per spec), so convert to arc-length on arc_oml first, the
-                // same relocation appendFlareRim itself already does internally.
-                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
-                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
-                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
-                    continue; // leave current_s untouched — ordinary wall passes straight through
-
-                double s_depart = fa.s_left;
-                if (s_depart < current_s) s_depart = current_s;
-                appendPolySegment(wall_line, ap, current_s, s_depart, wd.width, wall_line.empty());
-
-                // appendPolySegment above always ends by emitting the true wall-polygon point
-                // at s_depart (unconditionally, regardless of add_start), so the Flare Rim's
-                // own analytically-computed first point must always be skipped — using
-                // wall_line.empty() here (now false, since the call above already pushed
-                // points) skipped nothing and left a duplicate/jog at every rim's entry.
-                appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
-                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
-
-                current_s = std::max(fa.s_right, s_depart);
-            }
-            appendPolySegment(wall_line, ap, current_s, ap.total, wd.width, wall_line.empty());
-        }
-        else
-        {
-            appendPolySegment(wall_line, ap, 0.0, ap.total, wd.width, /*add_start=*/true);
-        }
-
-        if (! wall_line.empty())
-            wall_line.junctions_.push_back(wall_line.junctions_.front());
-        if (wall_line.size() >= 2)
-            result.push_back(std::move(wall_line));
-
-        // Collision Pruning (Spec REV 4.5) Part 1: at a thin neck, Shape::offset() can split
-        // this Wall's own output into multiple separate polygons, one per lobe -- largestPoly()
-        // above only ever walks the largest, silently leaving every other lobe with no Wall at
-        // all at this depth. Emit every other surviving component too, as a plain perimeter
-        // walk (no Flare Rim/Gusset -- per-component anchor placement is out of scope for this
-        // pass; a lobe with a Wall and no Gusset is strictly better than getting no Wall at all,
-        // which was the prior behavior). min_component_area is a (2w)^2 noise floor, not a size
-        // judgment about real defects -- it exists only to skip genuine offset slivers.
-        const double min_component_area = (2.0 * static_cast<double>(w)) * (2.0 * static_cast<double>(w));
-        for (const Polygon& other_poly : offset_shape)
-        {
-            if (&other_poly == poly)
-                continue; // primary (largest) component already emitted above
-            if (other_poly.size() < 3 || std::abs(other_poly.area()) < min_component_area)
-                continue;
-
-            ArcParam other_ap = buildArcParam(other_poly);
-            if (other_ap.total < 1.0)
-                continue;
-
-            ExtrusionLine other_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
-            appendPolySegment(other_line, other_ap, 0.0, other_ap.total, wd.width, /*add_start=*/true);
-            if (! other_line.empty())
-                other_line.junctions_.push_back(other_line.junctions_.front());
-            if (other_line.size() >= 2)
-                result.push_back(std::move(other_line));
-        }
-    }
-
-    return result;
-}
-
 // ============================================================================
-// Former (Spec REV 3.6) — a near-duplicate of generateFlange() by deliberate choice
-// ============================================================================
-//
-// Reuses generateFlange()'s own wall-emission/Gusset(Flare-Rim)-embedding logic essentially
-// verbatim, with buildFlangeWallStack swapped for buildFormerWallStack — the only structural
-// difference is which wall-stack-shape function builds walls_outer_first; everything
-// downstream (Q/oml_shift computation, anchor placement, Flare Rim embedding at the
-// innermost Wall, per-Wall emission order) is identical, since both are pure functions of a
-// {offset,width} Wall list agnostic to how that list was built. Duplicated rather than
-// factored into a shared helper to avoid touching generateFlange()'s own already-tested code
-// path — see this session's plan notes for the explicit risk/safety tradeoff.
-VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, const Settings& settings, int ramp_position, double helix_phase, Point2LL phase_origin, double R_ref)
-{
-    const coord_t w = settings.get<coord_t>("featherprint_line_width");
-
-    std::vector<FlangeWallDesc> walls_outer_first = buildFormerWallStack(ramp_position, w);
-
-    // Inner-area offset: same convention as generateFlange() — full Wall-stack depth to the
-    // innermost Wall's own inner face.
-    {
-        const FlangeWallDesc& wd_inner = walls_outer_first.back();
-        inner_offset_ = wd_inner.offset + wd_inner.width / 2;
-    }
-
-    // ---- Compute Stringer/Lacing anchor positions on the base perimeter for Gusset (Flare
-    // Rim) insertion — "oml_poly" here is Former's own reference frame: the ordinary,
-    // un-thickened perimeter this band grows from, playing the same role Flange's actual OML
-    // plays for Flare. ----
-    const Polygon* oml_poly = largestPoly(outline);
-    const int N = settings.get<int>("featherprint_stringer_count");
-    const double stringer_flare_W = settings.get<double>("featherprint_stringer_width");
-    const double lacing_flare_W   = settings.get<double>("featherprint_lacing_width");
-
-    struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
-    std::vector<FlareAnchor> flare_anchors;
-
-    double Q = 0.0;
-    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
-        Q += static_cast<double>(walls_outer_first[wi].width) / static_cast<double>(w);
-    const double flare_D = settings.get<double>("featherprint_feature_depth");
-    const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
-    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / static_cast<double>(w);
-    const double flare_r = 0.0;
-
-    if (oml_poly && oml_poly->size() >= 3 && N >= 1)
-    {
-        ArcParam arc_oml = buildArcParam(*oml_poly);
-        const Point2LL centroid = centroidBbox(*oml_poly);
-        const double w_d = static_cast<double>(w);
-        const double helix_frac  = std::fmod(helix_phase, 1.0);
-        const double arc_ref     = arc_oml.nearestArcPos(phase_origin);
-        arc_oml.resample_phase_s = arc_ref;
-        arc_oml.buildWarp(R_ref);
-        const double arc_oml_total_w = arc_oml.cum_warp.empty() ? arc_oml.total : arc_oml.total_warped;
-        const double origin_w    = arc_oml.toWarped(arc_ref);
-        const double ccw_advance_w = std::fmod(helix_frac * arc_oml_total_w + origin_w, arc_oml_total_w);
-        const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_oml_total_w + arc_oml_total_w, arc_oml_total_w);
-
-        struct OmlAnchor { double s; bool is_cw; bool skip{ false }; int pair_idx{ -1 }; };
-        std::vector<OmlAnchor> oml_anchors;
-        oml_anchors.reserve(2 * N);
-        for (int i = 0; i < N; i++)
-            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + ccw_advance_w, arc_oml_total_w)), false});
-        for (int i = 0; i < N; i++)
-            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + cw_advance_w,  arc_oml_total_w)), true });
-        std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
-
-        const double collision_w = stringer_flare_W * w_d;
-
-        const int total_anchors = static_cast<int>(oml_anchors.size());
-        for (int i = 0; i < total_anchors; i++)
-        {
-            for (int j = i + 1; j < total_anchors; j++)
-            {
-                if (oml_anchors[j].s - oml_anchors[i].s > 2.0 * collision_w) break;
-                if (oml_anchors[j].is_cw == oml_anchors[i].is_cw) continue;
-                Point2LL pi = arc_oml.pointAt(oml_anchors[i].s);
-                Point2LL pj = arc_oml.pointAt(oml_anchors[j].s);
-                double dx = static_cast<double>(pi.X - pj.X), dy = static_cast<double>(pi.Y - pj.Y);
-                if (std::sqrt(dx * dx + dy * dy) < collision_w)
-                {
-                    oml_anchors[i].skip = oml_anchors[j].skip = true;
-                    oml_anchors[i].pair_idx = j;
-                    oml_anchors[j].pair_idx = i;
-                }
-            }
-        }
-
-        const FlangeWallDesc& wd_inner = walls_outer_first.back();
-        Shape inner_shape = Shape(outline).offset(-wd_inner.offset);
-        const Polygon* inner_poly = largestPoly(inner_shape);
-        if (inner_poly && inner_poly->size() >= 3)
-        {
-            ArcParam arc_inner = buildArcParam(*inner_poly);
-
-            auto addAnchor = [&](double s_oml, double x_sign, double W)
-            {
-                Point2LL pt = arc_oml.pointAt(s_oml);
-                double dx = static_cast<double>(pt.X - centroid.X);
-                double dy = static_cast<double>(pt.Y - centroid.Y);
-                double theta = std::atan2(dy, dx);
-                double R_oml = std::sqrt(dx * dx + dy * dy);
-                if (R_oml < 1.0)
-                    return;
-                const double lx_max = W / 2.0 + flare_r;
-                const double theta_l = theta - lx_max * static_cast<double>(w) / R_oml;
-                const double theta_r = theta + lx_max * static_cast<double>(w) / R_oml;
-                double s_l = arcLengthAtAngle(arc_inner, centroid, theta_l);
-                double s_r = arcLengthAtAngle(arc_inner, centroid, theta_r);
-                if (s_l < 0.0 || s_r < 0.0)
-                    return;
-                flare_anchors.push_back({s_l, s_r, theta, R_oml, x_sign, W});
-            };
-
-            for (int i = 0; i < total_anchors; i++)
-            {
-                const OmlAnchor& oa = oml_anchors[i];
-                if (oa.skip)
-                {
-                    if (oa.pair_idx > i)
-                    {
-                        double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
-                        addAnchor(s_mid, 1.0, lacing_flare_W);
-                    }
-                    continue;
-                }
-                addAnchor(oa.s, 1.0, stringer_flare_W);
-            }
-
-            std::sort(flare_anchors.begin(), flare_anchors.end(),
-                [](const FlareAnchor& a, const FlareAnchor& b){ return a.s_left < b.s_left; });
-        }
-    }
-
-    const int n_walls = static_cast<int>(walls_outer_first.size());
-    VariableWidthLines result;
-
-    for (int wi = n_walls - 1; wi >= 0; wi--)
-    {
-        const FlangeWallDesc& wd      = walls_outer_first[wi];
-        const int       inset_idx = flangePrintInsetIdx(wi, n_walls);
-        const bool      is_innermost = (wi == n_walls - 1);
-
-        Shape offset_shape = Shape(outline).offset(-wd.offset);
-        if (offset_shape.empty()) continue;
-        const Polygon* poly = largestPoly(offset_shape);
-        if (! poly || poly->size() < 3) continue;
-
-        ArcParam ap = buildArcParam(*poly);
-        if (ap.total < 1.0) continue;
-
-        ExtrusionLine wall_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
-
-        if (is_innermost && ! flare_anchors.empty())
-        {
-            ArcParam arc_oml = buildArcParam(*oml_poly);
-            const Point2LL centroid = centroidBbox(*oml_poly);
-            double current_s = 0.0;
-            for (const FlareAnchor& fa : flare_anchors)
-            {
-                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
-                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
-                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
-                    continue;
-
-                double s_depart = fa.s_left;
-                if (s_depart < current_s) s_depart = current_s;
-                appendPolySegment(wall_line, ap, current_s, s_depart, wd.width, wall_line.empty());
-
-                appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
-                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
-
-                current_s = std::max(fa.s_right, s_depart);
-            }
-            appendPolySegment(wall_line, ap, current_s, ap.total, wd.width, wall_line.empty());
-        }
-        else
-        {
-            appendPolySegment(wall_line, ap, 0.0, ap.total, wd.width, /*add_start=*/true);
-        }
-
-        if (! wall_line.empty())
-            wall_line.junctions_.push_back(wall_line.junctions_.front());
-        if (wall_line.size() >= 2)
-            result.push_back(std::move(wall_line));
-
-        // Collision Pruning (Spec REV 4.5) Part 1 -- see generateFlange()'s identical block for
-        // the full rationale.
-        const double min_component_area = (2.0 * static_cast<double>(w)) * (2.0 * static_cast<double>(w));
-        for (const Polygon& other_poly : offset_shape)
-        {
-            if (&other_poly == poly)
-                continue;
-            if (other_poly.size() < 3 || std::abs(other_poly.area()) < min_component_area)
-                continue;
-
-            ArcParam other_ap = buildArcParam(other_poly);
-            if (other_ap.total < 1.0)
-                continue;
-
-            ExtrusionLine other_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
-            appendPolySegment(other_line, other_ap, 0.0, other_ap.total, wd.width, /*add_start=*/true);
-            if (! other_line.empty())
-                other_line.junctions_.push_back(other_line.junctions_.front());
-            if (other_line.size() >= 2)
-                result.push_back(std::move(other_line));
-        }
-    }
-
-    return result;
-}
-
-// ============================================================================
-// Collision Pruning (Spec REV 4.5) Part 2 — signed-area self-intersection pruning for open-arc
-// Wall stacks (generateFormerOpen()/generateFlangeOpen())
+// Collision Pruning (Spec REV 4.5) Part 2 — signed-area self-intersection pruning for Wall
+// stacks (used by generateFlange()/generateFormer() for closed rings and
+// generateFormerOpen()/generateFlangeOpen() for open arcs)
 // ============================================================================
 //
 // Former/Flange/Collar Walls offset inward from the OML with nothing bounding how deep that
@@ -1647,6 +1164,646 @@ FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersections
     return { std::move(pts), std::move(extra_rings) };
 }
 
+// ============================================================================
+// Collision Pruning (Spec REV 4.5) Part 3 — Skin-crossing pass. Tests a Wall's own candidate
+// path against a completely separate reference curve (the plain, ordinary Skin -- the baseline
+// single Wall that would print here without any active Flange/Former/Collar band). Unlike the
+// self-intersection pass above, there is no winding/area ambiguity: the Skin is the boundary of
+// legitimate local material, so ANY crossing of it by a deeper band Wall is a defect (the Wall
+// reaching out past where ordinary material would end) -- prune the excursion between each pair
+// of consecutive crossings, reconnecting directly at the two real crossing points. The Skin
+// itself is never modified.
+// ============================================================================
+namespace
+{
+struct SkinEvent
+{
+    int wall_seg;
+    Point2LL p;
+};
+
+// Finds every crossing (transversal or collinear-overlap) between the Wall's own path and the
+// Skin reference curve, one entry per Wall segment that crosses at all (first hit only -- enough
+// to pair consecutive crossings into excursions).
+std::vector<SkinEvent> findSkinCrossings(const std::vector<Point2LL>& wall_pts, bool wall_closed, const std::vector<Point2LL>& skin_pts, bool skin_closed)
+{
+    std::vector<SkinEvent> events;
+    const int wn = static_cast<int>(wall_pts.size());
+    const int w_segs = wall_closed ? wn : wn - 1;
+    const int sn = static_cast<int>(skin_pts.size());
+    const int s_segs = skin_closed ? sn : sn - 1;
+    for (int i = 0; i < w_segs; i++)
+    {
+        const int j = wall_closed ? (i + 1) % wn : i + 1;
+        for (int m = 0; m < s_segs; m++)
+        {
+            const int mn = skin_closed ? (m + 1) % sn : m + 1;
+            Point2LL X;
+            if (segSegIntersectOpen(wall_pts[i], wall_pts[j], skin_pts[m], skin_pts[mn], X))
+            {
+                events.push_back({ i, X });
+                break;
+            }
+            Point2LL p_start, p_end;
+            if (collinearOverlap(wall_pts[i], wall_pts[j], skin_pts[m], skin_pts[mn], p_start, p_end))
+            {
+                events.push_back({ i, p_start });
+                break;
+            }
+        }
+    }
+    return events;
+}
+} // namespace
+
+std::vector<Point2LL> FeatherPrintGenerator::pruneAgainstSkinPoints(std::vector<Point2LL> pts, bool wall_closed, const std::vector<Point2LL>& skin_pts, bool skin_closed, const char* diag_tag)
+{
+    if (skin_pts.size() < 2)
+        return pts;
+
+    constexpr int kMaxPasses = 32;
+    int prunes = 0;
+    for (int pass = 0; pass < kMaxPasses; pass++)
+    {
+        std::vector<SkinEvent> events = findSkinCrossings(pts, wall_closed, skin_pts, skin_closed);
+        if (events.size() < 2)
+        {
+            if (diag_tag) spdlog::info("FP-DIAG SkinArea {} n={} events={} prunes={}", diag_tag, static_cast<int>(pts.size()), static_cast<int>(events.size()), prunes);
+            break;
+        }
+        const SkinEvent& e1 = events[0];
+        const SkinEvent& e2 = events[1];
+        if (e2.wall_seg <= e1.wall_seg + 1)
+            break; // degenerate pairing, avoid an infinite loop
+
+        const int n = static_cast<int>(pts.size());
+        std::vector<Point2LL> next;
+        next.reserve(n);
+        for (int m = 0; m <= e1.wall_seg; m++)
+            next.push_back(pts[m]);
+        next.push_back(e1.p);
+        next.push_back(e2.p);
+        for (int m = e2.wall_seg + 1; m < n; m++)
+            next.push_back(pts[m]);
+        pts = std::move(next);
+        prunes++;
+        if (diag_tag) spdlog::info("FP-DIAG SkinArea {} pass={} splice seg={}..{} prunes={}", diag_tag, pass, e1.wall_seg, e2.wall_seg, prunes);
+    }
+    return pts;
+}
+
+VariableWidthLines FeatherPrintGenerator::generateFlange(const Shape& outline, const Settings& settings, int ramp_index, double helix_phase, Point2LL phase_origin, double R_ref)
+{
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+
+    // Collision Pruning (Spec REV 4.5) Part 3 -- the plain ordinary Skin ring (baseline single
+    // Wall that would print here without this band), used below to catch a deeper Wall reaching
+    // out past it.
+    const Shape skin_shape = Shape(outline).offset(-w / 2);
+    const Polygon* skin_poly_ref = largestPoly(skin_shape);
+    const std::vector<Point2LL> skin_pts = skin_poly_ref ? std::vector<Point2LL>(skin_poly_ref->begin(), skin_poly_ref->end()) : std::vector<Point2LL>();
+
+    std::vector<FlangeWallDesc> walls_outer_first = buildFlangeWallStack(ramp_index, w);
+
+    // Inner-area offset (see innerOffset()'s doc comment): the full Wall-stack depth to the
+    // innermost Wall's own INNER face (offset + half its own width), i.e. the region actually
+    // enclosed by the printed material at this Flange Layer.
+    {
+        const FlangeWallDesc& wd_inner = walls_outer_first.back();
+        inner_offset_ = wd_inner.offset + wd_inner.width / 2;
+    }
+
+    // ---- Compute Stringer/Lacing anchor positions on OML for Flare Rim insertion ----
+    const Polygon* oml_poly = largestPoly(outline);
+    const int N = settings.get<int>("featherprint_stringer_count");
+    // Flare Rim's Width matches the colliding feature's own Width (Spec REV 2.0), not a
+    // fixed literal.
+    const double stringer_flare_W = settings.get<double>("featherprint_stringer_width");
+    const double lacing_flare_W   = settings.get<double>("featherprint_lacing_width");
+
+    // theta/R_oml are evaluated on the OML (per spec, the Flare Rim is anchored there, not on
+    // the innermost wall); s_left/s_right cut the innermost wall's own perimeter walk at the
+    // exact theta the Flare Rim's own two endpoints land on (not an arc-length approximation),
+    // so the ordinary-wall walk and the Flare Rim's first/last emitted points coincide.
+    struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
+    std::vector<FlareAnchor> flare_anchors;
+
+    // Q per the WIP Parametric Canonical Toolpaths doc's Flare Rim table is the "Wall Number".
+    // A plain Wall COUNT under-charges any ramp layer whose stack includes a half-width Wall
+    // (the outer half-wall at ramp 0, or a buried half-wall at even ramp indices >= 2) — e.g.
+    // ramp 2's 3-Wall stack (full+half+full = 2.5w) would score the same Q=3 as ramp 3's
+    // 3-Wall stack (full+full+full = 3.0w), even though ramp 2's stack is only 2.5w thick.
+    // Sum each Wall's own width instead, giving the stack's true thickness in w-units. The
+    // innermost Wall itself is excluded from the sum — oml_shift already anchors Start/End at
+    // the innermost Wall's own centreline, so Q should only cover the Walls OUTSIDE it (already
+    // consumed depth before the Rim's own channel begins); including the innermost Wall's own
+    // width double-counted it, undershooting R1 by one Wall's width.
+    double Q = 0.0;
+    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
+        Q += static_cast<double>(walls_outer_first[wi].width) / static_cast<double>(w);
+    const double flare_D = settings.get<double>("featherprint_feature_depth");
+    const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
+    // Start/End (canonical y=0) must land where the surrounding ordinary innermost-Wall path
+    // actually runs — the innermost Wall's own offset from the OML — not at the OML itself.
+    // The previous version of this shift used the OUTER Wall's (near-zero) offset, which is
+    // only the right correction for arc_oml/oml_poly's own frame vs the true OML centreline;
+    // it left Start/End sitting essentially AT the OML while the ordinary wall_line segments
+    // on either side run at the innermost Wall's real (much deeper) offset, producing a large
+    // spurious jump/zigzag at every Flare anchor instead of a smooth local fillet.
+    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / static_cast<double>(w);
+    // The new single-fillet Flare Rim profile doesn't extend past its declared flat span
+    // W/2 (unlike the old dovetail's r-widened extent) — no extra collision widening needed.
+    const double flare_r = 0.0;
+
+    if (oml_poly && oml_poly->size() >= 3 && N >= 1)
+    {
+        ArcParam arc_oml = buildArcParam(*oml_poly);
+        const Point2LL centroid = centroidBbox(*oml_poly);
+        const double w_d = static_cast<double>(w);
+        const double helix_frac  = std::fmod(helix_phase, 1.0);
+        const double arc_ref     = arc_oml.nearestArcPos(phase_origin);
+        // Phase-lock the curvature-resampling grid to Phase Origin BEFORE buildWarp triggers
+        // ensureResampled -- see ArcParam::resample_phase_s's declaration for why this order
+        // matters (an unlocked grid reintroduces vertex-reindexing instability).
+        arc_oml.resample_phase_s = arc_ref;
+        arc_oml.buildWarp(R_ref); // Curvature-Weighted Stringer Density (REV 2.6); no-op if R_ref <= 0
+        const double arc_oml_total_w = arc_oml.cum_warp.empty() ? arc_oml.total : arc_oml.total_warped;
+        const double origin_w    = arc_oml.toWarped(arc_ref);
+        const double ccw_advance_w = std::fmod(helix_frac * arc_oml_total_w + origin_w, arc_oml_total_w);
+        const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_oml_total_w + arc_oml_total_w, arc_oml_total_w);
+
+        // OML anchor positions, CCW+CW interleaved and sorted by arc position so adjacent
+        // opposite-direction anchors can be tested for a Lacing collision (same pattern as
+        // the main generate() collision pass). Distributed in warped space (REV 2.6), then
+        // inverted back to real arc-length via fromWarped -- everything downstream of this
+        // (collision detection, Flare Rim placement) operates on real s exactly as before.
+        struct OmlAnchor { double s; bool is_cw; bool skip{ false }; int pair_idx{ -1 }; };
+        std::vector<OmlAnchor> oml_anchors;
+        oml_anchors.reserve(2 * N);
+        for (int i = 0; i < N; i++)
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + ccw_advance_w, arc_oml_total_w)), false});
+        for (int i = 0; i < N; i++)
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + cw_advance_w,  arc_oml_total_w)), true });
+        std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
+
+        // Two Stringer anchors must merge into one Lacing Rim once their *widened* Flare Rim
+        // footprints (each spanning the Stringer's own Flare Rim Width, wider than the plain
+        // 1w Stringer Trace cutout) would physically overlap — not just when the
+        // plain-Trace threshold (w) is crossed. Using the unwidened threshold here left
+        // near-tip layers (small circumference, closely packed anchors) with two separate,
+        // overlapping/crossing Flare Rims instead of one merged Lacing Rim.
+        const double collision_w = stringer_flare_W * w_d;
+
+        const int total_anchors = static_cast<int>(oml_anchors.size());
+        for (int i = 0; i < total_anchors; i++)
+        {
+            for (int j = i + 1; j < total_anchors; j++)
+            {
+                if (oml_anchors[j].s - oml_anchors[i].s > 2.0 * collision_w) break;
+                if (oml_anchors[j].is_cw == oml_anchors[i].is_cw) continue;
+                Point2LL pi = arc_oml.pointAt(oml_anchors[i].s);
+                Point2LL pj = arc_oml.pointAt(oml_anchors[j].s);
+                double dx = static_cast<double>(pi.X - pj.X), dy = static_cast<double>(pi.Y - pj.Y);
+                if (std::sqrt(dx * dx + dy * dy) < collision_w)
+                {
+                    oml_anchors[i].skip = oml_anchors[j].skip = true;
+                    oml_anchors[i].pair_idx = j;
+                    oml_anchors[j].pair_idx = i;
+                }
+            }
+        }
+
+        // Compute innermost wall offset shape so we can project anchors onto it (for the
+        // wall-walk cutout only — the Flare Rim's own geometry is anchored on the OML).
+        const FlangeWallDesc& wd_inner = walls_outer_first.back();
+        Shape inner_shape = Shape(outline).offset(-wd_inner.offset);
+        const Polygon* inner_poly = largestPoly(inner_shape);
+        if (inner_poly && inner_poly->size() >= 3)
+        {
+            ArcParam arc_inner = buildArcParam(*inner_poly);
+
+            auto addAnchor = [&](double s_oml, double x_sign, double W)
+            {
+                Point2LL pt = arc_oml.pointAt(s_oml);
+                double dx = static_cast<double>(pt.X - centroid.X);
+                double dy = static_cast<double>(pt.Y - centroid.Y);
+                double theta = std::atan2(dy, dx);
+                double R_oml = std::sqrt(dx * dx + dy * dy);
+                if (R_oml < 1.0)
+                    return;
+                // Project the Flare Rim's actual left/right endpoints (lx = ∓(W/2+flare_r),
+                // per the transform's angular formula theta = theta_anchor + x_sign*lx*w/R_a)
+                // onto the innermost wall, not just the anchor's own theta — this is what
+                // appendFlareRim will itself emit as its first/last points, so the
+                // ordinary-wall walk must stop exactly there.
+                const double lx_max = W / 2.0 + flare_r;
+                const double theta_l = theta - lx_max * static_cast<double>(w) / R_oml;
+                const double theta_r = theta + lx_max * static_cast<double>(w) / R_oml;
+                double s_l = arcLengthAtAngle(arc_inner, centroid, theta_l);
+                double s_r = arcLengthAtAngle(arc_inner, centroid, theta_r);
+                if (s_l < 0.0 || s_r < 0.0)
+                    return; // anchor doesn't project onto the innermost wall at all
+                flare_anchors.push_back({s_l, s_r, theta, R_oml, x_sign, W});
+            };
+
+            for (int i = 0; i < total_anchors; i++)
+            {
+                const OmlAnchor& oa = oml_anchors[i];
+                if (oa.skip)
+                {
+                    if (oa.pair_idx > i)
+                    {
+                        // Lacing anchor: midpoint between the two colliding Stringer anchors,
+                        // symmetric profile (x_sign=+1), W = the Lacing's own Width setting.
+                        double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
+                        addAnchor(s_mid, 1.0, lacing_flare_W);
+                    }
+                    continue;
+                }
+                // Ordinary Stringer anchor: the Flare Rim's dovetail profile is left-right
+                // symmetric (unlike the ordinary teardrop Trace), so it needs no CW/CCW
+                // mirror — x_sign=-1 would instead reverse the low-s->high-s traversal
+                // direction the wall-walk cutout (s_left/s_right) assumes, stitching it in
+                // backwards for CW anchors. W = the Stringer's own Width setting.
+                addAnchor(oa.s, 1.0, stringer_flare_W);
+            }
+
+            std::sort(flare_anchors.begin(), flare_anchors.end(),
+                [](const FlareAnchor& a, const FlareAnchor& b){ return a.s_left < b.s_left; });
+        }
+    }
+
+    // ---- Emit walls: innermost first (inset_idx = n_walls-1), outermost last (inset_idx = 0) ----
+    const int n_walls = static_cast<int>(walls_outer_first.size());
+    VariableWidthLines result;
+
+    for (int wi = n_walls - 1; wi >= 0; wi--) // inner→outer emission order
+    {
+        const FlangeWallDesc& wd      = walls_outer_first[wi];
+        const int       inset_idx = flangePrintInsetIdx(wi, n_walls);
+        const bool      is_innermost = (wi == n_walls - 1);
+
+        Shape offset_shape = Shape(outline).offset(-wd.offset);
+        if (offset_shape.empty()) continue;
+        const Polygon* poly = largestPoly(offset_shape);
+        if (! poly || poly->size() < 3) continue;
+
+        // Collision Pruning (Spec REV 4.5) Parts 2-3 -- the outer (wi==0) Wall sits at OML depth
+        // and cannot geometrically produce a genuine defect (see generateFormerOpen()'s
+        // identical exclusion for the full rationale); skip it.
+        Polygon pruned_poly = *poly;
+        if (wi != 0)
+        {
+            std::vector<Point2LL> raw_pts(poly->begin(), poly->end());
+            const bool ccw_ref = poly->area() >= 0.0;
+            const std::string diag_tag = fmt::format("Flange ramp={} wi={}/{} offset={}", ramp_index, wi, n_walls, wd.offset);
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, ccw_ref, w, diag_tag.c_str());
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/true, skin_pts, /*skin_closed=*/true, diag_tag.c_str());
+            pruned_poly = Polygon();
+            for (const Point2LL& p : pr.main_line)
+                pruned_poly.push_back(p);
+            for (auto& ring : pr.extra_rings)
+            {
+                if (ring.size() < 3) continue;
+                Polygon ring_poly;
+                for (const Point2LL& p : ring) ring_poly.push_back(p);
+                ArcParam ring_ap = buildArcParam(ring_poly);
+                if (ring_ap.total < 1.0) continue;
+                ExtrusionLine ring_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+                appendPolySegment(ring_line, ring_ap, 0.0, ring_ap.total, wd.width, /*add_start=*/true);
+                if (! ring_line.empty()) ring_line.junctions_.push_back(ring_line.junctions_.front());
+                if (ring_line.size() >= 2) result.push_back(std::move(ring_line));
+            }
+        }
+
+        ArcParam ap = buildArcParam(pruned_poly);
+        if (ap.total < 1.0) continue;
+
+        ExtrusionLine wall_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+
+        if (is_innermost && ! flare_anchors.empty())
+        {
+            // Flare Rim: innermost-wall perimeter walk with a Flare Rim channel embedded at
+            // each Stringer/Lacing anchor. The channel geometry itself is anchored on the OML
+            // (arc_oml recomputed below) per spec, not on this offset wall's own surface.
+            ArcParam arc_oml = buildArcParam(*oml_poly);
+            const Point2LL centroid = centroidBbox(*oml_poly);
+            double current_s = 0.0;
+            for (const FlareAnchor& fa : flare_anchors)
+            {
+                // Thin-Section Pruning (Spec REV 2.4) — see generate()'s own comment for the
+                // full rationale. Flare's own anchor is angle-based (out of REV 2.2/2.3's
+                // arc-length scope, per spec), so convert to arc-length on arc_oml first, the
+                // same relocation appendFlareRim itself already does internally.
+                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
+                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
+                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
+                    continue; // leave current_s untouched — ordinary wall passes straight through
+
+                double s_depart = fa.s_left;
+                if (s_depart < current_s) s_depart = current_s;
+                appendPolySegment(wall_line, ap, current_s, s_depart, wd.width, wall_line.empty());
+
+                // appendPolySegment above always ends by emitting the true wall-polygon point
+                // at s_depart (unconditionally, regardless of add_start), so the Flare Rim's
+                // own analytically-computed first point must always be skipped — using
+                // wall_line.empty() here (now false, since the call above already pushed
+                // points) skipped nothing and left a duplicate/jog at every rim's entry.
+                appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
+                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
+
+                current_s = std::max(fa.s_right, s_depart);
+            }
+            appendPolySegment(wall_line, ap, current_s, ap.total, wd.width, wall_line.empty());
+        }
+        else
+        {
+            appendPolySegment(wall_line, ap, 0.0, ap.total, wd.width, /*add_start=*/true);
+        }
+
+        if (! wall_line.empty())
+            wall_line.junctions_.push_back(wall_line.junctions_.front());
+        if (wall_line.size() >= 2)
+            result.push_back(std::move(wall_line));
+
+        // Collision Pruning (Spec REV 4.5) Part 1: at a thin neck, Shape::offset() can split
+        // this Wall's own output into multiple separate polygons, one per lobe -- largestPoly()
+        // above only ever walks the largest, silently leaving every other lobe with no Wall at
+        // all at this depth. Emit every other surviving component too, as a plain perimeter
+        // walk (no Flare Rim/Gusset -- per-component anchor placement is out of scope for this
+        // pass; a lobe with a Wall and no Gusset is strictly better than getting no Wall at all,
+        // which was the prior behavior). min_component_area is a (2w)^2 noise floor, not a size
+        // judgment about real defects -- it exists only to skip genuine offset slivers.
+        const double min_component_area = (2.0 * static_cast<double>(w)) * (2.0 * static_cast<double>(w));
+        for (const Polygon& other_poly : offset_shape)
+        {
+            if (&other_poly == poly)
+                continue; // primary (largest) component already emitted above
+            if (other_poly.size() < 3 || std::abs(other_poly.area()) < min_component_area)
+                continue;
+
+            ArcParam other_ap = buildArcParam(other_poly);
+            if (other_ap.total < 1.0)
+                continue;
+
+            ExtrusionLine other_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+            appendPolySegment(other_line, other_ap, 0.0, other_ap.total, wd.width, /*add_start=*/true);
+            if (! other_line.empty())
+                other_line.junctions_.push_back(other_line.junctions_.front());
+            if (other_line.size() >= 2)
+                result.push_back(std::move(other_line));
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Former (Spec REV 3.6) — a near-duplicate of generateFlange() by deliberate choice
+// ============================================================================
+//
+// Reuses generateFlange()'s own wall-emission/Gusset(Flare-Rim)-embedding logic essentially
+// verbatim, with buildFlangeWallStack swapped for buildFormerWallStack — the only structural
+// difference is which wall-stack-shape function builds walls_outer_first; everything
+// downstream (Q/oml_shift computation, anchor placement, Flare Rim embedding at the
+// innermost Wall, per-Wall emission order) is identical, since both are pure functions of a
+// {offset,width} Wall list agnostic to how that list was built. Duplicated rather than
+// factored into a shared helper to avoid touching generateFlange()'s own already-tested code
+// path — see this session's plan notes for the explicit risk/safety tradeoff.
+VariableWidthLines FeatherPrintGenerator::generateFormer(const Shape& outline, const Settings& settings, int ramp_position, double helix_phase, Point2LL phase_origin, double R_ref)
+{
+    const coord_t w = settings.get<coord_t>("featherprint_line_width");
+
+    // Collision Pruning (Spec REV 4.5) Part 3 -- see generateFlange()'s identical setup for the
+    // full rationale.
+    const Shape skin_shape = Shape(outline).offset(-w / 2);
+    const Polygon* skin_poly_ref = largestPoly(skin_shape);
+    const std::vector<Point2LL> skin_pts = skin_poly_ref ? std::vector<Point2LL>(skin_poly_ref->begin(), skin_poly_ref->end()) : std::vector<Point2LL>();
+
+    std::vector<FlangeWallDesc> walls_outer_first = buildFormerWallStack(ramp_position, w);
+
+    // Inner-area offset: same convention as generateFlange() — full Wall-stack depth to the
+    // innermost Wall's own inner face.
+    {
+        const FlangeWallDesc& wd_inner = walls_outer_first.back();
+        inner_offset_ = wd_inner.offset + wd_inner.width / 2;
+    }
+
+    // ---- Compute Stringer/Lacing anchor positions on the base perimeter for Gusset (Flare
+    // Rim) insertion — "oml_poly" here is Former's own reference frame: the ordinary,
+    // un-thickened perimeter this band grows from, playing the same role Flange's actual OML
+    // plays for Flare. ----
+    const Polygon* oml_poly = largestPoly(outline);
+    const int N = settings.get<int>("featherprint_stringer_count");
+    const double stringer_flare_W = settings.get<double>("featherprint_stringer_width");
+    const double lacing_flare_W   = settings.get<double>("featherprint_lacing_width");
+
+    struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
+    std::vector<FlareAnchor> flare_anchors;
+
+    double Q = 0.0;
+    for (size_t wi = 0; wi + 1 < walls_outer_first.size(); wi++)
+        Q += static_cast<double>(walls_outer_first[wi].width) / static_cast<double>(w);
+    const double flare_D = settings.get<double>("featherprint_feature_depth");
+    const FlangeWallDesc& wd_inner_layer = walls_outer_first.back();
+    const double oml_shift = -static_cast<double>(wd_inner_layer.offset) / static_cast<double>(w);
+    const double flare_r = 0.0;
+
+    if (oml_poly && oml_poly->size() >= 3 && N >= 1)
+    {
+        ArcParam arc_oml = buildArcParam(*oml_poly);
+        const Point2LL centroid = centroidBbox(*oml_poly);
+        const double w_d = static_cast<double>(w);
+        const double helix_frac  = std::fmod(helix_phase, 1.0);
+        const double arc_ref     = arc_oml.nearestArcPos(phase_origin);
+        arc_oml.resample_phase_s = arc_ref;
+        arc_oml.buildWarp(R_ref);
+        const double arc_oml_total_w = arc_oml.cum_warp.empty() ? arc_oml.total : arc_oml.total_warped;
+        const double origin_w    = arc_oml.toWarped(arc_ref);
+        const double ccw_advance_w = std::fmod(helix_frac * arc_oml_total_w + origin_w, arc_oml_total_w);
+        const double cw_advance_w  = std::fmod(origin_w - helix_frac * arc_oml_total_w + arc_oml_total_w, arc_oml_total_w);
+
+        struct OmlAnchor { double s; bool is_cw; bool skip{ false }; int pair_idx{ -1 }; };
+        std::vector<OmlAnchor> oml_anchors;
+        oml_anchors.reserve(2 * N);
+        for (int i = 0; i < N; i++)
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + ccw_advance_w, arc_oml_total_w)), false});
+        for (int i = 0; i < N; i++)
+            oml_anchors.push_back({arc_oml.fromWarped(std::fmod(static_cast<double>(i) / N * arc_oml_total_w + cw_advance_w,  arc_oml_total_w)), true });
+        std::sort(oml_anchors.begin(), oml_anchors.end(), [](const OmlAnchor& a, const OmlAnchor& b){ return a.s < b.s; });
+
+        const double collision_w = stringer_flare_W * w_d;
+
+        const int total_anchors = static_cast<int>(oml_anchors.size());
+        for (int i = 0; i < total_anchors; i++)
+        {
+            for (int j = i + 1; j < total_anchors; j++)
+            {
+                if (oml_anchors[j].s - oml_anchors[i].s > 2.0 * collision_w) break;
+                if (oml_anchors[j].is_cw == oml_anchors[i].is_cw) continue;
+                Point2LL pi = arc_oml.pointAt(oml_anchors[i].s);
+                Point2LL pj = arc_oml.pointAt(oml_anchors[j].s);
+                double dx = static_cast<double>(pi.X - pj.X), dy = static_cast<double>(pi.Y - pj.Y);
+                if (std::sqrt(dx * dx + dy * dy) < collision_w)
+                {
+                    oml_anchors[i].skip = oml_anchors[j].skip = true;
+                    oml_anchors[i].pair_idx = j;
+                    oml_anchors[j].pair_idx = i;
+                }
+            }
+        }
+
+        const FlangeWallDesc& wd_inner = walls_outer_first.back();
+        Shape inner_shape = Shape(outline).offset(-wd_inner.offset);
+        const Polygon* inner_poly = largestPoly(inner_shape);
+        if (inner_poly && inner_poly->size() >= 3)
+        {
+            ArcParam arc_inner = buildArcParam(*inner_poly);
+
+            auto addAnchor = [&](double s_oml, double x_sign, double W)
+            {
+                Point2LL pt = arc_oml.pointAt(s_oml);
+                double dx = static_cast<double>(pt.X - centroid.X);
+                double dy = static_cast<double>(pt.Y - centroid.Y);
+                double theta = std::atan2(dy, dx);
+                double R_oml = std::sqrt(dx * dx + dy * dy);
+                if (R_oml < 1.0)
+                    return;
+                const double lx_max = W / 2.0 + flare_r;
+                const double theta_l = theta - lx_max * static_cast<double>(w) / R_oml;
+                const double theta_r = theta + lx_max * static_cast<double>(w) / R_oml;
+                double s_l = arcLengthAtAngle(arc_inner, centroid, theta_l);
+                double s_r = arcLengthAtAngle(arc_inner, centroid, theta_r);
+                if (s_l < 0.0 || s_r < 0.0)
+                    return;
+                flare_anchors.push_back({s_l, s_r, theta, R_oml, x_sign, W});
+            };
+
+            for (int i = 0; i < total_anchors; i++)
+            {
+                const OmlAnchor& oa = oml_anchors[i];
+                if (oa.skip)
+                {
+                    if (oa.pair_idx > i)
+                    {
+                        double s_mid = (oa.s + oml_anchors[oa.pair_idx].s) * 0.5;
+                        addAnchor(s_mid, 1.0, lacing_flare_W);
+                    }
+                    continue;
+                }
+                addAnchor(oa.s, 1.0, stringer_flare_W);
+            }
+
+            std::sort(flare_anchors.begin(), flare_anchors.end(),
+                [](const FlareAnchor& a, const FlareAnchor& b){ return a.s_left < b.s_left; });
+        }
+    }
+
+    const int n_walls = static_cast<int>(walls_outer_first.size());
+    VariableWidthLines result;
+
+    for (int wi = n_walls - 1; wi >= 0; wi--)
+    {
+        const FlangeWallDesc& wd      = walls_outer_first[wi];
+        const int       inset_idx = flangePrintInsetIdx(wi, n_walls);
+        const bool      is_innermost = (wi == n_walls - 1);
+
+        Shape offset_shape = Shape(outline).offset(-wd.offset);
+        if (offset_shape.empty()) continue;
+        const Polygon* poly = largestPoly(offset_shape);
+        if (! poly || poly->size() < 3) continue;
+
+        // Collision Pruning (Spec REV 4.5) Parts 2-3 -- see generateFlange()'s identical block
+        // for the full rationale.
+        Polygon pruned_poly = *poly;
+        if (wi != 0)
+        {
+            std::vector<Point2LL> raw_pts(poly->begin(), poly->end());
+            const bool ccw_ref = poly->area() >= 0.0;
+            const std::string diag_tag = fmt::format("Former ramp={} wi={}/{} offset={}", ramp_position, wi, n_walls, wd.offset);
+            PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, ccw_ref, w, diag_tag.c_str());
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/true, skin_pts, /*skin_closed=*/true, diag_tag.c_str());
+            pruned_poly = Polygon();
+            for (const Point2LL& p : pr.main_line)
+                pruned_poly.push_back(p);
+            for (auto& ring : pr.extra_rings)
+            {
+                if (ring.size() < 3) continue;
+                Polygon ring_poly;
+                for (const Point2LL& p : ring) ring_poly.push_back(p);
+                ArcParam ring_ap = buildArcParam(ring_poly);
+                if (ring_ap.total < 1.0) continue;
+                ExtrusionLine ring_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+                appendPolySegment(ring_line, ring_ap, 0.0, ring_ap.total, wd.width, /*add_start=*/true);
+                if (! ring_line.empty()) ring_line.junctions_.push_back(ring_line.junctions_.front());
+                if (ring_line.size() >= 2) result.push_back(std::move(ring_line));
+            }
+        }
+
+        ArcParam ap = buildArcParam(pruned_poly);
+        if (ap.total < 1.0) continue;
+
+        ExtrusionLine wall_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+
+        if (is_innermost && ! flare_anchors.empty())
+        {
+            ArcParam arc_oml = buildArcParam(*oml_poly);
+            const Point2LL centroid = centroidBbox(*oml_poly);
+            double current_s = 0.0;
+            for (const FlareAnchor& fa : flare_anchors)
+            {
+                double s_anchor_oml = arcLengthAtAngle(arc_oml, centroid, fa.theta);
+                if (s_anchor_oml < 0.0) s_anchor_oml = 0.0;
+                if (isThinSection(arc_oml, centroid, s_anchor_oml, flare_D, w))
+                    continue;
+
+                double s_depart = fa.s_left;
+                if (s_depart < current_s) s_depart = current_s;
+                appendPolySegment(wall_line, ap, current_s, s_depart, wd.width, wall_line.empty());
+
+                appendFlareRim(wall_line, fa.theta, fa.R_oml, fa.x_sign, centroid, arc_oml,
+                               Q, flare_D, oml_shift, fa.W, w, /*skip_first=*/true);
+
+                current_s = std::max(fa.s_right, s_depart);
+            }
+            appendPolySegment(wall_line, ap, current_s, ap.total, wd.width, wall_line.empty());
+        }
+        else
+        {
+            appendPolySegment(wall_line, ap, 0.0, ap.total, wd.width, /*add_start=*/true);
+        }
+
+        if (! wall_line.empty())
+            wall_line.junctions_.push_back(wall_line.junctions_.front());
+        if (wall_line.size() >= 2)
+            result.push_back(std::move(wall_line));
+
+        // Collision Pruning (Spec REV 4.5) Part 1 -- see generateFlange()'s identical block for
+        // the full rationale.
+        const double min_component_area = (2.0 * static_cast<double>(w)) * (2.0 * static_cast<double>(w));
+        for (const Polygon& other_poly : offset_shape)
+        {
+            if (&other_poly == poly)
+                continue;
+            if (other_poly.size() < 3 || std::abs(other_poly.area()) < min_component_area)
+                continue;
+
+            ArcParam other_ap = buildArcParam(other_poly);
+            if (other_ap.total < 1.0)
+                continue;
+
+            ExtrusionLine other_line(inset_idx, /*is_odd=*/false, /*is_closed=*/true);
+            appendPolySegment(other_line, other_ap, 0.0, other_ap.total, wd.width, /*add_start=*/true);
+            if (! other_line.empty())
+                other_line.junctions_.push_back(other_line.junctions_.front());
+            if (other_line.size() >= 2)
+                result.push_back(std::move(other_line));
+        }
+    }
+
+    return result;
+}
+
 // Former's own open-manifold case (Cuff, Spec REV 3.6) — near-duplicate of
 // generateFlangeOpen() for the same reasons generateFormer() duplicates generateFlange():
 // Cuff is mechanically identical to Miter (outer Wall gets an ordinary Whip Terminal at each
@@ -1690,6 +1847,16 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
     // ---- Compute Stringer/Lacing anchors within this arc, for Gusset (Flare Rim) insertion ----
     ArcParam arc_oml = buildArcParamOpen(open_poly);
     const double s_end_oml = arc_oml.total;
+
+    // Collision Pruning (Spec REV 4.5) Part 3 -- Skin reference, built via normalOffsetOpen (the
+    // same local-normal, non-Clipper offset every Wall in this function already uses, not
+    // Shape::offset(), which can silently "bridge" across the same thin necks this pass exists
+    // to catch).
+    const std::vector<Point2LL> skin_pts = [&]
+    {
+        OpenPolyline skin_poly = normalOffsetOpen(arc_oml, centroid, w / 2, w);
+        return std::vector<Point2LL>(skin_poly.begin(), skin_poly.end());
+    }();
 
     struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
     std::vector<FlareAnchor> flare_anchors;
@@ -1803,6 +1970,7 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
             std::vector<Point2LL> raw_pts(offset_poly.begin(), offset_poly.end());
             const std::string diag_tag = fmt::format("FormerOpen layer={} ramp={} wi={}/{} offset={}", diag_layer_nr, ramp_position, wi, n_walls, wd.offset);
             PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w, diag_tag.c_str());
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/false, skin_pts, /*skin_closed=*/false, diag_tag.c_str());
             offset_poly = OpenPolyline();
             for (const Point2LL& p : pr.main_line)
                 offset_poly.push_back(p);
@@ -1953,6 +2121,14 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
     ArcParam arc_oml = buildArcParamOpen(open_poly);
     const double s_end_oml = arc_oml.total;
 
+    // Collision Pruning (Spec REV 4.5) Part 3 -- see generateFormerOpen()'s identical setup for
+    // the full rationale.
+    const std::vector<Point2LL> skin_pts = [&]
+    {
+        OpenPolyline skin_poly = normalOffsetOpen(arc_oml, centroid, w / 2, w);
+        return std::vector<Point2LL>(skin_poly.begin(), skin_poly.end());
+    }();
+
     struct FlareAnchor { double s_left; double s_right; double theta; double R_oml; double x_sign; double W; };
     std::vector<FlareAnchor> flare_anchors;
 
@@ -2065,6 +2241,7 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
             std::vector<Point2LL> raw_pts(offset_poly.begin(), offset_poly.end());
             const std::string diag_tag = fmt::format("FlangeOpen layer={} ramp={} wi={}/{} offset={}", diag_layer_nr, ramp_index, wi, n_walls, wd.offset);
             PruneResult pr = pruneSelfIntersectionsSignedArea(raw_pts, /*ccw_ref=*/true, w, diag_tag.c_str());
+            pr.main_line = pruneAgainstSkinPoints(std::move(pr.main_line), /*wall_closed=*/false, skin_pts, /*skin_closed=*/false, diag_tag.c_str());
             offset_poly = OpenPolyline();
             for (const Point2LL& p : pr.main_line)
                 offset_poly.push_back(p);
