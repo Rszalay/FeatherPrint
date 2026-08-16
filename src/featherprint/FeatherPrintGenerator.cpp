@@ -762,16 +762,32 @@ bool FeatherPrintGenerator::isThinSection(const ArcParam& arc, const Point2LL& c
         const Point2LL& A = (*arc.poly)[i];
         const Point2LL& B = (*arc.poly)[j];
         const double ex = static_cast<double>(B.X - A.X), ey = static_cast<double>(B.Y - A.Y);
-        const double seg_len = std::sqrt(ex * ex + ey * ey);
-        if (seg_len < 1e-6)
+        const double seg_len2 = ex * ex + ey * ey;
+        if (seg_len2 < 1e-6)
             continue;
-        const double denom = dirx * ey - diry * ex;
-        if (std::abs(denom) < 1e-9)
-            continue; // ray parallel to this segment
+        const double seg_len = std::sqrt(seg_len2);
+
+        // Nearest-distance check (replacing the original single ray-cast): a ray cast along
+        // resolveFrame's own smoothed inward normal is a 1D probe that can miss a genuinely
+        // close opposing wall sitting off to the side near a concave (internal) corner —
+        // confirmed real-print regression, missing real collisions specifically at
+        // internal-corner distortion. Testing the nearest point on EVERY non-excluded segment,
+        // rather than only whichever segment one fixed ray direction happens to cross, can't
+        // miss a close wall regardless of which way local corner geometry distorts the smoothed
+        // normal.
         const double asx = static_cast<double>(A.X) - sx, asy = static_cast<double>(A.Y) - sy;
-        const double t = (asx * ey - asy * ex) / denom; // distance along the ray
-        const double u = (asx * diry - asy * dirx) / denom; // position along the segment
-        if (! (u >= -1e-9 && u <= 1.0 + 1e-9 && t > 1e-6 && t <= ray_len))
+        double tproj = -(asx * ex + asy * ey) / seg_len2;
+        tproj = std::max(0.0, std::min(1.0, tproj));
+        const double px = static_cast<double>(A.X) + tproj * ex;
+        const double py = static_cast<double>(A.Y) + tproj * ey;
+        const double dpx = px - sx, dpy = py - sy;
+        const double dist = std::sqrt(dpx * dpx + dpy * dpy);
+        if (dist > ray_len)
+            continue;
+        // Lenient inward-cone check (not the old ray's effectively 0-degree-wide direction) —
+        // still rejects anything clearly on the wrong (outward) side of the anchor, while
+        // absorbing whatever distortion a corner introduces into the smoothed inward normal.
+        if (dist > 1e-6 && (dpx * dirx + dpy * diry) <= 0.0)
             continue;
 
         // A genuine thin section is where TWO DIFFERENT walls face each other closely — the
