@@ -558,9 +558,6 @@ private:
                                    const BlendPlacement& blend,
                                    coord_t w, bool skip_first = false);
 
-    // Ray from centroid at angle theta; returns arc-length of first polygon intersection, or -1.
-    static double arcLengthAtAngle(const ArcParam& arc, const Point2LL& centroid, double theta);
-
     // Thin-Section Pruning (Spec REV 2.4, proposed). True if a ray cast from the anchor
     // (s_anchor on arc) along its own local inward normal — the winding-based normal
     // resolveFrame already computes (REV 2.3), not a centroid-directed ray, for the same
@@ -676,10 +673,13 @@ private:
     //               where the outer wall is a half-width wall offset outward of the raw
     //               polygon. Every canonical y-value is placed at (y - oml_shift) in
     //               oml_arc's own frame so the profile still anchors to the true OML.
-    // theta_anchor/R_a must be evaluated against the OML (oml_arc), not the innermost wall,
-    // and oml_arc must also be passed as the `arc` used for the profile's tangent-blend frames.
+    // s_anchor/R_a must be evaluated against the OML (oml_arc), not the innermost wall, and
+    // oml_arc must also be passed as the `arc` used for the profile's tangent-blend frames.
+    // s_anchor is a real arc-length position on oml_arc that the CALLER has already resolved —
+    // this function no longer re-derives it via a centroid ray-cast internally (see the .cpp's
+    // own comment for why that was fragile on non-convex OMLs).
     static void appendFlareRim(ExtrusionLine& line,
-                               double theta_anchor, double R_a, double x_sign,
+                               double s_anchor, double R_a, double x_sign,
                                const Point2LL& centroid, const ArcParam& oml_arc,
                                double Q, double D, double oml_shift, double W, coord_t w, bool skip_first = false);
 

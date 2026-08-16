@@ -15,7 +15,7 @@ Instead of conventional infill, FeatherPrint produces a single-wall skin reinfor
 
 ## Installation
 
-1. Download **FeatherPrint-0.8.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
+1. Download **FeatherPrint-0.9.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
 2. Run the installer as Administrator
 3. The installer will detect your Cura 5.13.x installation, back up the original engine files, and deploy FeatherPrint
 
@@ -62,6 +62,7 @@ FeatherPrint is an early work-in-progress. The following features are currently 
 - **Former / Gusset / Cuff** — symmetric wall-stack bands, flush with the outer skin, generated at each synchronized stringer helix crossing (Lacing) for transverse bracing; Gusset integrates the crossing stringer into the band, and Cuff resolves a band meeting an open mesh boundary edge. **Former Spacing** lets you skip crossings (e.g. every other one) to trade stiffness for mass.
 - **Collar / Placket** — a Former-style reinforcement band at every Whip Terminal (both ends of every hole/slot, and the model's own top/bottom where no Flange is present); Placket resolves a Collar band's own taper meeting an open mesh boundary edge, the same way Cuff does for Former.
 - **Shelf** — a row of small support loops printed at a hole's own topmost Layer, wherever Punchout and Collar are both active, so the upper Collar band above the hole has something to build on instead of printing directly over open air.
+- **Collision Pruning** — Flange/Former/Collar wall stacks otherwise have no bound on how deep they offset inward; at a thin neck (narrower than twice the deepest wall's offset), that produces a self-intersecting or Skin-crossing toolpath. Detects and prunes the invalid segment on both the closed-ring and open-arc wall-generation pipelines, welding the remaining valid geometry back together at the crossing point, and correctly places Gusset/Flare Rim geometry even where a thin neck splits a wall into disjoint lobes.
 
 Curvature-Weighted Stringer Density (adaptive stringer spacing based on local surface curvature) was implemented and tested but is currently **disabled** pending a more reliable curvature estimation method; stringers use uniform arc-length spacing in the meantime.
 
