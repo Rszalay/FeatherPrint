@@ -692,10 +692,10 @@ bool FeatherPrintGenerator::isThinSection(const ArcParam& arc, const Point2LL& c
     // trivial t~0 self-intersection at the ray's own origin — anything else, however close in
     // arc-length or world space, is fair game for the hit test below.
     int anchor_seg = 0;
+    double sN = s_anchor;
+    if (arc.is_open) sN = std::max(0.0, std::min(arc.total, sN));
+    else { sN = std::fmod(sN, arc.total); if (sN < 0.0) sN += arc.total; }
     {
-        double sN = s_anchor;
-        if (arc.is_open) sN = std::max(0.0, std::min(arc.total, sN));
-        else { sN = std::fmod(sN, arc.total); if (sN < 0.0) sN += arc.total; }
         for (int k = 0; k < n; k++)
         {
             int kj = (k + 1) % n;
@@ -705,12 +705,30 @@ bool FeatherPrintGenerator::isThinSection(const ArcParam& arc, const Point2LL& c
         }
     }
     constexpr int kExclusionSegs = 1; // segment index distance from the anchor's own segment
+    // Real-print regression (found post-REV 4.10, ordinary curved-tube model, not a thin
+    // section at all): a fixed 1-segment index exclusion assumes segment length is roughly
+    // line-width scale. On a finely tessellated STL, many short segments can fit within a
+    // couple line widths of the anchor — the nearest-point scan above then finds the anchor's
+    // OWN local curve a few facets further along and, because per-facet mesh-slice normals are
+    // noisy at that granularity (see [[feedback-mesh-slice-curvature-unreliable]]), the
+    // opposing-normal check below can misread it as a genuinely opposing wall. Widen the
+    // exclusion to also cover a minimum REAL arc-length (not index count), so density of
+    // tessellation can't shrink the exclusion zone below the noise floor — sized well under
+    // the tight-corner geometry the index-based fix was protecting (a genuine fold's opposing
+    // wall sits at the corner's own physical gap, not within half a line width of the anchor).
+    const double kMinExclusionArcLen = 0.5 * static_cast<double>(w);
     auto segExcluded = [&](int idx)
     {
         int d = std::abs(idx - anchor_seg);
         if (! arc.is_open)
             d = std::min(d, n - d);
-        return d <= kExclusionSegs;
+        if (d <= kExclusionSegs)
+            return true;
+        double seg_s = arc.cum_len[idx];
+        double ds = std::abs(seg_s - sN);
+        if (! arc.is_open)
+            ds = std::min(ds, arc.total - ds);
+        return ds < kMinExclusionArcLen;
     };
 
     for (int i = 0; i < n; i++)
@@ -775,12 +793,22 @@ bool FeatherPrintGenerator::isThinSection(const ArcParam& arc, const Point2LL& c
         // requiring it past perpendicular) catches those corners too, at the cost of accepting
         // more marginal, less-than-fully-opposing hits generally — a tentative tradeoff, per
         // the same "not a settled value" flagging as the rest of this check.
-        constexpr double kMinOpposingAngleDeg = 45.0;
+        //
+        // Real-print regression (ordinary curved model, no thin sections at all): FP-DIAG data
+        // showed every false-positive hit landing between -0.55 and +0.71 for opposing_dot —
+        // NONE anywhere near genuine opposition (-1.0, two walls truly facing each other). The
+        // 45-degree value above was exactly the "not fully re-validated on gently-curved
+        // geometry" gap this file's own spec has carried as an open item since REV 4.4 — this
+        // is that regression, now with real data. Tightened substantially; 120 degrees still
+        // leaves meaningful margin above strict (180) for a distorted tight-fold's far-side
+        // normal, while rejecting the entire observed false-positive band above.
+        constexpr double kMinOpposingAngleDeg = 120.0;
         const double kOpposingThreshold = std::cos(kMinOpposingAngleDeg * std::numbers::pi / 180.0);
         double htx = ex / seg_len, hty = ey / seg_len;
         if (! arc.ccw) { htx = -htx; hty = -hty; }
         const double hnx = -hty, hny = htx;
-        if (dirx * hnx + diry * hny < kOpposingThreshold)
+        const double opposing_dot = dirx * hnx + diry * hny;
+        if (opposing_dot < kOpposingThreshold)
             return true;
     }
     return false;
@@ -2926,6 +2954,8 @@ int FeatherPrintGenerator::countLacingCollisions(const Shape& outline, const Set
     std::sort(anchors.begin(), anchors.end(), [](const SimpleAnchor& a, const SimpleAnchor& b) { return a.s < b.s; });
 
     const int total_anchors = static_cast<int>(anchors.size());
+    // Reverted to plain w_d (see generate()'s comment) — REV 4.10's stringer_W-scaled
+    // threshold false-positived on ordinary close-but-non-colliding Stringer runs.
     const double collision_w = w_d;
 
     struct AnchorRef { double s; bool is_cw; int orig_idx; };
@@ -3210,6 +3240,13 @@ VariableWidthLines FeatherPrintGenerator::generate(
     // Cross-helix collision detection: if a CCW and CW anchor are within w world-space
     // distance they will intersect — mark both for lacing (d < w, per the original spec
     // value — confirmed correct as-is for Stringer x Stringer collisions).
+    //
+    // REV 4.10 tried widening this to stringer_W * w_d, matching the Flange-zone formula,
+    // reasoning the ordinary Trace is stringer_W wide so that's the true overlap distance.
+    // Real-print testing (post-4.10) falsified that: Stringers are expected to run close
+    // together at many non-crossing points without literally overlapping, and the wider
+    // window flagged plenty of those as false-positive collisions, causing Traces to be
+    // silently dropped at random layers/positions. Reverted to the original w_d threshold.
     const double collision_w = w_d;
     // anchors is sorted by s in [0, arc.total) — a plain i<j scan with an early break never
     // considers a pair straddling the seam (one anchor near s~0, the other near s~arc.total,
@@ -3478,7 +3515,9 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
         s_end / 1000.0, params.full_ring_total / 1000.0, params.arc_start_in_ring / 1000.0,
         anchors.size(), ccw_adv_abs / 1000.0, cw_adv_abs / 1000.0);
 
-    // Collision detection — same logic as generate() (d < w), using arc_open for world positions
+    // Collision detection — same logic as generate() (d < w). See generate()'s own comment
+    // for why this reverted the REV 4.10 stringer_W-scaled threshold: real-print testing
+    // showed it false-positives on ordinary close-but-non-colliding Stringer runs.
     const int total_anchors = static_cast<int>(anchors.size());
     const double collision_w = w_d;
     for (int i = 0; i < total_anchors; i++)

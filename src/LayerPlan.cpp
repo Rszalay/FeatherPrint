@@ -523,6 +523,14 @@ GCodePath& LayerPlan::addTravel(const Point2LL& p, const ForceRetract force_retr
         // segments would otherwise go unretracted/unhopped and drag the just-printed wall.
         path->retract = true;
         path->perform_z_hop = mesh_or_extruder_settings.get<bool>("retraction_hop_enabled");
+        if (path->perform_z_hop)
+        {
+            // The generic retraction_hop height is tuned for ordinary printer travel, not for
+            // clearing a FeatherPrint-specific local obstacle at a synthetic-part transition
+            // (a Wall-stack peak, a Stringer/Lacing crossover weld) — use a dedicated,
+            // separately-tunable height for these transitions only (REV 4.10).
+            path->force_zhop_height = mesh_or_extruder_settings.get<coord_t>("featherprint_force_zhop_height");
+        }
     }
 
     // must start new travel path as retraction can be enabled or not depending on path length, etc.
@@ -3655,7 +3663,7 @@ void LayerPlan::writeGCode(GCodeExport& gcode)
                 if (path.perform_z_hop)
                 {
                     gcode.writeZhopStart(
-                        z_hop_height,
+                        path.force_zhop_height > 0 ? path.force_zhop_height : z_hop_height,
                         0.0,
                         retraction_amounts.has_value() ? std::make_optional(retraction_amounts->z_hop.amount) : std::nullopt,
                         retraction_amounts.has_value() ? retraction_amounts->z_hop.ratio : 0.0_r);

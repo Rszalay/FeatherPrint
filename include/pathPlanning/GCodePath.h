@@ -44,6 +44,7 @@ struct GCodePath
     bool unretract_before_last_travel_move{ false }; //!< Whether the last move of the path should be preceded by an unretraction. Used to unretract in the last travel move before
                                                      //!< an outer wall
     bool perform_z_hop{ false }; //!< Whether to perform a z_hop in this path, which is assumed to be a travel path.
+    coord_t force_zhop_height{ 0 }; //!< Non-zero overrides the z_hop height used for this path only (FeatherPrint ForceRetract::ALWAYS transitions), instead of the generic per-extruder retraction_hop value.
     bool perform_prime{ false }; //!< Whether this path is preceded by a prime (blob)
     std::vector<Point3LL> points{}; //!< The points constituting this path. The Z coordinate is an offset relative to the actual layer height, added to the global z_offset.
     bool done{ false }; //!< Path is finished, no more moves should be added, and a new path should be started instead of any appending done to this one.

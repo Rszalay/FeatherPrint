@@ -2848,6 +2848,20 @@
                     "settable_per_mesh": true,
                     "settable_globally": true
                 },
+                "featherprint_force_zhop_height":
+                {
+                    "label": "FeatherPrint Forced Z Hop Height",
+                    "description": "Z Hop height used only for FeatherPrint's own forced retract+hop travel moves between synthetic-part transitions (e.g. across a thin-neck split, or between disjoint Wall/Gusset components) — independent of the ordinary Z Hop Height setting, since these transitions may need to clear a local obstacle (a Wall-stack peak, a Stringer/Lacing crossover weld) that the generic travel Z Hop Height isn't sized for. Still gated by Z Hop Height Enabled: if that's off, these transitions force a retraction but not a hop.",
+                    "unit": "mm",
+                    "type": "float",
+                    "default_value": 2.0,
+                    "minimum_value": "0",
+                    "minimum_value_warning": "0",
+                    "maximum_value_warning": "10",
+                    "enabled": "infill_pattern == 'featherprint' and retraction_hop_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
                 "featherprint_lacing_width":
                 {
                     "label": "FeatherPrint Lacing Width",
