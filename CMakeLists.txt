@@ -218,6 +218,9 @@ set(engine_SRCS # Except main.cpp.
         src/vbct/validate.cpp
         src/vbct/vbs.cpp
         src/vbct/wall_ab_assignment.cpp
+
+        src/corrugated/VbctAdapter.cpp
+        src/corrugated/WallStrip.cpp
 )
 
 add_library(_CuraEngine STATIC ${engine_SRCS} ${engine_PB_SRCS})

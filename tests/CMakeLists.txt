@@ -15,7 +15,9 @@ set(TESTS_SRC_BASE
         PathOrderOptimizerTest
         PathOrderMonotonicTest
         TimeEstimateCalculatorTest
+        VbctAdapterTest
         WallsComputationTest
+        WallStripTest
 )
 
 set(TESTS_SRC_INTEGRATION
