@@ -30,6 +30,7 @@ enum class EFillMethod
     HONEYCOMB,
     OCTAGON,
     FEATHERPRINT, // Conformal stringer/lacing geodetic skin — FeatherPrint
+    CORRUGATED, // Corrugated wall-to-wall generator (VBCT pipeline) — FeatherPrint Corrugated
     NONE, // NOTE: Should remain second last! Before PLUGIN (Might be used in testing to enumerate the enum.)
     PLUGIN, // Place plugin after none to prevent it from being tested in the gtest suite.
 };

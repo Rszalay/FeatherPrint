@@ -2246,7 +2246,8 @@
                         "grid": "Grid",
                         "cubic": "Cubic",
                         "triangles": "Triangles",
-                        "featherprint": "FeatherPrint"
+                        "featherprint": "FeatherPrint",
+                        "corrugated": "Corrugated"
                     },
                     "default_value": "grid",
                     "enabled": "infill_line_distance > 0",
@@ -2920,6 +2921,154 @@
                     "minimum_value": "2",
                     "maximum_value": "20",
                     "enabled": "infill_pattern == 'featherprint' and featherprint_punchout_enabled",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                }
+            }
+        },
+        "corrugated":
+        {
+            "label": "Corrugated",
+            "icon": "Infill1",
+            "description": "Settings for Corrugated, a conformal wall-to-wall infill pattern powered by VBCT (wall correspondence + corrugation stringer generation) activated via Infill Pattern. Select 'Corrugated' under Infill > Infill Pattern to enable it; the settings below control VBCT's own pipeline tunables plus this project's Z-layer phase shift.",
+            "type": "category",
+            "children":
+            {
+                "corrugated_vbs_tolerance":
+                {
+                    "label": "Corrugated Edge Subdivision Tolerance",
+                    "description": "VBS boundary-subdivision tolerance fraction (Stage 2's 'x'), as a fraction of each contour's own mean edge length: an edge longer than (1+x) times that average is split into equal pieces. VBCT's own analysis found values below 1/3 (~0.334) can make irregular-edge shapes runaway-subdivide; values well above that mostly just produce fewer, longer stringer-supporting triangles.",
+                    "type": "float",
+                    "unit": "",
+                    "default_value": 0.3,
+                    "minimum_value": "0.05",
+                    "minimum_value_warning": "0.334",
+                    "maximum_value": "2.0",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_prune_threshold":
+                {
+                    "label": "Corrugated Skeleton Prune Threshold",
+                    "description": "VBCT Stage 9's pruning length threshold: skeleton chains (arms hanging off a junction with nothing at their far end) shorter than this are pruned and their material folded into a neighbouring wall instead of getting their own short corrugation span. Larger values simplify the resulting wall structure more aggressively; too large can absorb real, intentional short features.",
+                    "type": "float",
+                    "unit": "mm",
+                    "default_value": 0.8,
+                    "minimum_value": "0.0",
+                    "maximum_value_warning": "10.0",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_stringer_pitch":
+                {
+                    "label": "Corrugated Stringer Pitch",
+                    "description": "Target arc-length distance, along a corrugated domain's own governing (longer) wall, between successive corrugation stringers - VBCT Stage 10's own native tunable, used directly rather than converted from an approximate total count. Every corrugated domain in the part uses this same pitch, so a domain's own real stringer count still varies with its own measured perimeter (a short domain gets fewer stringers, a long one gets more), the same way Infill Line Distance is the setting Cura's own patterns actually consume elsewhere, with line count only ever a consequence, not a target in its own right.",
+                    "type": "float",
+                    "unit": "mm",
+                    "default_value": 3.0,
+                    "minimum_value": "0.05",
+                    "minimum_value_warning": "0.3",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_crossover_pitch_mm":
+                {
+                    "label": "Corrugated Crossover Pitch",
+                    "description": "The Z distance between successive crossings of the corrugation's two counter-rotating stringer families (Crosshatch), and the distance over which a Ring's own single stringer family sweeps once around the wall (spec Section 3.1's phase-anchoring continuity). Replaces the old wraps-per-mm rate setting: because this value is applied the same way to every domain in the part regardless of that domain's own stringer count, every Chain/Ring domain reaches its crossover at the same Z height instead of each domain's own crossover timing depending on how many stringers it happens to have. 0 disables both the crossover and the sweep (every layer restarts at VBCT's own fixed anchor). Keep this well above half a layer height or the sweep aliases into a static- or jittery-looking pattern instead of a smooth rotation - see this project's own investigation notes for the confirmed failure mode.",
+                    "type": "float",
+                    "unit": "mm",
+                    "default_value": 10.0,
+                    "minimum_value": "0.0",
+                    "minimum_value_warning": "1.0",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_raw_outline_mode":
+                {
+                    "label": "Corrugated Raw Outline Mode",
+                    "description": "Experimental. Corrugates a simple, fixed-width inset of this layer's raw slice outline (before Cura's own Arachne wall generation runs) instead of the wall-generated Infill Area. Arachne's variable-width bead placement can choose a genuinely different local wall topology at different Z heights for a part whose cross-section doesn't actually change with height, which VBCT's domain classification is sensitive to; a fixed-width inset trades Arachne's bead-width fidelity for guaranteed Z-invariant input. Does not yet exclude top/bottom skin area from the corrugated region - corrugation may overlap skin at the first/last few layers when enabled.",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_crosshatch_enabled":
+                {
+                    "label": "Corrugated Crosshatch",
+                    "description": "Adds a second stringer family that spirals in the opposite direction from the first as the print rises, so the two cross repeatedly over the print's height like two oppositely-wound helices, instead of one single spiraling stringer family. Requires a nonzero Corrugated Crossover Pitch to have any visible effect - with no Z-driven rotation there is no helix for a second one to counter-rotate against. Disabling this reproduces the single-family stringer pattern this project originally shipped with.",
+                    "type": "bool",
+                    "default_value": true,
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_skin_linked":
+                {
+                    "label": "Corrugated Linked Skin",
+                    "description": "Runs the corrugation's wall-following (\"skin\") portion as one continuous toolpath that alternates between the outer and inner wall each time it crosses a stringer, instead of printing each stringer as an independent segment. Supports Ring domains (a closed loop), a single Chain domain (an open path running from one end of the corridor to the other), and multiple Chain domains meeting at a junction (e.g. a Tee or cross shape) - each domain gets its own path, with any straight pass-through pair merged into one continuous run first (see Corrugated Chain Junction Merge Angle). Always uses the Corrugated Crosshatch stringer family internally on a Ring domain to have something to alternate against, even if Corrugated Crosshatch itself is disabled (not needed on a Chain domain). Falls back to the unlinked stringer pattern for any layer this can't be fully linked for (more than one Ring domain, a mixed Ring+Chain composition, a Glob domain, or any domain whose own stringer would leave a non-convex region).",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_chain_junction_merge_angle":
+                {
+                    "label": "Corrugated Chain Junction Merge Angle",
+                    "description": "When two Chain domains meet at a shared point (e.g. where a stem attaches to a crossbar, forming a Tee), this is how far from a perfectly straight 180 degrees their directions may differ and still be treated as one continuous straight pass-through, merged into a single Chain before corrugating - rather than two separate corridors that happen to end near each other. Only affects Chain domains meeting at a junction; has no effect on a part with no such junction. Increasing this risks merging a genuine branch that only coincidentally points close to opposite; decreasing it risks leaving a real, only-slightly-bent straight corridor unmerged.",
+                    "type": "float",
+                    "unit": "°",
+                    "default_value": 30,
+                    "minimum_value": "0",
+                    "maximum_value_warning": "90",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_strip_wall_a":
+                {
+                    "label": "Corrugated Strip Wall A",
+                    "description": "Suppresses Cura's own generated wall (all wall line loops on that side, not just the one next to the infill) on the segment(s) a corrugated domain covers, letting the corrugation's own Linked Skin wall-following path substitute for the removed wall's structural role instead of merely welding alongside it. Wall A is a Ring domain's outer wall, or (for a Chain domain, e.g. an open corridor) whichever of its own two walls is currently identified as Wall A - tracked consistently across layers, not picked independently each layer. Supports multiple Chain domains meeting at a junction, each stripped independently. Always forces Corrugated Linked Skin's wall-following mechanism on for the affected side even if Corrugated Linked Skin itself is disabled, since that mechanism is the only thing that can stand in for a removed wall. Has no effect on a Glob domain. Also has no effect on the corrugation's own boundary when Corrugated Raw Outline Mode is enabled (the wall is still stripped, but the corrugation does not yet move outboard to cover it in that mode) - disable Raw Outline Mode to use this setting.",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_strip_wall_b":
+                {
+                    "label": "Corrugated Strip Wall B",
+                    "description": "Suppresses Cura's own generated wall (all wall line loops on that side, not just the one next to the infill) on the segment(s) a corrugated domain covers, letting the corrugation's own Linked Skin wall-following path substitute for the removed wall's structural role instead of merely welding alongside it. Wall B is a Ring domain's inner wall (the hole's own boundary), or (for a Chain domain, e.g. an open corridor) whichever of its own two walls is currently identified as Wall B - tracked consistently across layers, not picked independently each layer. Supports multiple Chain domains meeting at a junction, each stripped independently. Always forces Corrugated Linked Skin's wall-following mechanism on for the affected side even if Corrugated Linked Skin itself is disabled, since that mechanism is the only thing that can stand in for a removed wall. Has no effect on a Glob domain. Also has no effect on the corrugation's own boundary when Corrugated Raw Outline Mode is enabled (the wall is still stripped, but the corrugation does not yet move outboard to cover it in that mode) - disable Raw Outline Mode to use this setting.",
+                    "type": "bool",
+                    "default_value": false,
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_deminimis_hole_area":
+                {
+                    "label": "Corrugated De Minimis Hole Area",
+                    "description": "Experimental. A small interior hole smaller than this area is ignored for the purposes of deciding a corrugated domain's own shape - treated as solid material there so it does not fragment what would otherwise be one simple domain into extra pieces. Cura's own wall generation is unaffected and still prints a real wall around the physical hole exactly as it would for any other hole; the corrugation's own stringers are still clipped against the hole's own real boundary so nothing is ever printed through the void. A hole's own suppressed/not-suppressed state does not flip on ordinary per-layer area noise: once treated as ignored, its area has to grow decisively past this threshold (not just cross it) before it starts being treated as a real hole again, and vice versa. This default has not yet been validated against a wide range of real prints - treat it as a starting point, not a final value.",
+                    "type": "float",
+                    "unit": "mm²",
+                    "default_value": 1.0,
+                    "minimum_value": "0",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_transition_layer_enabled":
+                {
+                    "label": "Corrugated Transition Layer Enabled",
+                    "description": "Experimental. Whenever the number of corrugated domains present on a layer changes from the previous layer - a domain appearing, disappearing, splitting, or merging - ordinary corrugation has no established continuity to build on yet, so the whole part's own infill area gets one ordinary concentric fill layer instead, the same way a top or bottom skin layer fills its own area. Disabling this turns off the safety net entirely, matching this project's own established default-on convention for a structural-safety feature.",
+                    "type": "bool",
+                    "default_value": true,
+                    "enabled": "infill_pattern == 'corrugated'",
                     "settable_per_mesh": true,
                     "settable_globally": true
                 }
@@ -8489,6 +8638,14 @@
                     "type": "bool",
                     "default_value": true,
                     "value": "magic_mesh_surface_mode != 'surface'",
+                    "settable_per_mesh": true
+                },
+                "meshfix_remove_diagonal_artifacts":
+                {
+                    "label": "Remove Tessellation Diagonal Artifacts",
+                    "description": "Experimental. Removes contour vertices produced by a straight-walled model's own triangulation diagonal, before wall/skin/infill generation ever sees them. A flat-walled model's side surface (a vertical extrusion or a linear sweep/shear) is tessellated as quads, each split into two triangles by one diagonal edge; slicing that diagonal produces an extra contour vertex that carries no real geometric information but slides slightly between layers even though the model's true cross-section does not change. Identified by mesh topology alone (not a distance-based heuristic), so it cannot remove genuine chamfer, draft, twist, or other smoothly-varying geometry - a real taper or a twisted sweep has no such diagonal to find.",
+                    "type": "bool",
+                    "default_value": false,
                     "settable_per_mesh": true
                 },
                 "meshfix_union_all_remove_holes":

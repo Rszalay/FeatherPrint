@@ -448,6 +448,8 @@ EFillMethod Settings::get<EFillMethod>(const std::string& key) const
         return EFillMethod::PLUGIN;
     case "featherprint"_sw:
         return EFillMethod::FEATHERPRINT;
+    case "corrugated"_sw:
+        return EFillMethod::CORRUGATED;
     default:
         return EFillMethod::NONE;
     }
