@@ -72,6 +72,7 @@ public:
         ff_holes.back().emplace_back(6000, 6000);
 
         // Settings for a simple 2 walls, about as basic as possible.
+        settings.add("infill_pattern", "grid");
         settings.add("alternate_extra_perimeter", "false");
         settings.add("fill_outline_gaps", "false");
         settings.add("initial_layer_line_width_factor", "100");
