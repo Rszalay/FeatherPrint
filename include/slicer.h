@@ -7,6 +7,7 @@
 #include <optional>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "geometry/OpenLinesSet.h"
 #include "geometry/Shape.h"
@@ -38,6 +39,22 @@ public:
     // with the vertex that it ended on.
     const MeshVertex* endVertex = nullptr;
     bool addedToPolygon = false;
+    // Whether `start`/`end` was produced by crossing a mesh edge identified (once, per mesh, in
+    // Slicer::buildFalseDiagonalEdges) as the "false diagonal" of a tessellated, straight,
+    // non-twisting ruled-surface quad's side wall (a vertical extrusion or a linear sweep/shear):
+    // the shared edge between two adjacent triangles where each triangle's own third vertex forms a
+    // "rail" with the *opposite* end of that shared edge, and the quad's two rails are parallel -
+    // the signature of a quad (P,Q,R,S) split by diagonal P-Q, where P-S and Q-R are the quad's real
+    // sides (a vertical rail, sharing identical XY top-to-bottom, is the special case of a rail
+    // parallel to +Z). Such a crossing's own XY slides with Z (it lies exactly on the straight line
+    // between the quad's two real corners at that Z) and carries zero geometric information of its
+    // own - see VBCT-Tessellation-Noise-Rejection-Brief.md for the full derivation and validation of
+    // the vertical case. Topologically exact (a fact about mesh connectivity and vertex positions,
+    // not a per-slice deviation heuristic), so unlike every geometry-based filter tried before it,
+    // this is safe to remove unconditionally with no adjacency/tolerance bookkeeping - see
+    // SlicerLayer::makeBasicPolygonLoop's own use of these flags.
+    bool start_is_false_diagonal = false;
+    bool end_is_false_diagonal = false;
 };
 
 class ClosePolygonResult
@@ -535,6 +552,47 @@ private:
     static std::optional<Point3D> getBarycentricCoordinates(const Point3LL& point, const Point3LL& p0, const Point3LL& p1, const Point3LL& p2);
 
     /*!
+     * \brief One mesh edge, identified by its two global vertex indices, canonicalized
+     * (smaller index first) so an edge hashes/compares identically regardless of which
+     * direction it's referenced from.
+     */
+    using EdgeKey = std::pair<int, int>;
+
+    struct EdgeKeyHash
+    {
+        size_t operator()(const EdgeKey& e) const
+        {
+            return std::hash<int64_t>()((static_cast<int64_t>(e.first) << 32) ^ static_cast<int64_t>(static_cast<uint32_t>(e.second)));
+        }
+    };
+
+    static EdgeKey canonicalEdgeKey(int a, int b)
+    {
+        return a <= b ? EdgeKey{ a, b } : EdgeKey{ b, a };
+    }
+
+    /*!
+     * \brief Identifies every mesh edge that is the "false diagonal" of a tessellated, straight,
+     * non-twisting ruled-surface quad's side wall (a vertical extrusion or a linear sweep/shear) -
+     * see SlicerSegment::start_is_false_diagonal's own doc comment for the exact topological
+     * criterion (a shared edge between two triangles where each triangle's own third vertex forms
+     * a "rail" with the *opposite* end of that shared edge, and the quad's two rails are parallel)
+     * and VBCT-Tessellation-Noise-Rejection-Brief.md for the vertical case's own derivation and
+     * validation against a real model. Never flags a genuine taper (its rails point in different
+     * directions) or a twisted/rotated sweep (same reason) - both are real shape changes, not
+     * artifacts.
+     *
+     * Computed once per mesh, entirely independent of Z height - a fact about mesh
+     * connectivity and vertex positions alone, not a per-layer or per-slice computation.
+     * Empty when \c meshfix_remove_diagonal_artifacts is off, so every downstream consumer
+     * (project2D, buildSegments) is a no-op in that case with no extra branching needed there.
+     *
+     * \param[in] mesh The mesh which is analyzed.
+     * \return The set of false-diagonal edges, keyed by canonicalized global vertex-index pair.
+     */
+    static std::unordered_set<EdgeKey, EdgeKeyHash> buildFalseDiagonalEdges(const Mesh& mesh);
+
+    /*!
      * \brief Project a triangle onto a 2D layer.
      *
      * The result is a SlicerSegment object, which is a line segment if the
@@ -543,17 +601,27 @@ private:
      * \param p0 A corner of the triangle.
      * \param p1 A corner of the triangle.
      * \param p2 A corner of the triangle.
+     * \param idx0 p0's own global vertex index (see false_diagonal_edges).
+     * \param idx1 p1's own global vertex index.
+     * \param idx2 p2's own global vertex index.
      * \param z The Z coordinate of the layer to intersect with.
+     * \param false_diagonal_edges Pre-scanned false-diagonal edges (buildFalseDiagonalEdges) -
+     * used to tag the resulting segment's own SlicerSegment::start_is_false_diagonal/
+     * end_is_false_diagonal.
      * \return A slicer segment.
      */
     static SlicerSegment project2D(
         const Point3LL& p0,
         const Point3LL& p1,
         const Point3LL& p2,
+        int idx0,
+        int idx1,
+        int idx2,
         const std::optional<Point2F>& uv0,
         const std::optional<Point2F>& uv1,
         const std::optional<Point2F>& uv2,
-        const coord_t z);
+        const coord_t z,
+        const std::unordered_set<EdgeKey, EdgeKeyHash>& false_diagonal_edges);
 
     /*! Creates an array of "z bounding boxes" for each face.
      * \param[in] mesh The mesh which is analyzed.
@@ -591,9 +659,15 @@ private:
      * \param[in] zbboxes The z part of the bounding boxes of the faces of the mesh.
      * \param[in] slicing_tolderance Slicing tolerance in order to figure out what happens when vertices are exactly on the slicing boundary.
      * \param[in, out] layers The segments are created here.
+     * \param[in] false_diagonal_edges Pre-scanned false-diagonal edges (buildFalseDiagonalEdges),
+     * forwarded to project2D for each face crossed.
      */
-    static void
-        buildSegments(const Mesh& mesh, const std::vector<std::pair<int32_t, int32_t>>& zbboxes, const SlicingTolerance& slicing_tolerance, std::vector<SlicerLayer>& layers);
+    static void buildSegments(
+        const Mesh& mesh,
+        const std::vector<std::pair<int32_t, int32_t>>& zbboxes,
+        const SlicingTolerance& slicing_tolerance,
+        std::vector<SlicerLayer>& layers,
+        const std::unordered_set<EdgeKey, EdgeKeyHash>& false_diagonal_edges);
 };
 
 } // namespace cura

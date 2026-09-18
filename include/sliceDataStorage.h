@@ -11,6 +11,7 @@
 #include "SupportInfillPart.h"
 #include "TopSurface.h"
 #include "WipeScriptConfig.h"
+#include "corrugated/CorrugationAnchor.h"
 #include "geometry/MixedLinesSet.h"
 #include "geometry/OpenLinesSet.h"
 #include "geometry/Point2LL.h"
@@ -487,6 +488,15 @@ public:
     std::shared_ptr<LightningGenerator> lightning_generator; //!< Pre-computed structure for Lightning type infill
 
     RetractionAndWipeConfig retraction_wipe_config; //!< Per-Object retraction and wipe settings.
+
+    //! Corrugated infill's cross-layer anchor continuity (spec REV 1.4 S:5.3): one entry per
+    //! layer, filled by FffGcodeWriter::computeCorrugationAnchors in a single-threaded pre-pass
+    //! before the parallel per-layer gcode-writing loop starts - mirrors
+    //! SliceDataStorage::spiralize_seam_vertex_indices' own precompute-before-parallel-loop
+    //! pattern, but per-mesh (each corrugated mesh's Ring tracks its own continuity
+    //! independently) rather than a single whole-print track. Empty for meshes that don't use
+    //! corrugated infill. See CorrugationAnchor's own doc comment.
+    std::vector<CorrugationAnchor> corrugation_anchors;
 
     /*!
      * \brief Creates a storage space for slice results of a mesh.

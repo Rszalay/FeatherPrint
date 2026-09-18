@@ -22,6 +22,53 @@
 namespace cura
 {
 
+namespace
+{
+// Simplify (utils/Simplify.cpp) treats a closed loop's explicit seam duplicate (the input's own
+// front==back closing pair) as two independent, ordinary vertices - it can delete one without
+// deleting the other, and can also relocate a vertex to a line-line intersection point with no
+// awareness of the rest of the polygon. On a real converging wall tip (layer-843 capture) this
+// was confirmed to orphan the original closing vertex and leave the output loop revisiting one
+// location three times (the mandatory re-closing copy of the new front, the same location's own
+// natural tip-fold visit, and the orphaned original seam point sandwiched between them) - a
+// self-touching pinch that isn't present in the pre-simplify data.
+//
+// Detect any non-adjacent coincidence in the (already re-closed) output beyond the one mandatory
+// wraparound pair (index 0 / index n-1, which every closed line legitimately has) so
+// simplifyToolPaths() can fall back to the pre-simplify points for just that one line, rather
+// than accept a polygon with a spurious self-touch baked into part.infill_area/inner_contour_.
+// Note this is deliberately conservative: a genuine converging-tip wall's OWN natural fold (e.g.
+// two nearby points where the wall goes out and comes back) will also trip this and fall back to
+// unsimplified - that only costs a missed point-count reduction for that one line, never
+// correctness, which is the right tradeoff here.
+constexpr coord_t kPinchEpsUm = 5;
+
+bool hasSelfTouchingPinch(const ExtrusionLine& line)
+{
+    const size_t n = line.size();
+    if (n < 4)
+    {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i)
+    {
+        for (size_t j = i + 2; j < n; ++j)
+        {
+            const bool wrap_adjacent = (i == 0 && j == n - 1);
+            if (wrap_adjacent)
+            {
+                continue;
+            }
+            if (shorterThan(line[i].p_ - line[j].p_, kPinchEpsUm))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+} // namespace
+
 WallToolPaths::WallToolPaths(
     const Shape& outline,
     const coord_t nominal_bead_width,
@@ -274,6 +321,15 @@ void WallToolPaths::simplifyToolPaths(std::vector<VariableWidthLines>& toolpaths
                        [&simplifier](auto& line)
                        {
                            auto line_ = line.is_closed_ ? simplifier.polygon(line) : simplifier.polyline(line);
+
+                           if (line_.is_closed_ && hasSelfTouchingPinch(line_))
+                           {
+                               // Simplify() introduced a self-touch that isn't present in the
+                               // pre-simplify data (confirmed on real capture) - keep the original,
+                               // unsimplified points for this one line rather than bake a spurious
+                               // pinch into the wall/infill-area geometry.
+                               line_ = line;
+                           }
 
                            if (line_.is_closed_ && line_.size() >= 2 && line_.front() != line_.back())
                            {

@@ -474,6 +474,21 @@ private:
         const bool split_near_end_location = false) const;
 
     /*!
+     * Renders the FeatherPrint Corrugated Ribbonization Correspondence Field as visible "spoke"
+     * line segments (one per correspondence pair, outer wall point to inner wall point), in
+     * place of normal infill, for parts with a real outer/inner wall pair. This is a debug/
+     * visual check tool (infill_pattern "corrugated"), not the real Corrugation Field.
+     * \return Whether this function added anything to the layer plan.
+     */
+    bool processCorrugatedInfill(
+        const SliceDataStorage& storage,
+        LayerPlan& gcode_layer,
+        const SliceMeshStorage& mesh,
+        const size_t extruder_nr,
+        const MeshPathConfigs& mesh_config,
+        const SliceLayerPart& part) const;
+
+    /*!
      * Generate the insets for the walls of a given layer part, without inserting them to the layer plan
      * \param[in] storage where the slice data is stored.
      * \param gcodeLayer The initial planning of the gcode of the layer.
@@ -778,6 +793,30 @@ private:
      * \return layer seam vertex index
      */
     unsigned int findSpiralizedLayerSeamVertexIndex(const SliceDataStorage& storage, const SliceMeshStorage& mesh, const int layer_nr, const int last_layer_nr);
+
+    /*!
+     * \brief Cross-layer corrugation anchor continuity pre-pass (spec REV 1.4 S:5.3), mirroring
+     * findLayerSeamsForSpiralize immediately above.
+     *
+     * VBCT's wall anchor/orientation rules are otherwise a from-scratch, purely-per-layer
+     * computation with no memory of what the previous layer chose - which is exactly what makes
+     * them unstable under sub-visual (tessellation-level) input noise, confirmed on a real part
+     * (see the spec section and its source brief, "VBCT Cross-Layer Anchor Continuity Brief").
+     * The only fix is for each layer's anchor choice to be a function of the immediately
+     * preceding layer's own already-computed result - which requires this pre-pass, because
+     * \ref processLayer (reached from \ref writeGCode's parallel
+     * run_multiple_producers_ordered_consumer loop below, via processCorrugatedInfill) runs as
+     * parallel producers with no ordering guarantee between layers. Only the ordered consumer
+     * that reassembles already-finished results into gcode runs in Z order, and by then
+     * corrugation for that layer is already finished - so nothing inside that parallel path can
+     * see another layer's result. This pass runs single-threaded, strictly before the parallel
+     * loop starts, filling each corrugated mesh's own SliceMeshStorage::corrugation_anchors so
+     * processCorrugatedInfill can later just look its already-computed anchor up.
+     *
+     * \param[in,out] storage where the slice data is stored - each corrugated mesh's
+     * \c corrugation_anchors is populated in place.
+     */
+    void computeCorrugationAnchors(SliceDataStorage& storage) const;
 
     /*!
      * Partition the Infill regions by the skin at N layers above.

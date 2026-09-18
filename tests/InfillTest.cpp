@@ -204,8 +204,11 @@ std::vector<InfillTestParameters> generateInfillTests()
      *  - Gyroid, honeycomb and octagon since they don't handle the 100% infill and related cases well
      *  - Concentric and ZigZag, since they now use a method that starts from an extra infill wall, which fail these tests (TODO!)
      */
-    std::vector<EFillMethod> skip_methods = { EFillMethod::CONCENTRIC, EFillMethod::ZIG_ZAG,   EFillMethod::CROSS,     EFillMethod::CROSS_3D, EFillMethod::CUBICSUBDIV,
-                                              EFillMethod::GYROID,     EFillMethod::LIGHTNING, EFillMethod::HONEYCOMB, EFillMethod::OCTAGON };
+    std::vector<EFillMethod> skip_methods
+        = { EFillMethod::CONCENTRIC, EFillMethod::ZIG_ZAG, EFillMethod::CROSS,      EFillMethod::CROSS_3D, EFillMethod::CUBICSUBDIV,
+            EFillMethod::GYROID,     EFillMethod::LIGHTNING, EFillMethod::HONEYCOMB, EFillMethod::OCTAGON,
+            EFillMethod::CORRUGATED, // Depends on part-level wall/correspondence data this generic Shape-only harness doesn't provide.
+            EFillMethod::FEATHERPRINT }; // Same reason - routed entirely through FeatherPrintGenerator, not Infill::generate().
 
     std::vector<EFillMethod> methods;
     for (int i_method = 0; i_method < static_cast<int>(EFillMethod::NONE); ++i_method)

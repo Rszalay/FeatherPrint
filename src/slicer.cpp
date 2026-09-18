@@ -4,7 +4,7 @@
 #include "slicer.h"
 
 #include <algorithm> // remove_if
-#include <cstdio>
+#include <cmath> // sqrt, abs
 #include <numbers>
 
 #include <scripta/logger.h>
@@ -35,6 +35,69 @@ constexpr int largest_neglected_gap_first_phase = MM2INT(0.01); //!< distance be
 constexpr int largest_neglected_gap_second_phase = MM2INT(0.02); //!< distance between two line segments regarded as connected
 constexpr int max_stitch1 = MM2INT(10.0); //!< maximal distance stitched between open polylines to form polygons
 
+namespace
+{
+
+// Perpendicular (XY) distance from p to the line through a-b, in microns. Falls back to plain
+// distance-to-a when a and b coincide (a zero-length anchor segment can't define a direction).
+double perpDistanceXY(const Point2LL& p, const Point2LL& a, const Point2LL& b)
+{
+    const double abx = static_cast<double>(b.X - a.X), aby = static_cast<double>(b.Y - a.Y);
+    const double apx = static_cast<double>(p.X - a.X), apy = static_cast<double>(p.Y - a.Y);
+    const double ab_len2 = abx * abx + aby * aby;
+    if (ab_len2 < 1.0) // a,b within 1 micron of each other - no meaningful direction
+    {
+        return std::sqrt(apx * apx + apy * apy);
+    }
+    const double cross = abx * apy - aby * apx;
+    return std::abs(cross) / std::sqrt(ab_len2);
+}
+
+// Douglas-Peucker-style recursion, restricted to candidate ("false diagonal") points only: the
+// two real quad-flatness tests in buildFalseDiagonalEdges (rail-parallelism, Z-span) only look at
+// ONE mesh edge in isolation, so they can't see that a long CHAIN of individually near-flat
+// quads on a finely-tessellated curved surface cumulatively represents real curvature - see
+// VBCT/FeatherPrint's own investigation notes (2026-09-13, Aerofoil-2412-Sweep hi-res reslice: a
+// single flagged edge measured genuinely coplanar to 1e-6, yet the whole flagged population at
+// one layer collapsed 92% of that layer's real points and 39% of its area). This is the missing
+// aggregate safety net: mark a candidate point as `must_keep` (i.e. don't actually drop it) the
+// moment collapsing its run would deviate from the nearest surviving neighbors by more than
+// kMaxCollapseDeviationUm - exactly the same bound the original exact-match feature achieved for
+// free (zero tolerance), just made explicit and checked directly against the resulting shape
+// instead of inferred from mesh topology. A truly straight run (genuine tall wall, any height)
+// still collapses entirely, since every point's own deviation stays ~0 regardless of run length.
+constexpr double kMaxCollapseDeviationUm = 10.0;
+
+void markMustKeepRun(const Polygon& poly, const Point2LL& anchor_lo, const Point2LL& anchor_hi, const std::vector<int>& run_indices, std::vector<bool>& must_keep)
+{
+    if (run_indices.empty())
+    {
+        return;
+    }
+    int max_pos = -1;
+    double max_dev = -1.0;
+    for (size_t k = 0; k < run_indices.size(); ++k)
+    {
+        const double d = perpDistanceXY(poly[run_indices[k]], anchor_lo, anchor_hi);
+        if (d > max_dev)
+        {
+            max_dev = d;
+            max_pos = static_cast<int>(k);
+        }
+    }
+    if (max_dev > kMaxCollapseDeviationUm)
+    {
+        const int idx = run_indices[static_cast<size_t>(max_pos)];
+        must_keep[static_cast<size_t>(idx)] = true;
+        const std::vector<int> left(run_indices.begin(), run_indices.begin() + max_pos);
+        const std::vector<int> right(run_indices.begin() + max_pos + 1, run_indices.end());
+        markMustKeepRun(poly, anchor_lo, poly[idx], left, must_keep);
+        markMustKeepRun(poly, poly[idx], anchor_hi, right, must_keep);
+    }
+}
+
+} // namespace
+
 void SlicerLayer::makeBasicPolygonLoops(OpenLinesSet& open_polylines)
 {
     for (size_t start_segment_idx = 0; start_segment_idx < segments_.size(); start_segment_idx++)
@@ -50,16 +113,67 @@ void SlicerLayer::makeBasicPolygonLoop(OpenLinesSet& open_polylines, const size_
 {
     Polygon poly(true);
     poly.push_back(segments_[start_segment_idx].start);
+    // Parallel to poly's own points - see SlicerSegment::start_is_false_diagonal's own doc
+    // comment. Filtered out below, before Simplify()/offset() or anything else has a chance to
+    // regenerate coordinates and destroy the exact correspondence this depends on.
+    std::vector<bool> is_false_diagonal;
+    is_false_diagonal.push_back(segments_[start_segment_idx].start_is_false_diagonal);
 
     for (int segment_idx = start_segment_idx; segment_idx != -1;)
     {
         SlicerSegment& segment = segments_[segment_idx];
         poly.push_back(segment.end);
+        is_false_diagonal.push_back(segment.end_is_false_diagonal);
         segment.addedToPolygon = true;
         segment_idx = getNextSegmentIdx(segment, start_segment_idx);
         if (segment_idx == static_cast<int>(start_segment_idx))
         { // polyon is closed
-            polygons_.push_back(std::move(poly));
+            // Which flagged points can actually be dropped without the aggregate shape deviating
+            // from its own nearest surviving neighbors by more than kMaxCollapseDeviationUm - see
+            // markMustKeepRun's own doc comment for why this aggregate check exists alongside
+            // buildFalseDiagonalEdges' per-edge candidate generation, not instead of it.
+            std::vector<bool> must_keep(poly.size(), false);
+            std::vector<int> kept_indices;
+            for (size_t i = 0; i < poly.size(); ++i)
+            {
+                if (! is_false_diagonal[i])
+                {
+                    kept_indices.push_back(static_cast<int>(i));
+                }
+            }
+            if (! kept_indices.empty())
+            {
+                const size_t n = poly.size();
+                const size_t num_kept = kept_indices.size();
+                for (size_t j = 0; j < num_kept; ++j)
+                {
+                    const int lo = kept_indices[j];
+                    const int hi = kept_indices[(j + 1) % num_kept];
+                    std::vector<int> run;
+                    for (size_t idx = (static_cast<size_t>(lo) + 1) % n; idx != static_cast<size_t>(hi); idx = (idx + 1) % n)
+                    {
+                        run.push_back(static_cast<int>(idx));
+                    }
+                    markMustKeepRun(poly, poly[lo], poly[hi], run, must_keep);
+                }
+            }
+            // else: every point in this loop was flagged, with no mandatory anchor at all to
+            // measure deviation against - leave must_keep all false rather than guess; the
+            // existing "never collapse below a valid polygon" fallback below (filtered.size() < 3
+            // falls back to the unfiltered poly) already covers this pathological case safely.
+
+            Polygon filtered(true);
+            for (size_t i = 0; i < poly.size(); ++i)
+            {
+                if (! is_false_diagonal[i] || must_keep[i])
+                {
+                    filtered.push_back(poly[i]);
+                }
+            }
+
+            // Never collapse below a valid polygon - a topologically-sound mesh shouldn't ever
+            // produce this, but fail safe rather than emit a degenerate shape if it somehow does.
+            polygons_.push_back(filtered.size() >= 3 ? std::move(filtered) : std::move(poly));
             return;
         }
     }
@@ -840,7 +954,14 @@ Slicer::Slicer(
 
     std::vector<std::pair<int32_t, int32_t>> zbbox = buildZHeightsForFaces(*mesh);
 
-    buildSegments(*mesh, zbbox, slicing_tolerance, layers);
+    // See SlicerSegment::start_is_false_diagonal's own doc comment and
+    // VBCT-Tessellation-Noise-Rejection-Brief.md. Gated here (not inside buildSegments/project2D)
+    // so the whole pre-scan - and every downstream lookup - is skipped entirely when off, at zero
+    // cost, rather than running and simply never matching anything.
+    const std::unordered_set<EdgeKey, EdgeKeyHash> false_diagonal_edges
+        = mesh->settings_.get<bool>("meshfix_remove_diagonal_artifacts") ? buildFalseDiagonalEdges(*mesh) : std::unordered_set<EdgeKey, EdgeKeyHash>{};
+
+    buildSegments(*mesh, zbbox, slicing_tolerance, layers, false_diagonal_edges);
 
     spdlog::info("Slice of mesh took {:03.3f} seconds", slice_timer.restart());
 
@@ -849,7 +970,12 @@ Slicer::Slicer(
     spdlog::info("Make polygons took {:03.3f} seconds", slice_timer.restart());
 }
 
-void Slicer::buildSegments(const Mesh& mesh, const std::vector<std::pair<int32_t, int32_t>>& zbbox, const SlicingTolerance& slicing_tolerance, std::vector<SlicerLayer>& layers)
+void Slicer::buildSegments(
+    const Mesh& mesh,
+    const std::vector<std::pair<int32_t, int32_t>>& zbbox,
+    const SlicingTolerance& slicing_tolerance,
+    std::vector<SlicerLayer>& layers,
+    const std::unordered_set<EdgeKey, EdgeKeyHash>& false_diagonal_edges)
 {
     cura::parallel_for(
         layers,
@@ -880,6 +1006,9 @@ void Slicer::buildSegments(const Mesh& mesh, const std::vector<std::pair<int32_t
                 Point3LL p0 = v0.p_;
                 Point3LL p1 = v1.p_;
                 Point3LL p2 = v2.p_;
+                const int idx0 = face.vertex_index_[0];
+                const int idx1 = face.vertex_index_[1];
+                const int idx2 = face.vertex_index_[2];
 
                 // Compensate for points exactly on the slice-boundary, except for 'inclusive', which already handles this correctly.
                 if (slicing_tolerance != SlicingTolerance::INCLUSIVE)
@@ -922,13 +1051,13 @@ void Slicer::buildSegments(const Mesh& mesh, const std::vector<std::pair<int32_t
 
                 if (p0.z_ < z && p1.z_ > z && p2.z_ > z) //  1_______2
                 { //   \     /
-                    s = project2D(p0, p2, p1, uv0, uv2, uv1, z); //------------- z
+                    s = project2D(p0, p2, p1, idx0, idx2, idx1, uv0, uv2, uv1, z, false_diagonal_edges); //------------- z
                     end_edge_idx = 0; //     \ /
                 } //      0
 
                 else if (p0.z_ > z && p1.z_ <= z && p2.z_ <= z) //      0
                 { //     / \      .
-                    s = project2D(p0, p1, p2, uv0, uv1, uv2, z); //------------- z
+                    s = project2D(p0, p1, p2, idx0, idx1, idx2, uv0, uv1, uv2, z, false_diagonal_edges); //------------- z
                     end_edge_idx = 2; //   /     \    .
                     if (p2.z_ == z) //  1_______2
                     {
@@ -938,13 +1067,13 @@ void Slicer::buildSegments(const Mesh& mesh, const std::vector<std::pair<int32_t
 
                 else if (p1.z_ < z && p0.z_ > z && p2.z_ > z) //  0_______2
                 { //   \     /
-                    s = project2D(p1, p0, p2, uv1, uv0, uv2, z); //------------- z
+                    s = project2D(p1, p0, p2, idx1, idx0, idx2, uv1, uv0, uv2, z, false_diagonal_edges); //------------- z
                     end_edge_idx = 1; //     \ /
                 } //      1
 
                 else if (p1.z_ > z && p0.z_ <= z && p2.z_ <= z) //      1
                 { //     / \      .
-                    s = project2D(p1, p2, p0, uv1, uv2, uv0, z); //------------- z
+                    s = project2D(p1, p2, p0, idx1, idx2, idx0, uv1, uv2, uv0, z, false_diagonal_edges); //------------- z
                     end_edge_idx = 0; //   /     \    .
                     if (p0.z_ == z) //  0_______2
                     {
@@ -954,13 +1083,13 @@ void Slicer::buildSegments(const Mesh& mesh, const std::vector<std::pair<int32_t
 
                 else if (p2.z_ < z && p1.z_ > z && p0.z_ > z) //  0_______1
                 { //   \     /
-                    s = project2D(p2, p1, p0, uv2, uv1, uv0, z); //------------- z
+                    s = project2D(p2, p1, p0, idx2, idx1, idx0, uv2, uv1, uv0, z, false_diagonal_edges); //------------- z
                     end_edge_idx = 2; //     \ /
                 } //      2
 
                 else if (p2.z_ > z && p1.z_ <= z && p0.z_ <= z) //      2
                 { //     / \      .
-                    s = project2D(p2, p0, p1, uv2, uv0, uv1, z); //------------- z
+                    s = project2D(p2, p0, p1, idx2, idx0, idx1, uv2, uv0, uv1, z, false_diagonal_edges); //------------- z
                     end_edge_idx = 1; //   /     \    .
                     if (p1.z_ == z) //  0_______1
                     {
@@ -1168,14 +1297,122 @@ std::vector<std::pair<int32_t, int32_t>> Slicer::buildZHeightsForFaces(const Mes
     return zHeights;
 }
 
+std::unordered_set<Slicer::EdgeKey, Slicer::EdgeKeyHash> Slicer::buildFalseDiagonalEdges(const Mesh& mesh)
+{
+    std::unordered_set<EdgeKey, EdgeKeyHash> result;
+    auto xy_eq = [](const Point3LL& a, const Point3LL& b) { return a.x_ == b.x_ && a.y_ == b.y_; };
+
+    // Any straight, non-twisting ruled-surface quad (vertical or swept) is a false diagonal iff its
+    // two "rail" vectors are parallel - see buildFalseDiagonalEdges' own doc comment (slicer.h) for
+    // the full derivation. A vertical rail (xy_eq) is the special case of a rail parallel to +Z;
+    // this generalises to any orientation via a cross-product-based parallel test.
+    //
+    // kMinRailZSpan: skip a candidate shared edge whose own two endpoints sit at (near-)equal Z -
+    // it's an in-plane edge of the surface's own tessellation (e.g. a facet on a finely-tessellated
+    // curved nose/tail), never a genuine rung/diagonal, which must always connect a bottom-ish to a
+    // top-ish vertex. Without this guard, testing every adjacent face pair for rail-parallelism
+    // alone reproduces the "real curvature and artifact deviation occupy the same range" trap
+    // VBCT-Tessellation-Noise-Rejection-Brief.md already found for per-vertex deviation heuristics -
+    // confirmed directly on Aerofoil - 2412-Sweep (1).stl (492 tris): without this guard, 72/255
+    // candidates fall under a 0.01 sin-of-angle threshold with no clean gap; with it, the best
+    // remaining candidate measures 1e-6 (machine-precision-parallel, the same character as the
+    // original exact-match test) and the pool shrinks to a plausible per-rail wall count. 50 microns
+    // sits far below any real rung span (mm-scale in every case measured) and far above STL export
+    // noise.
+    constexpr coord_t kMinRailZSpan = 50; // microns
+    // kMaxRailSinAngle: sin(angle) between the two candidate rails, i.e.
+    // |cross(railA, railB)| / (|railA| * |railB|). Measured true-diagonal candidates on the real
+    // sweep model cluster from 1e-6 up to ~1e-2 once kMinRailZSpan excludes the in-plane false
+    // matches above - this is STL-quantization noise on genuine diagonals, not population overlap
+    // with unrelated curved-surface facets. 0.03 (~1.7 degrees) sits with margin above that spread.
+    constexpr double kMaxRailSinAngle = 0.03;
+
+    // Plain double arithmetic on the raw fixed-point components (matching xy_eq's own direct-field-
+    // access style) - deliberately not routed through Point3LL's own integer-returning vSize()/dot(),
+    // which would round away exactly the sub-micron precision this comparison needs.
+    auto rails_parallel = [](const Point3LL& r, const Point3LL& q, const Point3LL& s, const Point3LL& p) -> bool
+    {
+        const double ax = static_cast<double>(r.x_ - q.x_), ay = static_cast<double>(r.y_ - q.y_), az = static_cast<double>(r.z_ - q.z_);
+        const double bx = static_cast<double>(s.x_ - p.x_), by = static_cast<double>(s.y_ - p.y_), bz = static_cast<double>(s.z_ - p.z_);
+        const double len_a = std::sqrt(ax * ax + ay * ay + az * az);
+        const double len_b = std::sqrt(bx * bx + by * by + bz * bz);
+        if (len_a < 1.0 || len_b < 1.0)
+        {
+            return false; // degenerate (near-coincident) rail - never trust a near-zero-length vector's direction
+        }
+        const double cx = ay * bz - az * by;
+        const double cy = az * bx - ax * bz;
+        const double cz = ax * by - ay * bx;
+        const double sin_angle = std::sqrt(cx * cx + cy * cy + cz * cz) / (len_a * len_b);
+        return sin_angle < kMaxRailSinAngle;
+    };
+
+    for (int fi = 0; fi < static_cast<int>(mesh.faces_.size()); ++fi)
+    {
+        const MeshFace& face = mesh.faces_[fi];
+        for (int ei = 0; ei < 3; ++ei)
+        {
+            const int p_idx = face.vertex_index_[ei];
+            const int q_idx = face.vertex_index_[(ei + 1) % 3];
+            const Point3LL& p = mesh.vertices_[p_idx].p_;
+            const Point3LL& q = mesh.vertices_[q_idx].p_;
+            if (xy_eq(p, q))
+            {
+                continue; // the edge itself is a vertical/swept rail - it's a real quad side, not a diagonal candidate
+            }
+            const coord_t z_span = (p.z_ > q.z_) ? (p.z_ - q.z_) : (q.z_ - p.z_);
+            if (z_span < kMinRailZSpan)
+            {
+                continue; // the edge itself is (near-)in-plane - never a genuine rung/diagonal, only ever a curved-surface facet edge
+            }
+            const int fj = face.connected_face_index_[ei];
+            if (fj == -1)
+            {
+                continue; // no adjacent face (disconnected/non-manifold mesh) - same sentinel/guard as endOtherFaceIdx's own consumer
+            }
+            const int r_idx = face.vertex_index_[(ei + 2) % 3]; // this face's own third vertex
+            const MeshFace& other_face = mesh.faces_[fj];
+            int s_idx = -1;
+            for (int k = 0; k < 3; ++k)
+            {
+                const int candidate = other_face.vertex_index_[k];
+                if (candidate != p_idx && candidate != q_idx)
+                {
+                    s_idx = candidate;
+                    break;
+                }
+            }
+            if (s_idx == -1)
+            {
+                continue; // shouldn't happen for a genuine shared edge, but never dereference a missing vertex
+            }
+            const Point3LL& r = mesh.vertices_[r_idx].p_;
+            const Point3LL& s = mesh.vertices_[s_idx].p_;
+            // False-diagonal signature: each triangle's own third vertex forms a "rail" with the
+            // *opposite* end of the shared edge, and the two candidate rails are parallel - see this
+            // function's own doc comment (slicer.h) for the full derivation.
+            const bool matches = rails_parallel(r, q, s, p) || rails_parallel(r, p, s, q);
+            if (matches)
+            {
+                result.insert(canonicalEdgeKey(p_idx, q_idx));
+            }
+        }
+    }
+    return result;
+}
+
 SlicerSegment Slicer::project2D(
     const Point3LL& p0,
     const Point3LL& p1,
     const Point3LL& p2,
+    const int idx0,
+    const int idx1,
+    const int idx2,
     const std::optional<Point2F>& uv0,
     const std::optional<Point2F>& uv1,
     const std::optional<Point2F>& uv2,
-    const coord_t z)
+    const coord_t z,
+    const std::unordered_set<EdgeKey, EdgeKeyHash>& false_diagonal_edges)
 {
     SlicerSegment seg;
 
@@ -1183,6 +1420,9 @@ SlicerSegment Slicer::project2D(
     seg.start.Y = interpolate(z, p0.z_, p1.z_, p0.y_, p1.y_);
     seg.end.X = interpolate(z, p0.z_, p2.z_, p0.x_, p2.x_);
     seg.end.Y = interpolate(z, p0.z_, p2.z_, p0.y_, p2.y_);
+    // See SlicerSegment::start_is_false_diagonal's own doc comment (slicer.h).
+    seg.start_is_false_diagonal = false_diagonal_edges.count(canonicalEdgeKey(idx0, idx1)) > 0;
+    seg.end_is_false_diagonal = false_diagonal_edges.count(canonicalEdgeKey(idx0, idx2)) > 0;
 
     if (uv0.has_value() && uv1.has_value() && uv2.has_value())
     {

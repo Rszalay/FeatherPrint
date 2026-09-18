@@ -18,10 +18,12 @@ set(TESTS_SRC_BASE
         VbctAdapterTest
         WallsComputationTest
         WallStripTest
+        WallToolPathsTest
 )
 
 set(TESTS_SRC_INTEGRATION
         SlicePhaseTest
+        SlicerFalseDiagonalTest
 )
 
 set(TESTS_SRC_SETTINGS

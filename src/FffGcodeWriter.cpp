@@ -4,6 +4,8 @@
 #include "FffGcodeWriter.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <limits> // numeric_limits
 #include <list>
 #include <memory>
@@ -27,8 +29,12 @@
 #include "WallToolPaths.h"
 #include "bridge/bridge.h"
 #include "communication/Communication.h" //To send layer view data.
+#include "corrugated/VbctAdapter.h"
+#include "corrugated/WallStrip.h"
 #include "geometry/LinesSet.h"
 #include "geometry/OpenPolyline.h"
+#include "geometry/Point2D.h"
+#include "geometry/Polygon.h"
 #include "geometry/PointMatrix.h"
 #include "infill.h"
 #include "progress/Progress.h"
@@ -169,6 +175,12 @@ void FffGcodeWriter::writeGCode(SliceDataStorage& storage, TimeKeeper& time_keep
     {
         findLayerSeamsForSpiralize(storage, total_layers);
     }
+
+    // Cross-layer corrugation anchor continuity (spec REV 1.4 S:5.3) - see
+    // computeCorrugationAnchors' own doc comment for why this has to run here, single-threaded,
+    // before the parallel run_multiple_producers_ordered_consumer loop below. Cost-free when no
+    // mesh uses corrugated infill (the per-mesh check inside skips straight past).
+    computeCorrugationAnchors(storage);
 
     int process_layer_starting_layer_nr = 0;
     const bool has_raft = scene.current_mesh_group->settings.get<EPlatformAdhesion>("adhesion_type") == EPlatformAdhesion::RAFT;
@@ -316,6 +328,22 @@ void FffGcodeWriter::findLayerSeamsForSpiralize(SliceDataStorage& storage, size_
                 }
             }
         }
+    }
+}
+
+void FffGcodeWriter::computeCorrugationAnchors(SliceDataStorage& storage) const
+{
+    // No extruder/mesh-order iteration needed here, unlike findLayerSeamsForSpiralize above -
+    // corrugation anchor tracking is purely per-mesh (spec REV 1.4 S:5.3's own scope), with no
+    // cross-mesh interaction, so every mesh using corrugated infill gets its own independent pass.
+    for (const std::shared_ptr<SliceMeshStorage>& mesh_ptr : storage.meshes)
+    {
+        SliceMeshStorage& mesh = *mesh_ptr;
+        if (mesh.settings.get<EFillMethod>("infill_pattern") != EFillMethod::CORRUGATED)
+        {
+            continue;
+        }
+        mesh.corrugation_anchors = VbctAdapter::computeAnchorsForMesh(mesh);
     }
 }
 
@@ -1906,6 +1934,76 @@ void FffGcodeWriter::addMeshPartToGCode(
     const bool end_infill_close_to_seam
         = infill_before_walls && mesh.settings.get<InfillStartEndPreference>("infill_start_end_preference") == InfillStartEndPreference::END_CLOSE_TO_SEAM;
 
+    // Wall Strip (spec REV 2.6, Section 5.7; Ring domains only as of this pass): suppress Cura's
+    // own generated wall on a corrugated Ring domain's own outer (Wall A) and/or inner/hole (Wall
+    // B) contour, letting the corrugation's own Linked Corrugation Skin wall-following path
+    // substitute for the removed wall - see stripRingWalls' own header doc
+    // (include/corrugated/WallStrip.h) for the full design and why this is a post-hoc trim of the
+    // already-finished part.wall_toolpaths rather than a change to wall generation itself. Must run
+    // *before* preProcessInsets below, since that call is what actually consumes
+    // part.wall_toolpaths to build the InsetOrderOptimizer - by the time processCorrugatedInfill's
+    // own VBCT domain computation runs (later, during processInfill), the insets have already been
+    // committed. Mutating part.wall_toolpaths directly is safe: this layer's own SliceLayerPart is
+    // exclusively owned by this layer's parallel gcode task by this point, and WallsComputation's
+    // own earlier slicing pass never re-runs here. Gated entirely behind the two new settings -
+    // when both are false (the default), this is skipped and today's behavior is unchanged.
+    if (mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::CORRUGATED
+        && (mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b")))
+    {
+        const LayerIndex strip_layer_nr = gcode_layer.getLayerNr();
+        const bool have_strip_anchor = strip_layer_nr >= 0 && static_cast<size_t>(strip_layer_nr) < mesh.corrugation_anchors.size();
+        const bool strip_has_ring = have_strip_anchor && mesh.corrugation_anchors[strip_layer_nr].has_ring;
+        if (strip_has_ring)
+        {
+            stripRingWalls(part.wall_toolpaths, mesh.settings.get<bool>("corrugated_strip_wall_a"), mesh.settings.get<bool>("corrugated_strip_wall_b"));
+        }
+
+        // Wall Strip (spec REV 2.6/5.7): every Chain domain this layer has, not just a single
+        // tracked one, can be stripped simultaneously (e.g. a Tee's own crossbar and stem at once) -
+        // findAllChainDomainWalls (VbctAdapter.h) returns one entry per domain, each already
+        // labeled Wall A/Wall B via the per-domain cross-layer identity tracking
+        // (CorrugationAnchor::chain_domain_wall_identities). A Chain domain's own wall is very often
+        // only part of a larger wall polygon shared with sibling domains (the Tee crossbar case,
+        // spec Section 5.6's addendum) - stripWallArcLengthRanges (WallStrip.h) handles that case,
+        // the simpler single-domain-owns-its-whole-loop case, and multiple domains sharing (or not
+        // sharing) a contour, all uniformly.
+        //
+        // Every domain's every requested side is collected into *one* combined list and passed to a
+        // single stripWallArcLengthRanges call, not one call per domain/side - stripping one side
+        // first would leave its own physical contour open, and stripWallArcLengthRanges only ever
+        // matches *closed* contours, so a later independent call sharing that same contour (either
+        // this domain's own other side, or a different domain entirely) could no longer find it at
+        // all (confirmed directly by the user on a real print for one domain's own two sides - the
+        // same risk applies equally across domains sharing a loop). stripWallArcLengthRanges' own
+        // doc comment covers why this needs to be one call, not why the caller should retry
+        // differently.
+        if (have_strip_anchor && ! mesh.corrugation_anchors[strip_layer_nr].chain_domain_wall_identities.empty())
+        {
+            const std::vector<VbctAdapter::ChainWallPoints> all_chain_walls = VbctAdapter::findAllChainDomainWalls(
+                part,
+                mesh.settings,
+                mesh.corrugation_anchors[strip_layer_nr].chain_domain_wall_identities,
+                mesh.corrugation_anchors[strip_layer_nr].suppressed_hole_identities);
+            std::vector<std::vector<Point2LL>> chain_strip_sets;
+            for (const VbctAdapter::ChainWallPoints& chain_walls : all_chain_walls)
+            {
+                if (! chain_walls.found)
+                {
+                    continue;
+                }
+                if (mesh.settings.get<bool>("corrugated_strip_wall_a"))
+                {
+                    chain_strip_sets.push_back(chain_walls.wall_a);
+                }
+                if (mesh.settings.get<bool>("corrugated_strip_wall_b"))
+                {
+                    chain_strip_sets.push_back(chain_walls.wall_b);
+                }
+            }
+            stripWallArcLengthRanges(part.wall_toolpaths, chain_strip_sets);
+        }
+    }
+
     // Pre-process the insets without actually adding them, so that we know where they are going to start printing
     InsetsPreprocessResult insets_preprocess_result = preProcessInsets(storage, gcode_layer, mesh, extruder_nr, mesh_config, part, end_infill_close_to_seam);
     bool infill_added = false;
@@ -2170,6 +2268,18 @@ bool FffGcodeWriter::processSingleLayerInfill(
     {
         return false;
     }
+
+    const auto pattern = mesh.settings.get<EFillMethod>("infill_pattern");
+    if (pattern == EFillMethod::CORRUGATED)
+    {
+        // The Corrugated pattern is a wall-correspondence visualization, not a density-based
+        // fill - it doesn't depend on infill_line_distance or the density-partitioned
+        // infill_area_per_combine_per_density below, so it must bypass that guard entirely
+        // (a common real slicing setup has 0% infill density, which would otherwise always
+        // return false here before this pattern ever got a chance to run).
+        return processCorrugatedInfill(storage, gcode_layer, mesh, extruder_nr, mesh_config, part);
+    }
+
     const auto infill_line_distance = mesh.settings.get<coord_t>("infill_line_distance");
     if (infill_line_distance == 0 || part.infill_area_per_combine_per_density[0].empty())
     {
@@ -2183,8 +2293,6 @@ bool FffGcodeWriter::processSingleLayerInfill(
     OpenLinesSet infill_lines;
     OpenLinesSet skin_support_lines;
     Shape skin_support_polygons;
-
-    const auto pattern = mesh.settings.get<EFillMethod>("infill_pattern");
     const bool zig_zaggify_infill = mesh.settings.get<bool>("zig_zaggify_infill") || pattern == EFillMethod::ZIG_ZAG;
     const bool connect_polygons = mesh.settings.get<bool>("connect_infill_polygons");
     const auto infill_overlap = mesh.settings.get<coord_t>("infill_overlap_mm");
@@ -2462,6 +2570,566 @@ bool FffGcodeWriter::processSingleLayerInfill(
         skin_support_angle);
 
     return added_something;
+}
+
+bool FffGcodeWriter::processCorrugatedInfill(
+    const SliceDataStorage& storage,
+    LayerPlan& gcode_layer,
+    const SliceMeshStorage& mesh,
+    const size_t extruder_nr,
+    const MeshPathConfigs& mesh_config,
+    const SliceLayerPart& part) const
+{
+    // VBCT (see src/vbct/VENDORED.md) is this project's real wall-correspondence + corrugation
+    // engine: it takes the infill area's own contours, builds a constrained Delaunay
+    // triangulation, classifies Ring/Chain/Glob domains via its own skeleton, and emits straight
+    // corrugation stringers directly - superseding this project's earlier hand-rolled Ring-only
+    // correspondence code (retired; see git history). Tunables now reach Cura's settings UI (the
+    // "Corrugated" settings category, packaging/fdmprinter.def.json) instead of being hardcoded
+    // - spec Section 5.1's original direction to expose every tuning constant.
+    const double vbct_x = mesh.settings.get<double>("corrugated_vbs_tolerance");
+    const coord_t vbct_threshold = mesh.settings.get<coord_t>("corrugated_prune_threshold");
+    const LayerIndex corrugation_input_layer_nr = gcode_layer.getLayerNr();
+
+    // Transition Layer (2026-09-15 full-layer redesign): when this exact layer's own total domain
+    // count changed relative to the previous layer (CorrugationAnchor::transition_layer_triggered,
+    // decided once with cross-layer tracking by computeAnchorsForMesh's own pre-pass), corrugation
+    // itself has no continuity to build on yet for whichever domain(s) just appeared/disappeared -
+    // rather than substituting solid fill for just the affected domain inside an otherwise-ordinary
+    // corrugated layer (this feature's original, more complex design), the whole part's own infill
+    // area is filled as one ordinary concentric layer instead, exactly the way a top/bottom skin
+    // layer fills its own area - simpler, and it makes no difference to the printed part which
+    // domain(s) specifically drove the transition, since every domain on the layer transitions
+    // together. Bypasses VBCT/corrugate() entirely for this layer.
+    if (mesh.settings.get<bool>("corrugated_transition_layer_enabled")
+        && corrugation_input_layer_nr >= 0 && static_cast<size_t>(corrugation_input_layer_nr) < mesh.corrugation_anchors.size()
+        && mesh.corrugation_anchors[corrugation_input_layer_nr].transition_layer_triggered)
+    {
+        bool added_something = false;
+        const AngleDegrees transition_angle = 45;
+        constexpr coord_t transition_skin_overlap = 0;
+        constexpr Ratio transition_skin_density = 1.0_r;
+        processSkinPrintFeature(
+            storage,
+            gcode_layer,
+            mesh,
+            extruder_nr,
+            part.infill_area,
+            mesh_config.infill_config[0],
+            EFillMethod::CONCENTRIC,
+            transition_angle,
+            transition_skin_overlap,
+            transition_skin_density,
+            LinesOrderingMethod::Basic,
+            /*is_roofing_flooring=*/false,
+            added_something,
+            GCodePathConfig::FAN_SPEED_DEFAULT,
+            std::nullopt);
+        return added_something;
+    }
+
+    // Experimental: corrugate a simple, fixed-width inset of the raw slice outline (this layer's
+    // cross-section *before* Arachne wall generation ever runs) instead of the wall-generated
+    // Infill Area, trading Arachne's variable-width bead fidelity for input VBCT's own domain
+    // classification can rely on being Z-invariant - see VbctAdapter::insetOutline's own header
+    // doc and this setting's description in packaging/fdmprinter.def.json. Does not yet exclude
+    // top/bottom skin area (corrugation may overlap skin at the first/last few layers when
+    // enabled) - deliberately out of scope for this pass. buildCorrugationInput is the same
+    // helper computeCorrugationAnchors' pre-pass used for this exact layer, so both stay in sync.
+    Shape corrugation_input = VbctAdapter::buildCorrugationInput(part, mesh.settings);
+    // Grow corrugation_input by infill_overlap_mm, exactly matching Infill::generate()'s own
+    // convention (src/infill.cpp: "inner_contour_ = inner_contour_.offset(infill_overlap_)") -
+    // every *other* infill pattern gets this same growth before generating its own lines, so its
+    // output physically overlaps/bonds with the wall rather than stopping exactly at
+    // part.infill_area's own raw boundary. This project's own corrugated code path never went
+    // through Infill::generate() at all (EFillMethod::CORRUGATED's own case there is a no-op - see
+    // its own comment), so it never got this growth - confirmed via direct user report (a real,
+    // visible gap between the printed wall and the corrugation, absent for every normal pattern on
+    // the same model/settings) and a diagnostic ruling out every other candidate cause first
+    // (this project's own inboard offset, corrugated_raw_outline_mode, and VBCT's own Stages 1-9
+    // wall reconstruction - all confirmed to introduce zero extra inset). A positive offset on a
+    // Shape with holes grows the outer boundary outward *and* shrinks each hole inward by the same
+    // amount - exactly the "bond with whichever wall is on each side" behavior wanted here, for
+    // both the outer wall and (for a Ring domain) the inner wall's own cavity.
+    const bool vbct_strip_wall_a = mesh.settings.get<bool>("corrugated_strip_wall_a");
+    const bool vbct_strip_wall_b = mesh.settings.get<bool>("corrugated_strip_wall_b");
+    const bool corrugation_input_have_anchor
+        = corrugation_input_layer_nr >= 0 && static_cast<size_t>(corrugation_input_layer_nr) < mesh.corrugation_anchors.size();
+    const bool corrugation_input_has_chain = corrugation_input_have_anchor && ! mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_wall_identities.empty();
+
+    // Wall Strip (spec REV 2.6/5.7): move corrugation_input's own covered-range vertices outward,
+    // toward outline's own true surface, for whichever side(s) are stripped, for *every* Chain
+    // domain this layer has (not just a single tracked one - findAllChainDomainWalls returns one
+    // entry per domain, e.g. a Tee's own crossbar and stem can both be stripped at once) - the
+    // Chain analogue of buildCorrugationInput's own whole-contour swap for Ring (that swap doesn't
+    // apply here: a Chain domain's wall is often only *part* of a larger shared contour, per
+    // expandChainContourRange's own doc comment - moving infill's own existing vertices
+    // individually, rather than grafting in a foreign point set from outline, is also what fixed a
+    // real VBCT domain-segmentation corruption a first version of this feature caused on real
+    // geometry, confirmed via direct user report; see that function's own doc comment for the full
+    // account). Applied directly to corrugation_input, before the infill_overlap_mm growth below -
+    // and the growth itself is skipped entirely for this domain when it applies (see that block's
+    // own comment for why a partial-contour revert isn't attempted yet), rather than reverted
+    // after the fact the way Ring's own whole-contour case is.
+    //
+    // Unlike stripWallArcLengthRanges above, calling expandChainContourRange once per (domain,
+    // side) in a simple loop is safe without any batching - it only ever displaces existing
+    // vertices in place, never opens the contour it operates on, so a later call (a different
+    // domain, or this same domain's other side) can still find and match it normally.
+    bool chain_strip_active = false;
+    // Backup of corrugation_input as it stood before any Chain boundary expansion - used as a
+    // fallback below if the expanded geometry turns out to make VBCT reject the whole layer (see
+    // that fallback's own comment for why detecting this ahead of time isn't reliable, and why
+    // retrying against VBCT's own real self-intersection check is used instead).
+    const Shape corrugation_input_before_chain_strip = corrugation_input;
+    if (corrugation_input_has_chain && (vbct_strip_wall_a || vbct_strip_wall_b) && ! mesh.settings.get<bool>("corrugated_raw_outline_mode"))
+    {
+        const std::vector<VbctAdapter::ChainWallPoints> all_chain_walls = VbctAdapter::findAllChainDomainWalls(
+            part,
+            mesh.settings,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_wall_identities,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities);
+        // Same half-infill_line_width inset convention expandCorrugationInputForStrippedWalls uses
+        // for Ring, computed the same way (VbctAdapter.cpp) - the corrugation's own centerline
+        // prints at infill_line_width, not zero width, so it needs to sit half that width in from
+        // outline's own true surface to stay flush with it rather than hang half a line width past
+        // it (confirmed directly by the user on a real print, reproducing Ring's own identical bug).
+        const coord_t chain_half_line_width = mesh.settings.get<coord_t>("infill_line_width") / 2;
+        for (const VbctAdapter::ChainWallPoints& chain_walls : all_chain_walls)
+        {
+            if (! chain_walls.found)
+            {
+                continue;
+            }
+            if (vbct_strip_wall_a && VbctAdapter::expandChainContourRange(corrugation_input, part.outline, chain_walls.wall_a, chain_half_line_width))
+            {
+                chain_strip_active = true;
+            }
+            if (vbct_strip_wall_b && VbctAdapter::expandChainContourRange(corrugation_input, part.outline, chain_walls.wall_b, chain_half_line_width))
+            {
+                chain_strip_active = true;
+            }
+        }
+    }
+
+    // Grow corrugation_input by infill_overlap_mm, exactly matching Infill::generate()'s own
+    // convention (src/infill.cpp: "inner_contour_ = inner_contour_.offset(infill_overlap_)") -
+    // every *other* infill pattern gets this same growth before generating its own lines, so its
+    // output physically overlaps/bonds with the wall rather than stopping exactly at
+    // part.infill_area's own raw boundary. This project's own corrugated code path never went
+    // through Infill::generate() at all (EFillMethod::CORRUGATED's own case there is a no-op - see
+    // its own comment), so it never got this growth - confirmed via direct user report (a real,
+    // visible gap between the printed wall and the corrugation, absent for every normal pattern on
+    // the same model/settings) and a diagnostic ruling out every other candidate cause first
+    // (this project's own inboard offset, corrugated_raw_outline_mode, and VBCT's own Stages 1-9
+    // wall reconstruction - all confirmed to introduce zero extra inset). A positive offset on a
+    // Shape with holes grows the outer boundary outward *and* shrinks each hole inward by the same
+    // amount - exactly the "bond with whichever wall is on each side" behavior wanted here, for
+    // both the outer wall and (for a Ring domain) the inner wall's own cavity.
+    //
+    // Wall Strip (Chain increment): skipped entirely for this domain when chain_strip_active - a
+    // partial-contour revert (only the grafted sub-range's own growth undone, not the rest of the
+    // same shared contour) isn't attempted yet, unlike Ring's own whole-contour revert below; a
+    // known simplification, to refine via real-print testing the same way Ring's own inset/revert
+    // fixes were found, rather than guessing at the right partial treatment blind.
+    const coord_t vbct_infill_overlap = mesh.settings.get<coord_t>("infill_overlap_mm");
+    Shape corrugation_input_grown = chain_strip_active ? corrugation_input : corrugation_input.offset(vbct_infill_overlap);
+
+    // Wall Strip (spec REV 2.6): a stripped side's own corrugation_input contour already runs
+    // along the true model surface (buildCorrugationInput's own expansion, VbctAdapter.cpp) -
+    // there's no wall left on that side to weld an overlap into any more, so growing it by
+    // infill_overlap_mm on top of that would push the corrugation past the part's own true
+    // surface. Confirmed directly by the user on a real print (an overshoot of about one line
+    // width, right where the growth above would place it). Reverts the growth for whichever
+    // contour corresponds to a stripped side, by swapping it back to corrugation_input's own
+    // un-grown version of the same contour - done as a post-hoc swap rather than offsetting each
+    // contour separately from the start, since Shape::offset() needs both an outer and its own
+    // hole together to grow/shrink each correctly by winding direction; splitting them apart
+    // first and offsetting each in isolation risks getting that sign wrong. Skipped entirely
+    // (falls back to the ordinary uniform growth above, unchanged) whenever corrugation_input
+    // doesn't look like a simple single-hole Ring (not exactly two contours before and after
+    // growth) or Raw Outline Mode is active (buildCorrugationInput already ignores strip settings
+    // there - see its own doc comment - so nothing was actually expanded to revert).
+    if ((vbct_strip_wall_a || vbct_strip_wall_b) && ! mesh.settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input.size() == 2
+        && corrugation_input_grown.size() == 2)
+    {
+        auto outerIndex = [](const Shape& shape) -> size_t
+        {
+            return std::abs(shape[0].area()) >= std::abs(shape[1].area()) ? 0 : 1;
+        };
+        const size_t orig_outer = outerIndex(corrugation_input);
+        const size_t grown_outer = outerIndex(corrugation_input_grown);
+        Shape reverted;
+        reverted.push_back(vbct_strip_wall_a ? corrugation_input[orig_outer] : corrugation_input_grown[grown_outer]);
+        reverted.push_back(vbct_strip_wall_b ? corrugation_input[1 - orig_outer] : corrugation_input_grown[1 - grown_outer]);
+        corrugation_input_grown = reverted;
+    }
+    corrugation_input = corrugation_input_grown;
+
+    // Stringer pitch is now the user-facing setting directly - a target arc-length spacing along
+    // a domain's own governing (longer) wall, VBCT Stage 10's own native tunable, with no
+    // count-to-spacing estimation step in between (replaces the old corrugated_stringer_count +
+    // estimateSpacingForStringerCount indirection - a region's real perimeter still varies, so a
+    // given pitch still produces a varying real stringer count per domain, the same way Infill
+    // Line Distance is the setting Cura's own patterns actually consume elsewhere).
+    const coord_t vbct_stringer_pitch = mesh.settings.get<coord_t>("corrugated_stringer_pitch");
+    // Stringer-count stability (corrugation-start-jitter investigation): prefer the pre-pass's own
+    // hysteresis-stabilized spacing when available - see CorrugationAnchor::stringer_spacing_
+    // override's own doc comment for why a bare per-layer pitch here, fresh every layer, lets
+    // ordinary sub-percent per-layer noise flip the resulting stringer count and reshuffle every
+    // stringer's own position, not just this domain's own real-print-only anchor continuity
+    // fields. Falls back to the bare pitch setting on the same legitimate reset points (no parts,
+    // VBCT rejected the input, no domain to measure) those other fields already fall back on.
+    const bool have_stringer_count_override = corrugation_input_have_anchor && mesh.corrugation_anchors[corrugation_input_layer_nr].stringer_count_tracked;
+    const coord_t vbct_spacing
+        = have_stringer_count_override ? mesh.corrugation_anchors[corrugation_input_layer_nr].stringer_spacing_override : vbct_stringer_pitch;
+    // Crossover Pitch (2026-09-15 redesign, replacing the old phase_rate/"wraps per mm" setting):
+    // the Z distance, in mm, between successive base/crosshatch family coincidences, the same for
+    // every domain in the mesh regardless of its own stringer count/density - see
+    // VbctAdapter::corrugate's own crossover_pitch_mm doc comment for the full formula and the
+    // real defect (uncoordinated per-domain crossover layers) this replaces the old rate-based
+    // setting to fix. Also drives Ring's own single-family stringer-start continuity sweep (spec
+    // Section 3.1's phase-anchoring continuity, ported from the prototype/phase_family.py
+    // exploration) - see VBCT-Wall-Start-Point-Instability-Brief.md / the layer-7 investigation
+    // notes for the aliasing failure mode a too-fast sweep can still produce, independent of this
+    // setting's own name/units.
+    const double vbct_crossover_pitch_mm = mesh.settings.get<double>("corrugated_crossover_pitch_mm");
+    // Second ("CW") stringer family (spec Section 3.1's "two counter-rotating helix families
+    // (CCW/CW)") - see VbctAdapter::corrugate's own doc comment for what this actually changes.
+    const bool vbct_crosshatch_enabled = mesh.settings.get<bool>("corrugated_crosshatch_enabled");
+    // Linked corrugation skin - see VbctAdapter::corrugateLinkedSkin's own doc comment. Read here,
+    // not passed to corrugate() itself: linking is a structurally different output (one connected
+    // toolpath vs. independent stringer segments), tried as its own call below with a fallback to
+    // corrugate()'s own unlinked output, not a parameter on corrugate().
+    //
+    // Wall Strip (spec REV 2.6, Section 5.7) forces this on regardless of the user's own
+    // corrugated_skin_linked setting, the same precedent corrugateLinkedSkin already establishes
+    // for Ring's own forced-Crosshatch requirement: Linked Skin's wall-following path is the only
+    // thing that can substitute for a wall addMeshPartToGCode has already stripped out of
+    // part.wall_toolpaths (above, before preProcessInsets ran) - without this, a stripped wall with
+    // corrugated_skin_linked left off would fall back to independent stringers with no
+    // wall-following substitute at all, a real structural hole where a wall used to be.
+    const bool vbct_skin_linked = mesh.settings.get<bool>("corrugated_skin_linked") || vbct_strip_wall_a || vbct_strip_wall_b;
+    // Chain junction (Hub) support (spec REV 2.1) - see VbctAdapter::corrugateLinkedSkin's own doc
+    // comment (chain_junction_merge_angle_deg parameter) and mergeStraightPassThroughChains' own
+    // doc comment in VbctAdapter.cpp for what this controls.
+    const double vbct_chain_junction_merge_angle = mesh.settings.get<double>("corrugated_chain_junction_merge_angle");
+
+    const LayerIndex layer_nr = gcode_layer.getLayerNr();
+    const coord_t layer_z = (layer_nr >= 0 && static_cast<size_t>(layer_nr) < mesh.layers.size()) ? mesh.layers[layer_nr].printZ : 0;
+
+    // Cross-layer anchor continuity (spec REV 1.4 S:5.3): computeCorrugationAnchors already
+    // precomputed this exact layer's anchors for both of the Ring's walls, single-threaded,
+    // before this parallel per-layer call ever ran - see that function's own doc comment for why
+    // it can't be computed here instead. std::nullopt (no entry, or has_ring false - a
+    // topology-change reset per VbctAdapter::computeAnchorsForMesh) falls back to corrugate()'s
+    // own existing per-layer absolute rule for both walls, unchanged from before this feature
+    // existed.
+    const bool have_anchor = layer_nr >= 0 && static_cast<size_t>(layer_nr) < mesh.corrugation_anchors.size() && mesh.corrugation_anchors[layer_nr].has_ring;
+    const std::optional<double> anchor_t0_frac = have_anchor ? std::make_optional(mesh.corrugation_anchors[layer_nr].t0_frac) : std::nullopt;
+    const std::optional<double> other_wall_t0_frac = have_anchor ? std::make_optional(mesh.corrugation_anchors[layer_nr].other_wall_t0_frac) : std::nullopt;
+    // Cross-layer *direction* continuity, alongside the position overrides above - a position
+    // override alone can't fix which way the non-anchor stringers step (see
+    // CorrugationAnchor::reverse_canonical_wall's own doc comment for the full evidence this was
+    // needed: position tracking alone left hundreds of real sign flips uncorrected in the actual
+    // toolpath, since the direction correction lived only in the pre-pass's own bookkeeping until
+    // this was added to actually forward it into the live per-layer call).
+    const std::optional<bool> reverse_canonical_wall = have_anchor ? std::make_optional(mesh.corrugation_anchors[layer_nr].reverse_canonical_wall) : std::nullopt;
+
+    // Chain domain support (spec REV 2.1): same continuity mechanism as the Ring overrides above,
+    // tracked independently - see CorrugationAnchor::has_chain/chain_anchor_point's own doc
+    // comment. Mutually exclusive with have_anchor in practice (a layer is either a tracked Ring
+    // or a tracked Chain, never both), but computed independently here for the same reason the
+    // pre-pass tracks them independently.
+    const bool have_chain_anchor = layer_nr >= 0 && static_cast<size_t>(layer_nr) < mesh.corrugation_anchors.size() && mesh.corrugation_anchors[layer_nr].has_chain;
+    const std::optional<Point2LL> chain_anchor_point = have_chain_anchor ? std::make_optional(mesh.corrugation_anchors[layer_nr].chain_anchor_point) : std::nullopt;
+
+    // Chain domain *end-position* continuity, alongside chain_anchor_point's own "which end" role
+    // above - see CorrugationAnchor::chain_left_near_t_frac's own doc comment for the full
+    // rationale (Ring's own dual-wall t0_frac/other_wall_t0_frac overrides above, extended to
+    // Chain's own two real, distinct wall ends). have_chain_anchor alone isn't enough to gate
+    // these - chain_position_tracked is false on the first tracked layer / immediately after a
+    // reset, when the pre-pass has nothing yet to search against.
+    const bool have_chain_position = have_chain_anchor && mesh.corrugation_anchors[layer_nr].chain_position_tracked;
+    const std::optional<double> chain_left_near_t_frac = have_chain_position ? std::make_optional(mesh.corrugation_anchors[layer_nr].chain_left_near_t_frac) : std::nullopt;
+    const std::optional<double> chain_left_far_t_frac = have_chain_position ? std::make_optional(mesh.corrugation_anchors[layer_nr].chain_left_far_t_frac) : std::nullopt;
+    const std::optional<double> chain_right_near_t_frac = have_chain_position ? std::make_optional(mesh.corrugation_anchors[layer_nr].chain_right_near_t_frac) : std::nullopt;
+    const std::optional<double> chain_right_far_t_frac = have_chain_position ? std::make_optional(mesh.corrugation_anchors[layer_nr].chain_right_far_t_frac) : std::nullopt;
+    // Chain wall outer/inner identity continuity (VBCT sign-oscillation investigation) - see
+    // CorrugationAnchor::chain_swap_left_right's own doc comment. Gated the same way as the four
+    // t_frac overrides above - meaningless (and always false) until a previous tracked layer's own
+    // identity exists to compare against.
+    const bool chain_swap_left_right = have_chain_position && mesh.corrugation_anchors[layer_nr].chain_swap_left_right;
+
+    // Transition Layer, per-domain solid-fill substitution (spec REV 3.3/3.6/5.10): this exact
+    // layer's own already-decided set of domains, if any, to substitute with full-density solid
+    // infill instead of ordinary corrugation - see TransitionLayerRequest's own doc comment. Solid
+    // fill spacing is infill_line_width, so successive members sit edge to edge with
+    // (approximately) no gap.
+    VbctAdapter::TransitionLayerRequest transition_layer_request;
+    transition_layer_request.ring = mesh.corrugation_anchors[corrugation_input_layer_nr].ring_transition_layer_triggered;
+    transition_layer_request.chain_domain_identities = mesh.corrugation_anchors[corrugation_input_layer_nr].chain_transition_layer_domain_identities;
+    transition_layer_request.solid_fill_spacing = mesh.settings.get<coord_t>("infill_line_width");
+    const bool transition_layer_active = transition_layer_request.ring || ! transition_layer_request.chain_domain_identities.empty();
+    OpenLinesSet transition_lines;
+
+    // Linked corrugation skin, tried first when enabled - see VbctAdapter::corrugateLinkedSkin's
+    // own doc comment for exactly what it produces and why it always needs the CW family for Ring
+    // regardless of vbct_crosshatch_enabled, but respects it for Chain (spec REV 2.4, Chain
+    // Crosshatch + Linked Skin integration - mirrors how it's already passed to corrugate() below).
+    // Falls back to today's unlinked corrugate() output below whenever this layer/domain isn't
+    // linkable yet (not exactly one Ring domain, a clipped stringer, or a collapsed wall offset) -
+    // never blank output, just today's existing behavior.
+    // Chain end-linking connector (spec REV 2.6 design, implemented below): only the Linked
+    // Corrugation Skin path has a single continuous per-domain polyline whose own front()/back()
+    // sit at the domain's own true caps (VbctAdapter::corrugateLinkedSkin's own doc comment) - the
+    // unlinked corrugate() fallback's independent stringer segments have no such terminal point to
+    // connect from, so the connector step below only applies when this is true.
+    bool stringer_lines_are_linked_skin = false;
+    std::optional<OpenLinesSet> stringer_lines;
+    if (vbct_skin_linked)
+    {
+        stringer_lines = VbctAdapter::corrugateLinkedSkin(
+            corrugation_input,
+            vbct_x,
+            vbct_threshold,
+            vbct_spacing,
+            layer_z,
+            vbct_crossover_pitch_mm,
+            anchor_t0_frac,
+            other_wall_t0_frac,
+            reverse_canonical_wall,
+            chain_anchor_point,
+            vbct_chain_junction_merge_angle,
+            vbct_crosshatch_enabled,
+            chain_left_near_t_frac,
+            chain_left_far_t_frac,
+            chain_right_near_t_frac,
+            chain_right_far_t_frac,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
+            chain_swap_left_right,
+            transition_layer_request);
+        stringer_lines_are_linked_skin = stringer_lines.has_value();
+    }
+    if (! stringer_lines.has_value())
+    {
+        stringer_lines = VbctAdapter::corrugate(
+            corrugation_input,
+            vbct_x,
+            vbct_threshold,
+            vbct_spacing,
+            layer_z,
+            vbct_crossover_pitch_mm,
+            anchor_t0_frac,
+            other_wall_t0_frac,
+            reverse_canonical_wall,
+            vbct_crosshatch_enabled,
+            chain_anchor_point,
+            chain_left_near_t_frac,
+            chain_left_far_t_frac,
+            chain_right_near_t_frac,
+            chain_right_far_t_frac,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
+            transition_layer_request,
+            &transition_lines);
+    }
+    // Wall Strip fallback (multi-domain Chain increment): VBCT itself is the only reliable judge of
+    // whether expandChainContourRange's own per-domain boundary displacement (above) produced valid
+    // geometry - see that loop's own comment for why multiple domains sharing one contour can fold
+    // the shared corner between them into a self-intersection that only VBCT's own check catches (a
+    // Clipper-union-based heuristic tried first here missed it: a same-winding "pinch" can resolve
+    // to the same net area and even the same polygon count under Clipper's own nonzero-fill rule).
+    // If both corrugate() and corrugateLinkedSkin() rejected the expanded input, retry once against
+    // the un-expanded backup - trading "the stripped domain's own boundary correctly fills the gap"
+    // for "this layer still corrugates at all", far better than giving up on the whole layer.
+    if (! stringer_lines.has_value() && chain_strip_active)
+    {
+        spdlog::warn("VBCT rejected the expanded Chain Wall Strip boundary for corrugation, retrying with the un-expanded boundary");
+        corrugation_input = corrugation_input_before_chain_strip;
+        chain_strip_active = false;
+        if (vbct_skin_linked)
+        {
+            stringer_lines = VbctAdapter::corrugateLinkedSkin(
+                corrugation_input,
+                vbct_x,
+                vbct_threshold,
+                vbct_spacing,
+                layer_z,
+                vbct_crossover_pitch_mm,
+                anchor_t0_frac,
+                other_wall_t0_frac,
+                reverse_canonical_wall,
+                chain_anchor_point,
+                vbct_chain_junction_merge_angle,
+                vbct_crosshatch_enabled,
+                chain_left_near_t_frac,
+                chain_left_far_t_frac,
+                chain_right_near_t_frac,
+                chain_right_far_t_frac,
+                mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
+                chain_swap_left_right,
+                transition_layer_request);
+            stringer_lines_are_linked_skin = stringer_lines.has_value();
+        }
+        if (! stringer_lines.has_value())
+        {
+            stringer_lines_are_linked_skin = false;
+            stringer_lines = VbctAdapter::corrugate(
+                corrugation_input,
+                vbct_x,
+                vbct_threshold,
+                vbct_spacing,
+                layer_z,
+                vbct_crossover_pitch_mm,
+                anchor_t0_frac,
+                other_wall_t0_frac,
+                reverse_canonical_wall,
+                vbct_crosshatch_enabled,
+                chain_anchor_point,
+                chain_left_near_t_frac,
+                chain_left_far_t_frac,
+                chain_right_near_t_frac,
+                chain_right_far_t_frac,
+                mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
+                transition_layer_request,
+                &transition_lines);
+        }
+    }
+    if (! stringer_lines.has_value())
+    {
+        return false;
+    }
+
+    // Transition Layer, per-domain solid-fill substitution (spec REV 3.3/3.6/5.10):
+    // corrugateLinkedSkin() only ever excludes a transitioned domain from its own output (see its
+    // own header doc) - it never produces that domain's own solid-fill lines itself, since
+    // Crosshatch/Linked Corrugation Skin's gating logic has no defined meaning for full-density
+    // coverage. When stringer_lines came from the linked-skin path, transition_lines is therefore
+    // still empty at this point (the unlinked corrugate() path above already threaded
+    // &transition_lines through directly, so it needs no extra call). One extra unlinked
+    // corrugate() call, over the same geometry corrugateLinkedSkin just successfully accepted,
+    // harvests just the transitioned domain(s)' own lines via the same out-parameter - its own
+    // ordinary-domain return value is discarded, since stringer_lines already has that from the
+    // linked-skin call. Fails safe (no Transition Layer this layer, not a layer-wide failure) if
+    // this one extra call is somehow rejected, matching this project's established "never let an
+    // enhancement pass break otherwise-working output" convention.
+    if (transition_layer_active && stringer_lines_are_linked_skin)
+    {
+        VbctAdapter::corrugate(
+            corrugation_input,
+            vbct_x,
+            vbct_threshold,
+            vbct_spacing,
+            layer_z,
+            vbct_crossover_pitch_mm,
+            anchor_t0_frac,
+            other_wall_t0_frac,
+            reverse_canonical_wall,
+            vbct_crosshatch_enabled,
+            chain_anchor_point,
+            chain_left_near_t_frac,
+            chain_left_far_t_frac,
+            chain_right_near_t_frac,
+            chain_right_far_t_frac,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
+            transition_layer_request,
+            &transition_lines);
+    }
+
+    // Chain end-linking connector (spec REV 2.6 design, implemented here): when exactly one of a
+    // Chain domain's own two walls is stripped, the un-stripped wall's own two dangling endpoints
+    // (WallStrip's own splice cut points - see stripWallArcLengthRanges' own doc comment) sit at
+    // the domain's own true caps, and the corrugation's own Linked Skin path (this layer's own
+    // stringer_lines, when it came from corrugateLinkedSkin and not the unlinked corrugate()
+    // fallback - see stringer_lines_are_linked_skin's own comment above) terminates at the same
+    // physical caps but as a separate, unconnected polyline - leaving a real, visible open seam at
+    // both real ends. Closed here by extending the corrugation's own polyline to the nearest open
+    // wall endpoint at each of its own two ends, not by mutating the wall itself:
+    // part.wall_toolpaths may already be emitted by this point (when !infill_before_walls, walls
+    // are written before infill runs), and this function only has const access to part regardless,
+    // so reaching back into the wall's own already-finished toolpath this late would be a
+    // materially bigger, riskier change for no real benefit - the connector prints at infill line
+    // width, not wall width, a known, accepted simplification (it's closing a corrugation-to-wall
+    // seam, not extending a wall). Fails safe per endpoint via findNearestOpenWallEndpoint's own
+    // max_dist cap (this project's established "never guess" convention) - both-walls-stripped has
+    // no open wall to find (no seam to begin with, confirmed by existing WallStripTest coverage)
+    // and neither-stripped has nothing to gate this block open at all.
+    if (stringer_lines_are_linked_skin && corrugation_input_has_chain && (vbct_strip_wall_a != vbct_strip_wall_b))
+    {
+        const coord_t connector_max_dist = mesh.settings.get<coord_t>("infill_line_width") * 4;
+        for (OpenPolyline& line : *stringer_lines)
+        {
+            if (line.size() < 2)
+            {
+                continue;
+            }
+            const std::optional<Point2LL> near_front = findNearestOpenWallEndpoint(part.wall_toolpaths, line.front(), connector_max_dist);
+            const std::optional<Point2LL> near_back = findNearestOpenWallEndpoint(part.wall_toolpaths, line.back(), connector_max_dist);
+            if (near_front.has_value())
+            {
+                line.insert(line.begin(), *near_front);
+            }
+            if (near_back.has_value())
+            {
+                line.push_back(*near_back);
+            }
+        }
+    }
+
+    // Transition Layer, per-domain solid-fill substitution (spec REV 3.3/3.6/5.10): emit the
+    // transitioned domain(s)' own full-density lines with Cura's own native bridging print
+    // settings (speed, flow, fan), separately from the ordinary corrugation below - a Transition
+    // Layer spans the same kind of gap an ordinary bridge would, so it needs the same treatment.
+    // Bypasses InfillOrderOptimizer entirely for this subset (this project's own established
+    // preference for an adapter/call-site fix over a stock CuraEngine change -
+    // InfillOrderOptimizer has no config-override seam today), reusing
+    // bridge_skin_material_flow/bridge_skin_speed/bridge_fan_speed rather than introducing new
+    // Corrugated-specific bridge settings, per REV 3.3's own confirmed decision. Gated behind
+    // bridge_settings_enabled, matching stock CuraEngine's own gate for every other bridging
+    // decision. Constructed via designated initializers, not copy-then-mutate -
+    // GCodePathConfig's own extrusion_mm3_per_mm is computed from
+    // line_width/layer_thickness/flow at construction (see GCodePathConfig.h), so a
+    // post-construction mutation of those would leave it stale.
+    if (! transition_lines.empty() && mesh.settings.get<bool>("bridge_settings_enabled"))
+    {
+        const GCodePathConfig bridge_config{
+            .type = PrintFeatureType::Infill,
+            .line_width = mesh_config.infill_config[0].getLineWidth(),
+            .layer_thickness = mesh_config.infill_config[0].getLayerThickness(),
+            .flow = mesh.settings.get<Ratio>("bridge_skin_material_flow"),
+            .speed_derivatives = { .speed = mesh.settings.get<Velocity>("bridge_skin_speed"),
+                                    .acceleration = mesh.settings.get<Acceleration>("acceleration_infill"),
+                                    .jerk = mesh.settings.get<Velocity>("jerk_infill") },
+            .is_bridge_path = true,
+            .fan_speed = mesh.settings.get<Ratio>("bridge_fan_speed") * 100.0
+        };
+        gcode_layer.addLinesByOptimizer(transition_lines, bridge_config, SpaceFillType::Lines);
+    }
+
+    InfillOrderOptimizer optimizer;
+    OpenLinesSet lines = *stringer_lines;
+    optimizer.addPart(InfillOrderOptimizer::InfillPartArea::Infill, lines);
+    optimizer.optimize(false, std::nullopt);
+
+    const bool ordinary_added = optimizer.addToLayer(
+        gcode_layer,
+        mesh.settings,
+        std::nullopt,
+        EFillMethod::CORRUGATED,
+        mesh_config,
+        storage,
+        mesh,
+        extruder_nr,
+        /*start_move_inwards_length=*/0,
+        /*end_move_inwards_length=*/0,
+        /*infill_inner_contour=*/Shape(),
+        /*skin_support_line_distance=*/0,
+        /*infill_below_skin=*/Shape(),
+        /*skin_support_angle=*/AngleDegrees(0));
+    // Transition Layer: account for the bridging emission above too - a layer where every domain
+    // transitioned can have an empty ordinary `lines` set (ordinary_added false) while still
+    // having genuinely added real geometry via the bridging path.
+    return ordinary_added || ! transition_lines.empty();
 }
 
 void FffGcodeWriter::partitionInfillBySkinAbove(

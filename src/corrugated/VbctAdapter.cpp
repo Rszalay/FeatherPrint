@@ -5,8 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <fstream> // TEMPORARY - dumpLayerContoursForInvestigation, remove alongside it
 #include <limits>
 #include <stdexcept>
 
@@ -75,124 +73,6 @@ std::vector<vbct::Contour> shapeToContours(const Shape& shape)
         contours.push_back(vbct::from_float_points(points, "ring" + std::to_string(next_id++)));
     }
     return contours;
-}
-
-// TEMPORARY debug instrumentation for the FPTF-45 hole/chain-domain-instability
-// investigation. Dumps every layer's own real contour input to VBCT (post-Simplify,
-// post-meshfix, exactly what run_full_pipeline actually receives) to a JSON file matching the
-// VBCT Cpp reference project's own case_library.json schema, so it can be fed straight into
-// that project's diagnostic tools without re-deriving contours from the raw STL. One file per
-// distinct Z height (overwrites on a repeat call for the same layer, e.g. the cross-layer
-// continuity pre-pass's own shadow-copy re-run - harmless, since the content is the same input).
-// Remove this function and its two call sites in corrugate()/corrugateLinkedSkin() once the
-// investigation concludes.
-void dumpLayerContoursForInvestigation(const std::vector<vbct::Contour>& contours, double x, double threshold_mm, double spacing_mm, double z_mm)
-{
-    static const std::string kDumpDir
-        = "C:\\Users\\ricsz\\AppData\\Local\\Temp\\claude\\c--Users-ricsz-source-CoWork-Projects-Scratch-VBCT-Cpp\\"
-          "74ac32a8-7672-4766-90f4-3fe3fe194d84\\scratchpad\\real_layer_dump\\";
-    std::ofstream dump_out(kDumpDir + "layer_z" + std::to_string(z_mm) + ".json");
-    if (! dump_out)
-    {
-        return; // directory doesn't exist on this machine, or investigation already concluded - silently skip
-    }
-    dump_out << "{\"contours\":[";
-    for (size_t ci = 0; ci < contours.size(); ++ci)
-    {
-        if (ci)
-        {
-            dump_out << ",";
-        }
-        dump_out << "[";
-        for (size_t pi = 0; pi < contours[ci].points.size(); ++pi)
-        {
-            if (pi)
-            {
-                dump_out << ",";
-            }
-            dump_out << "[" << (static_cast<double>(contours[ci].points[pi].x) / vbct::SCALE) << "," << (static_cast<double>(contours[ci].points[pi].y) / vbct::SCALE)
-                      << "]";
-        }
-        dump_out << "]";
-    }
-    dump_out << "],\"x\":" << x << ",\"threshold\":" << threshold_mm << ",\"spacing\":" << spacing_mm << ",\"z\":" << z_mm << "}";
-}
-
-// TEMPORARY debug instrumentation for the layer-395 area-collapse investigation (2026-09-13):
-// appends one CSV row per call site per layer, gated to a single target Z so this doesn't spam
-// every layer of every print. Pure geometry (Shape::area(), no VBCT calls, nothing that can
-// throw) - safe to call from anywhere, unlike dumpWallAbAssignmentForInvestigation before it.
-// Remove this function and its call sites once the investigation concludes.
-void dumpAreaForInvestigation(const std::string& stage, const Shape& shape, double z_mm)
-{
-    constexpr double kTargetZMm = 84.35; // retargeted to layer 843 (trailing-edge near-duplicate-point investigation)
-    constexpr double kZEpsilonMm = 0.001;
-    if (std::abs(z_mm - kTargetZMm) > kZEpsilonMm)
-    {
-        return;
-    }
-    static const std::string kDumpPath
-        = "C:\\Users\\ricsz\\AppData\\Local\\Temp\\claude\\c--Users-ricsz-source-CoWork-Projects-Scratch-VBCT-Cpp\\"
-          "74ac32a8-7672-4766-90f4-3fe3fe194d84\\scratchpad\\area_investigation_layer395.csv";
-    std::ofstream dump_out(kDumpPath, std::ios::app);
-    if (! dump_out)
-    {
-        return; // directory doesn't exist on this machine, or investigation already concluded - silently skip
-    }
-    const double area_mm2 = shape.area() / 1e6; // Shape::area() is in micron^2 (coord_t units)
-    // Point count alongside area: a whole-surface's worth of real curve detail collapsing into a
-    // single straight segment barely moves total enclosed area (a thin airfoil's camber deviates
-    // only slightly from its own chord), so area alone can miss exactly this failure mode - see
-    // this investigation's own findings. Total vertex count across every polygon in the shape
-    // catches it directly instead.
-    size_t total_points = 0;
-    for (const Polygon& poly : shape)
-    {
-        total_points += poly.size();
-    }
-    dump_out << stage << "," << z_mm << "," << shape.size() << "," << total_points << "," << area_mm2 << "\n";
-}
-
-// TEMPORARY debug instrumentation, same investigation/gating/safety as dumpAreaForInvestigation
-// above - dumps a Shape's own raw point coordinates (one JSON file per call site) so the actual
-// polygon shape can be inspected/plotted, not just its area and point count. Remove alongside
-// dumpAreaForInvestigation once the investigation concludes.
-void dumpShapePointsForInvestigation(const std::string& stage, const Shape& shape, double z_mm)
-{
-    constexpr double kTargetZMm = 84.35; // retargeted to layer 843 (trailing-edge near-duplicate-point investigation)
-    constexpr double kZEpsilonMm = 0.001;
-    if (std::abs(z_mm - kTargetZMm) > kZEpsilonMm)
-    {
-        return;
-    }
-    const std::string kDumpPath
-        = "C:\\Users\\ricsz\\AppData\\Local\\Temp\\claude\\c--Users-ricsz-source-CoWork-Projects-Scratch-VBCT-Cpp\\"
-          "74ac32a8-7672-4766-90f4-3fe3fe194d84\\scratchpad\\shape_points_" + stage + ".json";
-    std::ofstream dump_out(kDumpPath);
-    if (! dump_out)
-    {
-        return;
-    }
-    dump_out << "{\"z_mm\":" << z_mm << ",\"polygons\":[";
-    for (size_t pi = 0; pi < shape.size(); ++pi)
-    {
-        if (pi)
-        {
-            dump_out << ",";
-        }
-        dump_out << "[";
-        const Polygon& poly = shape[pi];
-        for (size_t vi = 0; vi < poly.size(); ++vi)
-        {
-            if (vi)
-            {
-                dump_out << ",";
-            }
-            dump_out << "[" << (static_cast<double>(poly[vi].X) / 1000.0) << "," << (static_cast<double>(poly[vi].Y) / 1000.0) << "]";
-        }
-        dump_out << "]";
-    }
-    dump_out << "]}";
 }
 
 Shape filterDeminimisHoles(const Shape& shape, const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities, std::vector<std::vector<Point2LL>>& ignored_hole_loops)
@@ -318,12 +198,6 @@ std::optional<OpenLinesSet> corrugate(
     const TransitionLayerRequest& transition_layer_request,
     OpenLinesSet* transition_lines_out)
 {
-    // TEMPORARY (layer-395 area-collapse investigation): z_mm isn't computed until further down,
-    // and this function can return before reaching that point - compute a local copy up front so
-    // the area dumps below always fire regardless of where this call ends up returning.
-    const double dbg_z_mm = static_cast<double>(z) / kMicronsPerMm;
-    dumpAreaForInvestigation("corrugate_infill_area_input", infill_area, dbg_z_mm);
-
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): applies this layer's own already-decided
     // suppression set (VbctAdapter::computeAnchorsForMesh's own pre-pass) before VBCT ever sees
     // the geometry - see filterDeminimisHoles' own doc comment. A no-op (returns infill_area
@@ -331,7 +205,6 @@ std::optional<OpenLinesSet> corrugate(
     // common case.
     std::vector<std::vector<Point2LL>> ignored_hole_loops;
     const Shape filtered_infill_area = filterDeminimisHoles(infill_area, suppressed_hole_identities, ignored_hole_loops);
-    dumpAreaForInvestigation("corrugate_post_filterDeminimisHoles", filtered_infill_area, dbg_z_mm);
     const std::vector<vbct::Contour> contours = shapeToContours(filtered_infill_area);
     if (contours.empty())
     {
@@ -379,7 +252,6 @@ std::optional<OpenLinesSet> corrugate(
     // exact case.
     constexpr double kCrosshatchDegeneracyBias = 1e-7;
     const double phase_offset = crossover_pitch_mm != 0.0 ? (z_mm / (2.0 * crossover_pitch_mm) + kCrosshatchDegeneracyBias) : 0.0;
-    dumpLayerContoursForInvestigation(contours, x, threshold_mm, spacing_mm, z_mm);
 
     const std::optional<vbct::Point2> chain_anchor_point_mm
         = chain_anchor_point.has_value() ? std::make_optional(toVbctMm(*chain_anchor_point)) : std::nullopt;
@@ -2962,16 +2834,9 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     const bool chain_swap_left_right,
     const TransitionLayerRequest& transition_layer_request)
 {
-    // TEMPORARY (layer-395 area-collapse investigation) - see corrugate()'s own identical comment.
-    const double dbg_z_mm = static_cast<double>(z) / kMicronsPerMm;
-    dumpAreaForInvestigation("corrugateLinkedSkin_infill_area_input", infill_area, dbg_z_mm);
-    dumpShapePointsForInvestigation("corrugateLinkedSkin_infill_area_input", infill_area, dbg_z_mm);
-
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9) - see corrugate()'s own identical comment.
     std::vector<std::vector<Point2LL>> ignored_hole_loops;
     const Shape filtered_infill_area = filterDeminimisHoles(infill_area, suppressed_hole_identities, ignored_hole_loops);
-    dumpAreaForInvestigation("corrugateLinkedSkin_post_filterDeminimisHoles", filtered_infill_area, dbg_z_mm);
-    dumpShapePointsForInvestigation("corrugateLinkedSkin_post_filterDeminimisHoles", filtered_infill_area, dbg_z_mm);
     const std::vector<vbct::Contour> contours = shapeToContours(filtered_infill_area);
     if (contours.empty())
     {
@@ -2989,7 +2854,6 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     // comment for why.
     constexpr double kCrosshatchDegeneracyBias = 1e-7;
     const double phase_offset = crossover_pitch_mm != 0.0 ? (z_mm / (2.0 * crossover_pitch_mm) + kCrosshatchDegeneracyBias) : 0.0;
-    dumpLayerContoursForInvestigation(contours, x, threshold_mm, spacing_mm, z_mm);
 
     std::vector<std::vector<vbct::Point2>> extra_clip_loops_mm;
     extra_clip_loops_mm.reserve(ignored_hole_loops.size());
@@ -3098,40 +2962,6 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
         r9, spacing_mm, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, /*crosshatch_enabled=*/true, chain_anchor_point_mm,
         chain_crosshatch_enabled, chain_left_near_t_frac, chain_left_far_t_frac, chain_right_near_t_frac, chain_right_far_t_frac, extra_clip_loops_mm,
         chain_swap_left_right);
-
-    // TEMPORARY (isolated-sliver-removal investigation, layers 91/157/235/486/567/714): dump the
-    // real domain composition and per-domain events.ok this call actually sees, right where the
-    // real linked-skin path gets built - remove alongside every other dump this investigation added.
-    if (dbg_z_mm > 9.0 && dbg_z_mm < 9.3)
-    {
-        FILE* f = fopen(
-            "C:\\Users\\ricsz\\AppData\\Local\\Temp\\claude\\c--Users-ricsz-source-CoWork-Projects-Scratch-VBCT-Cpp\\"
-            "74ac32a8-7672-4766-90f4-3fe3fe194d84\\scratchpad\\corrugateLinkedSkin_debug_layer91.txt",
-            "w");
-        if (f)
-        {
-            fprintf(f, "dbg_z_mm=%f n_domains=%zu\n", dbg_z_mm, r9.domains.size());
-            for (size_t i = 0; i < r9.domains.size(); ++i)
-            {
-                const vbct::Domain& dom = r9.domains[i];
-                fprintf(
-                    f,
-                    "domain[%zu] kind=%s has_left=%d has_right=%d left_pts=%zu right_pts=%zu\n",
-                    i,
-                    dom.kind.c_str(),
-                    dom.left.has_value(),
-                    dom.right.has_value(),
-                    dom.left ? dom.left->points.size() : 0,
-                    dom.right ? dom.right->points.size() : 0);
-            }
-            fprintf(f, "n_domain_events=%zu\n", domain_events.size());
-            for (size_t i = 0; i < domain_events.size(); ++i)
-            {
-                fprintf(f, "domain_events[%zu] ok=%d is_ring=%d n_events=%zu\n", i, domain_events[i].ok, domain_events[i].is_ring, domain_events[i].events.size());
-            }
-            fclose(f);
-        }
-    }
 
     // Chain junction (Hub) support (spec REV 2.1): generalized from "exactly one linkable domain"
     // to "every domain independently" - a multi-domain Chain layer (e.g. a Tee's crossbar-plus-stem

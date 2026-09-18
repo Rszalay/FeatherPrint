@@ -53,6 +53,8 @@ class SlicePhaseTest : public testing::Test
         scene.settings.add("meshfix_maximum_resolution", "0.04");
         scene.settings.add("meshfix_maximum_deviation", "0.02");
         scene.settings.add("meshfix_maximum_extrusion_area_deviation", "2000");
+        scene.settings.add("meshfix_remove_diagonal_artifacts", "false");
+        scene.settings.add("infill_pattern", "grid");
         scene.settings.add("wall_transition_angle", "10");
         scene.settings.add("xy_offset", "0");
         scene.settings.add("xy_offset_layer_0", "0");
