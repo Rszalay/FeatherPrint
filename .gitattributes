@@ -1,0 +1,27 @@
+# Normalize all text files to LF in the repo; checkout conversion is left to
+# core.autocrlf, but this makes the repo behave the same regardless of that
+# per-machine setting (needed now that FeatherPrint, Corrugated and VBCT Cpp
+# are being unified from three trees with inconsistent history).
+* text=auto eol=lf
+
+# Binary formats — never touched by line-ending normalization.
+*.stl binary
+*.3mf binary
+*.7z binary
+*.zip binary
+*.png binary
+*.PNG binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.bmp binary
+*.dll binary
+*.exe binary
+*.pdb binary
+*.lib binary
+*.obj binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
