@@ -19,6 +19,10 @@
 ; fdmprinter.def.json (relative to this .iss file)
 #define FdmPrinterDef "..\packaging\fdmprinter.def.json"
 
+; Bundled quality_changes profile pair (relative to this .iss file)
+#define QualityChangesGlobal   "..\packaging\quality_changes\fdmprinter_featherprint_corrugated.inst.cfg"
+#define QualityChangesExtruder "..\packaging\quality_changes\fdmprinter_extruder_0_featherprint_corrugated.inst.cfg"
+
 ; =============================================================================
 [Setup]
 AppId={{A3C1E7F2-5D8B-4A9E-B2F4-8E6D0C3A2B5F}
@@ -63,6 +67,8 @@ Source: "{#SourceBuildDir}\tbbbind_2_5.dll";            DestDir: "{tmp}\FeatherP
 Source: "{#SourceBuildDir}\tbbmalloc.dll";              DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceBuildDir}\tbbmalloc_proxy.dll";        DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#FdmPrinterDef}";                             DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
+Source: "{#QualityChangesGlobal}";                      DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
+Source: "{#QualityChangesExtruder}";                    DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
 
 ; =============================================================================
 [Code]
@@ -219,7 +225,8 @@ begin
     '  1. Back up CuraEngine.exe  ->  CuraEngine.exe.bak' + #13#10 +
     '  2. Replace CuraEngine.exe with FeatherPrint {#MyAppVersion}' + #13#10 +
     '  3. Copy required runtime DLLs (with .bak backups)' + #13#10 +
-    '  4. Deploy modified fdmprinter.def.json (with .bak backup)' + #13#10 + #13#10 +
+    '  4. Deploy modified fdmprinter.def.json (with .bak backup)' + #13#10 +
+    '  5. Install a validated "FeatherPrint Corrugated" print profile' + #13#10 + #13#10 +
     'To restore the original engine, run Uninstall from Add/Remove Programs.' + #13#10 + #13#10 +
     'Continue?';
 
@@ -234,11 +241,12 @@ end;
 { --------------------------------------------------------------------------- }
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  StagingDir:  String;
-  DefSrcDir:   String;
-  FileNames:   TStringList;
-  i:           Integer;
-  Src, Dst:    String;
+  StagingDir:        String;
+  DefSrcDir:         String;
+  QualityChangesDir: String;
+  FileNames:         TStringList;
+  i:                 Integer;
+  Src, Dst:          String;
 begin
   if CurStep <> ssPostInstall then Exit;
 
@@ -283,6 +291,17 @@ begin
   BackupFile(DefSrcDir + 'fdmprinter.def.json');
   CopyFile(StagingDir + 'fdmprinter.def.json', DefSrcDir + 'fdmprinter.def.json', False);
 
+  { Install the bundled "FeatherPrint Corrugated" quality_changes profile into the
+    current user's Cura config. This adds new, uniquely-named files rather than
+    overwriting anything, so it always just refreshes to the version shipped with
+    this installer (no .bak backup/restore needed) and is left in place on uninstall. }
+  QualityChangesDir := ExpandConstant('{userappdata}\cura\{#TargetCuraVersion}\quality_changes\');
+  ForceDirectories(QualityChangesDir);
+  CopyFile(StagingDir + 'fdmprinter_featherprint_corrugated.inst.cfg',
+           QualityChangesDir + 'fdmprinter_featherprint_corrugated.inst.cfg', False);
+  CopyFile(StagingDir + 'fdmprinter_extruder_0_featherprint_corrugated.inst.cfg',
+           QualityChangesDir + 'fdmprinter_extruder_0_featherprint_corrugated.inst.cfg', False);
+
   { Save install location so the uninstaller can find it }
   SaveStringToFile(ExpandConstant('{app}\install_location.txt'),
                    CuraInstallDir, False);
@@ -290,6 +309,9 @@ begin
   MsgBox(
     'FeatherPrint installed successfully!' + #13#10 + #13#10 +
     'Location: ' + CuraInstallDir + #13#10 + #13#10 +
+    'A "FeatherPrint Corrugated" print profile is now available under Print Settings ->' + #13#10 +
+    'Profiles - it sets the validated corrugated_* / meshfix / geometry settings' + #13#10 +
+    '(materials/temperature are left to whichever material profile you already use).' + #13#10 + #13#10 +
     'NOTE: If you update Cura, the official CuraEngine will overwrite this.' + #13#10 +
     'Run this installer again after a Cura update to restore FeatherPrint.',
     mbInformation, MB_OK);
