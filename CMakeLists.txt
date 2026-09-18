@@ -204,6 +204,20 @@ set(engine_SRCS # Except main.cpp.
         src/geometry/MendedShape.cpp
 
         src/geometry/conversions/Point2D_Point2LL.cpp
+
+        src/vbct/contour.cpp
+        src/vbct/mesh.cpp
+        src/vbct/pipeline.cpp
+        src/vbct/stage10.cpp
+        src/vbct/stage5.cpp
+        src/vbct/stage6.cpp
+        src/vbct/stage7.cpp
+        src/vbct/stage8.cpp
+        src/vbct/stage9.cpp
+        src/vbct/transform.cpp
+        src/vbct/validate.cpp
+        src/vbct/vbs.cpp
+        src/vbct/wall_ab_assignment.cpp
 )
 
 add_library(_CuraEngine STATIC ${engine_SRCS} ${engine_PB_SRCS})
@@ -214,6 +228,8 @@ endif ()
 target_include_directories(_CuraEngine
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/vbct> # Vendored VBCT's own same-directory quote-includes
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/third_party/CDT> # Vendored CDT's <CDT.h>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}> # Include Cura.pb.h
