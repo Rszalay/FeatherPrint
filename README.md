@@ -22,7 +22,7 @@ Only one generator runs per mesh, dispatched from the same engine build — pick
 
 1. Download **FeatherPrint-1.0.1-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
 2. Run the installer as Administrator
-3. The installer will detect your Cura 5.13.x installation, back up the original engine files, deploy FeatherPrint, and install a validated **"FeatherPrint Corrugated"** print profile (Print Settings → Profiles)
+3. The installer will detect your Cura 5.13.x installation, back up the original engine files, deploy FeatherPrint, and install validated **"FeatherPrint"** and **"FeatherPrint Corrugated"** print profiles (Print Settings → Profiles)
 
 To uninstall, run **Uninstall FeatherPrint** from Windows Add/Remove Programs. All original Cura files are restored from backup automatically.
 
@@ -36,9 +36,11 @@ To uninstall, run **Uninstall FeatherPrint** from Windows Add/Remove Programs. A
 4. Wall Line Count, Top Layers, and Bottom Layers will adjust automatically
 5. Slice and preview — the geodetic stringer (FeatherPrint) or corrugated wall-to-wall (Corrugated) pattern should be visible in the layer view
 
-For Corrugated, the bundled **"FeatherPrint Corrugated"** print profile (installed automatically) sets the validated `corrugated_*` tuning settings for you — select it under Print Settings → Profiles rather than hand-tuning those settings on a stock profile.
+Two print profiles are installed automatically and appear under Print Settings → Profiles: **"FeatherPrint"** (stringer/lacing settings for the FeatherPrint generator) and **"FeatherPrint Corrugated"** (validated `corrugated_*` tuning). Select the one that matches your model rather than hand-tuning a stock profile.
 
 ### Recommended settings — FeatherPrint
+
+The bundled **"FeatherPrint"** profile applies the `featherprint_*` tuning plus wall/skin/brim/support geometry (layer height 0.1 mm); material, temperature and speed are left to whichever material profile you already use. If you set things by hand instead, start from:
 
 | Setting | Value |
 |---|---|

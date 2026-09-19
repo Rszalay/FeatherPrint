@@ -31,7 +31,7 @@ FeatherPrint installs over an existing Cura with one Windows installer, and you 
 
 1. Download `FeatherPrint-1.0.0-Windows-x64-Setup.exe` from the [v1.0.0 release page](https://github.com/Rszalay/FeatherPrint/releases/tag/v1.0.0).
 2. Right-click the file and choose Run as administrator.
-3. Follow the installer. It finds your Cura 5.13.x installation, backs up the original engine files, deploys FeatherPrint, and installs the bundled "FeatherPrint Corrugated" print profile.
+3. Follow the installer. It finds your Cura 5.13.x installation, backs up the original engine files, deploys FeatherPrint, and installs the bundled "FeatherPrint" and "FeatherPrint Corrugated" print profiles.
 4. Start Cura and open the Infill Pattern setting. You should now see FeatherPrint and Corrugated in the list.
 
 ![Cura print settings with the three-bar menu open and All selected, which reveals the FeatherPrint and Corrugated categories](images/featherprint-manual-01.png)
@@ -234,7 +234,7 @@ Corrugated adds twelve settings in their own Corrugated category, all active onl
 
 | Setting | Default | What it controls |
 | --- | --- | --- |
-| `corrugated_skin_linked` | Off | Prints the wall-following part of the corrugation as one continuous path that swaps between outer and inner wall at each stringer, instead of separate segments. Falls back to unlinked stringers on layers it cannot link. |
+| `corrugated_skin_linked` | On | Prints the wall-following part of the corrugation as one continuous path that swaps between outer and inner wall at each stringer, instead of separate segments. Falls back to unlinked stringers on layers it cannot link. |
 | `corrugated_strip_wall_a` | Off | Removes Cura's own wall on the outer wall (Wall A), letting the corrugation take over its job. Turns on linked skin for that side. |
 | `corrugated_strip_wall_b` | Off | The same for the inner wall (Wall B). |
 
@@ -245,7 +245,7 @@ Stripping a wall does not work together with Raw Outline Mode; turn that off to 
 | Setting | Default | Units | What it controls |
 | --- | --- | --- | --- |
 | `corrugated_vbs_tolerance` | 0.3 | fraction | How finely long contour edges are split. Values below about 0.334 can make irregular shapes over-subdivide, and Cura warns below that. |
-| `corrugated_prune_threshold` | 0.8 | mm | Short side-arms shorter than this are folded into a neighbouring wall. Too large a value can absorb real short features. |
+| `corrugated_prune_threshold` | 11 | mm | Short side-arms shorter than this are folded into a neighbouring wall. Too large a value can absorb real short features. |
 | `corrugated_chain_junction_merge_angle` | 30 | ° | How far from a straight 180° two corridors may bend at a junction and still be merged into one continuous corridor. |
 | `corrugated_deminimis_hole_area` | 1.0 | mm² | Holes smaller than this are ignored when deciding a region's shape. Experimental. |
 | `corrugated_transition_layer_enabled` | On |  | Prints a solid fill layer where the number of regions changes, so corrugation has something to build on. Experimental. |
@@ -254,7 +254,7 @@ Stripping a wall does not work together with Raw Outline Mode; turn that off to 
 
 | Setting | Default | What it controls |
 | --- | --- | --- |
-| `corrugated_raw_outline_mode` | Off | Corrugates a fixed-width inset of the raw slice outline instead of Cura's generated walls, for parts where wall generation changes shape between layers. May overlap the top and bottom skin. |
+| `corrugated_raw_outline_mode` | On | Corrugates a fixed-width inset of the raw slice outline instead of Cura's generated walls, for parts where wall generation changes shape between layers. May overlap the top and bottom skin. |
 | `meshfix_remove_diagonal_artifacts` | Off | A Cura mesh-fix option, not in the Corrugated category. Removes false vertices left by STL tessellation, which can otherwise make a thin trailing edge unstable. Helps every infill pattern. This mainly applies to vertical quads from extrusions in the z axis. |
 
 These defaults are first-pass values that have not yet been tested across a wide range of parts, which is why the bundled profile is the safer starting point.

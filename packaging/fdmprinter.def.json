@@ -2954,9 +2954,9 @@
                     "description": "VBCT Stage 9's pruning length threshold: skeleton chains (arms hanging off a junction with nothing at their far end) shorter than this are pruned and their material folded into a neighbouring wall instead of getting their own short corrugation span. Larger values simplify the resulting wall structure more aggressively; too large can absorb real, intentional short features.",
                     "type": "float",
                     "unit": "mm",
-                    "default_value": 0.8,
+                    "default_value": 11,
                     "minimum_value": "0.0",
-                    "maximum_value_warning": "10.0",
+                    "maximum_value_warning": "20.0",
                     "enabled": "infill_pattern == 'corrugated'",
                     "settable_per_mesh": true,
                     "settable_globally": true
@@ -2992,7 +2992,7 @@
                     "label": "Corrugated Raw Outline Mode",
                     "description": "Experimental. Corrugates a simple, fixed-width inset of this layer's raw slice outline (before Cura's own Arachne wall generation runs) instead of the wall-generated Infill Area. Arachne's variable-width bead placement can choose a genuinely different local wall topology at different Z heights for a part whose cross-section doesn't actually change with height, which VBCT's domain classification is sensitive to; a fixed-width inset trades Arachne's bead-width fidelity for guaranteed Z-invariant input. Does not yet exclude top/bottom skin area from the corrugated region - corrugation may overlap skin at the first/last few layers when enabled.",
                     "type": "bool",
-                    "default_value": false,
+                    "default_value": true,
                     "enabled": "infill_pattern == 'corrugated'",
                     "settable_per_mesh": true,
                     "settable_globally": true
@@ -3012,7 +3012,7 @@
                     "label": "Corrugated Linked Skin",
                     "description": "Runs the corrugation's wall-following (\"skin\") portion as one continuous toolpath that alternates between the outer and inner wall each time it crosses a stringer, instead of printing each stringer as an independent segment. Supports Ring domains (a closed loop), a single Chain domain (an open path running from one end of the corridor to the other), and multiple Chain domains meeting at a junction (e.g. a Tee or cross shape) - each domain gets its own path, with any straight pass-through pair merged into one continuous run first (see Corrugated Chain Junction Merge Angle). Always uses the Corrugated Crosshatch stringer family internally on a Ring domain to have something to alternate against, even if Corrugated Crosshatch itself is disabled (not needed on a Chain domain). Falls back to the unlinked stringer pattern for any layer this can't be fully linked for (more than one Ring domain, a mixed Ring+Chain composition, a Glob domain, or any domain whose own stringer would leave a non-convex region).",
                     "type": "bool",
-                    "default_value": false,
+                    "default_value": true,
                     "enabled": "infill_pattern == 'corrugated'",
                     "settable_per_mesh": true,
                     "settable_globally": true

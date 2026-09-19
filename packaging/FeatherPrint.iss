@@ -22,6 +22,8 @@
 ; Bundled quality_changes profile pair (relative to this .iss file)
 #define QualityChangesGlobal   "..\packaging\quality_changes\fdmprinter_featherprint_corrugated.inst.cfg"
 #define QualityChangesExtruder "..\packaging\quality_changes\fdmprinter_extruder_0_featherprint_corrugated.inst.cfg"
+#define FpQualityGlobal        "..\packaging\quality_changes\fdmprinter_featherprint.inst.cfg"
+#define FpQualityExtruder      "..\packaging\quality_changes\fdmprinter_extruder_0_featherprint.inst.cfg"
 
 ; =============================================================================
 [Setup]
@@ -69,6 +71,8 @@ Source: "{#SourceBuildDir}\tbbmalloc_proxy.dll";        DestDir: "{tmp}\FeatherP
 Source: "{#FdmPrinterDef}";                             DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
 Source: "{#QualityChangesGlobal}";                      DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
 Source: "{#QualityChangesExtruder}";                    DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
+Source: "{#FpQualityGlobal}";                           DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
+Source: "{#FpQualityExtruder}";                         DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
 
 ; =============================================================================
 [Code]
@@ -234,7 +238,7 @@ begin
     '  2. Replace CuraEngine.exe with FeatherPrint {#MyAppVersion}' + #13#10 +
     '  3. Copy required runtime DLLs (with .bak backups)' + #13#10 +
     '  4. Deploy modified fdmprinter.def.json (with .bak backup)' + #13#10 +
-    '  5. Install a validated "FeatherPrint Corrugated" print profile' + #13#10 +
+    '  5. Install "FeatherPrint" and "FeatherPrint Corrugated" print profiles' + #13#10 +
     '  6. Clear Cura''s definition cache so the new settings show up' + #13#10 + #13#10 +
     'Please close Cura before continuing.' + #13#10 + #13#10 +
     'To restore the original engine, run Uninstall from Add/Remove Programs.' + #13#10 + #13#10 +
@@ -311,6 +315,10 @@ begin
            QualityChangesDir + 'fdmprinter_featherprint_corrugated.inst.cfg', False);
   CopyFile(StagingDir + 'fdmprinter_extruder_0_featherprint_corrugated.inst.cfg',
            QualityChangesDir + 'fdmprinter_extruder_0_featherprint_corrugated.inst.cfg', False);
+  CopyFile(StagingDir + 'fdmprinter_featherprint.inst.cfg',
+           QualityChangesDir + 'fdmprinter_featherprint.inst.cfg', False);
+  CopyFile(StagingDir + 'fdmprinter_extruder_0_featherprint.inst.cfg',
+           QualityChangesDir + 'fdmprinter_extruder_0_featherprint.inst.cfg', False);
 
   { Cura caches parsed definitions and trusts the cache whenever it is newer than the source
     file. CopyFile keeps the JSON's old modification date, so a cache built by any earlier
@@ -324,8 +332,8 @@ begin
   MsgBox(
     'FeatherPrint installed successfully!' + #13#10 + #13#10 +
     'Location: ' + CuraInstallDir + #13#10 + #13#10 +
-    'A "FeatherPrint Corrugated" print profile is now available under Print Settings ->' + #13#10 +
-    'Profiles - it sets the validated corrugated_* / meshfix / geometry settings' + #13#10 +
+    '"FeatherPrint" and "FeatherPrint Corrugated" print profiles are now available under' + #13#10 +
+    'Print Settings -> Profiles - they set the validated generator/geometry settings' + #13#10 +
     '(materials/temperature are left to whichever material profile you already use).' + #13#10 + #13#10 +
     'NOTE: If you update Cura, the official CuraEngine will overwrite this.' + #13#10 +
     'Run this installer again after a Cura update to restore FeatherPrint.',
