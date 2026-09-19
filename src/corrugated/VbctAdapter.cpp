@@ -1527,7 +1527,16 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             continue;
         }
         const SliceLayerPart& part = layer.parts[0];
-        const Shape corrugation_input_raw = buildCorrugationInput(part, mesh.settings);
+        // Must be the same geometry FffGcodeWriter::processCorrugatedInfill hands VBCT, which grows
+        // this by infill_overlap_mm (unless a Wall Strip side is active - see that function's own
+        // comment). Stage 9's Ring wall start point, vertex count and winding are sensitive to even
+        // that ~0.02-0.04mm growth, and the anchors decided here (t0_frac as an arc fraction from the
+        // wall's start, plus the winding-direction correction) are only meaningful against a wall
+        // built from identical input: without this, the live wall came out wound the opposite way to
+        // what this pre-pass planned on ~28% of Ring layers, mirroring the stringers there.
+        const Shape corrugation_input_built = buildCorrugationInput(part, mesh.settings);
+        const bool strip_wall_active = mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b");
+        const Shape corrugation_input_raw = strip_wall_active ? corrugation_input_built : corrugation_input_built.offset(mesh.settings.get<coord_t>("infill_overlap_mm"));
 
         // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): decide, with hysteresis, which of
         // this layer's own holes to treat as ignored for domain-classification purposes, before
@@ -2394,6 +2403,7 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             }
         }
     }
+
 
     return result;
 }

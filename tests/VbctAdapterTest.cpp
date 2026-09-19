@@ -1623,6 +1623,9 @@ void addCorrugationAnchorSettings(Settings& settings)
     // even though none of these tests actually exercise stripping itself.
     settings.add("corrugated_strip_wall_a", "False");
     settings.add("corrugated_strip_wall_b", "False");
+    // computeAnchorsForMesh grows its own input by this, matching the live per-layer path. "0"
+    // reproduces the geometry these tests were written against.
+    settings.add("infill_overlap_mm", "0");
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9) - read unconditionally by
     // computeAnchorsForMesh's own hole-detection pre-pass for every layer, so this must be
     // registered here too even though none of these tests actually have any holes. "0" reproduces
