@@ -1,0 +1,221 @@
+<title>Corrugated Workflow</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<style>
+:root{
+  --bg:#EEF2F5; --ink:#12212C; --muted:#55697A; --stroke:#2C4356; --node:#FFFFFF; --panel:#E0E8EE;
+  --accent:#0B7A87; --on-accent:#FFFFFF; --warn:#B4570B; --warn-bg:#FBEBDD; --rule:#B5C4CF;
+  --sans:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --display:'Barlow Semi Condensed','Arial Narrow',system-ui,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0D151B; --ink:#DDE7EE; --muted:#93A7B6; --stroke:#6E8CA1; --node:#15222B; --panel:#1B2B36;
+    --accent:#43BCC8; --on-accent:#06222A; --warn:#E9A05B; --warn-bg:#2C2015; --rule:#2B3E4B;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0D151B; --ink:#DDE7EE; --muted:#93A7B6; --stroke:#6E8CA1; --node:#15222B; --panel:#1B2B36;
+  --accent:#43BCC8; --on-accent:#06222A; --warn:#E9A05B; --warn-bg:#2C2015; --rule:#2B3E4B;
+}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55;padding-inline:16px;padding-block:32px 48px}
+.wrap{max-width:860px;margin-inline:auto;display:flex;flex-direction:column;gap:24px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0}
+h1{font-family:var(--display);font-weight:600;font-size:clamp(34px,6vw,52px);line-height:1;margin:6px 0 12px;letter-spacing:-.01em;text-wrap:balance}
+.lede{max-width:65ch;color:var(--muted);margin:0}
+.legend{display:flex;flex-wrap:wrap;gap:8px 24px;font-size:13px;color:var(--muted);margin:0;padding:0;list-style:none}
+.legend li{display:flex;align-items:center;gap:8px}
+.legend svg{width:34px;height:14px;flex:none}
+figure{margin:0;display:flex;flex-direction:column;gap:12px}
+.scroll{overflow-x:auto;border:1px solid var(--rule);border-radius:6px;background:var(--bg)}
+.scroll svg{display:block;width:100%;min-width:720px;height:auto;color:var(--ink)}
+figcaption{font-size:13px;color:var(--muted);max-width:70ch}
+.foot{font-size:13px;color:var(--muted);border-top:1px solid var(--rule);padding-top:16px;margin:0;max-width:70ch}
+/* svg parts */
+.node{fill:var(--node);stroke:var(--stroke);stroke-width:1.4}
+.pill{fill:var(--accent);stroke:none}
+.dec{fill:var(--node);stroke:var(--accent);stroke-width:1.8}
+.fix{fill:var(--warn-bg);stroke:var(--warn);stroke-width:1.4}
+.panel{fill:var(--panel);stroke:none}
+.flow{fill:none;stroke:var(--stroke);stroke-width:1.5}
+.loop{fill:none;stroke:var(--warn);stroke-width:1.5}
+.tie{fill:none;stroke:var(--muted);stroke-width:1;stroke-dasharray:3 3}
+.rule{stroke:var(--rule);stroke-width:1}
+.ah-ink{fill:var(--stroke)} .ah-warn{fill:var(--warn)}
+text{font-family:var(--sans);fill:var(--ink);font-size:12px}
+.h{font-weight:600;font-size:13px}
+.s{fill:var(--muted);font-size:11.5px}
+.m{font-family:var(--mono);font-size:10.5px}
+.on{fill:var(--on-accent);font-weight:600;font-size:13px}
+.lab{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;fill:var(--muted)}
+.yn{font-family:var(--mono);font-size:10.5px;fill:var(--muted)}
+.wn{font-family:var(--mono);font-size:10.5px;fill:var(--warn)}
+.pt{font-weight:600;font-size:11.5px}
+.pl{font-size:12px}
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">FeatherPrint manual · Corrugated mode · draft chart</p>
+    <h1>Filling the gap between walls</h1>
+    <p class="lede">Corrugated replaces ordinary infill in a hollow, thin-walled part with a stringer structure that follows both walls. This is the path a part takes: what to check in the model, which settings to set, and what to look for before printing. Amber paths are correction loops.</p>
+  </header>
+
+  <ul class="legend" aria-label="Legend">
+    <li><svg viewBox="0 0 34 14" aria-hidden="true"><line x1="1" y1="7" x2="33" y2="7" class="flow"/></svg>Main path</li>
+    <li><svg viewBox="0 0 34 14" aria-hidden="true"><line x1="1" y1="7" x2="33" y2="7" class="loop"/></svg>Fix and retry</li>
+    <li><svg viewBox="0 0 34 14" aria-hidden="true"><line x1="1" y1="7" x2="33" y2="7" class="tie"/></svg>Reference note</li>
+  </ul>
+
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 780 1344" role="img" aria-label="Corrugated mode workflow in five phases: confirm the model is closed and hollow, choose the Corrugated infill pattern and tune its settings, slice, inspect the layer view looping back to settings if wrong, then print.">
+      <defs>
+        <marker id="ai" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" class="ah-ink"/></marker>
+        <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" class="ah-warn"/></marker>
+      </defs>
+<text x="0" y="14" class="lab">1 · MODEL</text>
+<line x1="0" y1="22" x2="780" y2="22" class="rule"/>
+<rect x="260" y="40" width="240" height="32" rx="16" class="pill"/>
+<text x="380" y="60" class="on" text-anchor="middle">Start with your STL</text>
+<line x1="380" y1="72" x2="380" y2="98" class="flow" marker-end="url(#ai)"/>
+<polygon points="380,100 500,145 380,190 260,145" class="dec"/>
+<text x="380" y="141" class="pl" text-anchor="middle">Closed and</text>
+<text x="380" y="157" class="pl" text-anchor="middle">watertight?</text>
+<text x="245" y="138" class="wn" text-anchor="middle">No</text>
+<line x1="260" y1="145" x2="202" y2="145" class="loop" marker-end="url(#aw)"/>
+<rect x="30" y="114" width="170" height="62" rx="4" class="fix"/>
+<text x="115" y="133" class="h" text-anchor="middle">Repair the mesh</text>
+<text x="115" y="149" class="s" text-anchor="middle">or use FeatherPrint mode</text>
+<text x="115" y="163" class="s" text-anchor="middle">if open on purpose</text>
+<path d="M115 114 V86 H372" class="loop" marker-end="url(#aw)"/>
+<text x="392" y="209" class="yn">Yes</text>
+<line x1="380" y1="190" x2="380" y2="220" class="flow" marker-end="url(#ai)"/>
+<polygon points="380,222 500,267 380,312 260,267" class="dec"/>
+<text x="380" y="263" class="pl" text-anchor="middle">Hollow, thin-walled</text>
+<text x="380" y="279" class="pl" text-anchor="middle">cross-section?</text>
+<text x="245" y="260" class="wn" text-anchor="middle">No</text>
+<line x1="260" y1="267" x2="202" y2="267" class="loop" marker-end="url(#aw)"/>
+<rect x="30" y="236" width="170" height="62" rx="4" class="fix"/>
+<text x="115" y="255" class="h" text-anchor="middle">Shell the model</text>
+<text x="115" y="271" class="s" text-anchor="middle">a solid block has no</text>
+<text x="115" y="285" class="s" text-anchor="middle">wall pair to corrugate</text>
+<path d="M115 236 V206 H372" class="loop" marker-end="url(#aw)"/>
+<line x1="530" y1="267" x2="556" y2="267" class="tie"/>
+<rect x="556" y="214" width="216" height="112" rx="4" class="panel"/>
+<text x="568" y="234" class="pt">How each layer is read</text>
+<text x="568" y="254" class="pl">Ring · outer + inner wall</text>
+<text x="568" y="270" class="pl">Chain · open corridor, C or Tee</text>
+<text x="568" y="286" class="pl">Glob · nothing printed yet</text>
+<text x="568" y="302" class="s">Not required: star-convex,</text>
+<text x="568" y="318" class="s">single region</text>
+<text x="392" y="331" class="yn">Yes</text>
+<text x="0" y="352" class="lab">2 · CONFIGURE</text>
+<line x1="0" y1="360" x2="780" y2="360" class="rule"/>
+<line x1="380" y1="312" x2="380" y2="388" class="flow" marker-end="url(#ai)"/>
+<rect x="230" y="388" width="300" height="68" rx="4" class="node"/>
+<text x="380" y="409" class="h" text-anchor="middle">Load the bundled profile</text>
+<text x="246" y="431" class="m">FeatherPrint Corrugated</text>
+<text x="246" y="447" class="m">infill_pattern = corrugated</text>
+<line x1="530" y1="422" x2="556" y2="422" class="tie"/>
+<rect x="556" y="388" width="216" height="68" rx="4" class="panel"/>
+<text x="568" y="408" class="pl">Print Settings › Profiles</text>
+<text x="568" y="424" class="s">Exclusive with FeatherPrint</text>
+<line x1="380" y1="456" x2="380" y2="470" class="flow" marker-end="url(#ai)"/>
+<rect x="230" y="470" width="300" height="86" rx="4" class="node"/>
+<text x="380" y="491" class="h" text-anchor="middle">Set stringer density and twist</text>
+<text x="246" y="513" class="m">corrugated_stringer_pitch</text>
+<text x="246" y="529" class="m">corrugated_crossover_pitch_mm</text>
+<text x="246" y="545" class="m">corrugated_crosshatch_enabled</text>
+<line x1="530" y1="513" x2="556" y2="513" class="tie"/>
+<rect x="556" y="470" width="216" height="102" rx="4" class="panel"/>
+<text x="568" y="490" class="pt">Defaults</text>
+<text x="568" y="510" class="pl">Stringer pitch 3.0 mm</text>
+<text x="568" y="526" class="pl">Crossover pitch 10 mm, 0 = off</text>
+<text x="568" y="542" class="pl">Crosshatch on</text>
+<text x="568" y="558" class="s">Keep well above ½ layer height</text>
+<line x1="380" y1="556" x2="380" y2="582" class="flow" marker-end="url(#ai)"/>
+<rect x="230" y="582" width="300" height="86" rx="4" class="node"/>
+<text x="380" y="603" class="h" text-anchor="middle">Optional: replace Cura's walls</text>
+<text x="246" y="625" class="m">corrugated_skin_linked</text>
+<text x="246" y="641" class="m">corrugated_strip_wall_a</text>
+<text x="246" y="657" class="m">corrugated_strip_wall_b</text>
+<line x1="530" y1="625" x2="556" y2="625" class="tie"/>
+<rect x="556" y="582" width="216" height="74" rx="4" class="panel"/>
+<text x="568" y="602" class="pt">Off by default</text>
+<text x="568" y="622" class="pl">Strip forces linked skin</text>
+<text x="568" y="638" class="s">Not with raw outline mode</text>
+<line x1="380" y1="668" x2="380" y2="694" class="flow" marker-end="url(#ai)"/>
+<rect x="230" y="694" width="300" height="118" rx="4" class="node"/>
+<text x="380" y="715" class="h" text-anchor="middle">Optional: tune geometry handling</text>
+<text x="246" y="737" class="m">corrugated_vbs_tolerance</text>
+<text x="246" y="753" class="m">corrugated_prune_threshold</text>
+<text x="246" y="769" class="m">corrugated_chain_junction_merge_angle</text>
+<text x="246" y="785" class="m">corrugated_deminimis_hole_area</text>
+<text x="246" y="801" class="m">corrugated_transition_layer_enabled</text>
+<line x1="530" y1="753" x2="556" y2="753" class="tie"/>
+<rect x="556" y="694" width="216" height="118" rx="4" class="panel"/>
+<text x="568" y="714" class="pt">Defaults</text>
+<text x="568" y="734" class="pl">Subdivision 0.3 (warns < 0.334)</text>
+<text x="568" y="750" class="pl">Prune 0.8 mm</text>
+<text x="568" y="766" class="pl">Junction merge 30°</text>
+<text x="568" y="782" class="pl">Small hole 1.0 mm²</text>
+<text x="568" y="798" class="pl">Transition layer on</text>
+<line x1="380" y1="812" x2="380" y2="838" class="flow" marker-end="url(#ai)"/>
+<rect x="230" y="838" width="300" height="70" rx="4" class="node"/>
+<text x="380" y="859" class="h" text-anchor="middle">Optional: experimental</text>
+<text x="246" y="881" class="m">corrugated_raw_outline_mode</text>
+<text x="246" y="897" class="m">meshfix_remove_diagonal_artifacts</text>
+<line x1="530" y1="873" x2="556" y2="873" class="tie"/>
+<rect x="556" y="838" width="216" height="70" rx="4" class="panel"/>
+<text x="568" y="858" class="pt">Both off by default</text>
+<text x="568" y="878" class="s">Raw outline may overlap skin</text>
+<text x="568" y="894" class="s">Diagonal fix: thin trailing edges</text>
+<text x="0" y="926" class="lab">3 · SLICE</text>
+<line x1="0" y1="934" x2="780" y2="934" class="rule"/>
+<line x1="380" y1="908" x2="380" y2="962" class="flow" marker-end="url(#ai)"/>
+<rect x="230" y="962" width="300" height="48" rx="4" class="node"/>
+<text x="380" y="983" class="h" text-anchor="middle">Slice in Cura</text>
+<text x="380" y="999" class="s" text-anchor="middle">FeatherPrint engine</text>
+<line x1="530" y1="986" x2="556" y2="986" class="tie"/>
+<rect x="556" y="946" width="216" height="118" rx="4" class="panel"/>
+<text x="568" y="966" class="pt">Handled for you</text>
+<text x="568" y="986" class="pl">Wall pairs found per layer</text>
+<text x="568" y="1002" class="pl">Stringers placed between walls</text>
+<text x="568" y="1018" class="pl">Crossover phase carried up</text>
+<text x="568" y="1034" class="s">Solid transition layer where a</text>
+<text x="568" y="1050" class="s">domain appears</text>
+<text x="0" y="1086" class="lab">4 · INSPECT</text>
+<line x1="0" y1="1094" x2="780" y2="1094" class="rule"/>
+<line x1="380" y1="1010" x2="380" y2="1120" class="flow" marker-end="url(#ai)"/>
+<polygon points="380,1120 500,1165 380,1210 260,1165" class="dec"/>
+<text x="380" y="1161" class="pl" text-anchor="middle">Layer view matches</text>
+<text x="380" y="1177" class="pl" text-anchor="middle">your intent?</text>
+<text x="245" y="1160" class="wn" text-anchor="middle">No</text>
+<line x1="260" y1="1165" x2="202" y2="1165" class="loop" marker-end="url(#aw)"/>
+<rect x="30" y="1138" width="170" height="54" rx="4" class="fix"/>
+<text x="115" y="1157" class="h" text-anchor="middle">Change settings</text>
+<text x="115" y="1173" class="s" text-anchor="middle">or fix the model</text>
+<path d="M115 1138 V513 H226" class="loop" marker-end="url(#aw)"/>
+<line x1="530" y1="1165" x2="556" y2="1165" class="tie"/>
+<rect x="556" y="1104" width="216" height="144" rx="4" class="panel"/>
+<text x="568" y="1124" class="pt">Check in the layer view</text>
+<text x="568" y="1144" class="pl">Stringers span both walls</text>
+<text x="568" y="1160" class="pl">Crossovers line up in Z</text>
+<text x="568" y="1176" class="pl">Solid fill where a domain</text>
+<text x="568" y="1192" class="s">appears, then resumes</text>
+<text x="568" y="1208" class="pl">Empty patches are Glob</text>
+<text x="568" y="1224" class="pl">Y-junction arms stay unlinked</text>
+<text x="392" y="1228" class="yn">Yes</text>
+<text x="0" y="1262" class="lab">5 · PRINT</text>
+<line x1="0" y1="1270" x2="780" y2="1270" class="rule"/>
+<line x1="380" y1="1210" x2="380" y2="1292" class="flow" marker-end="url(#ai)"/>
+<rect x="260" y="1294" width="240" height="32" rx="16" class="pill"/>
+<text x="380" y="1314" class="on" text-anchor="middle">Print the part</text>
+    </svg>
+    </div>
+    <figcaption>Two model checks gate the part, five groups of settings configure the slice (only the first two are needed), and one layer-view check decides whether to print or loop back. Side panels are reference, not steps.</figcaption>
+  </figure>
+
+  <p class="foot">Draft for the FeatherPrint manual, from the Corrugated specification REV 3.8 (18 September 2026) and the Corrugated settings file. Corrugated is a separate infill pattern from FeatherPrint: a mesh uses one or the other. Defaults are first-pass values not yet validated across a wide range of parts. Glob regions currently print no corrugation, and a Y-junction with no straight pass-through still corrugates each arm independently.</p>
+</div>
