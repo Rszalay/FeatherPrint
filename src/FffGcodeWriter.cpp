@@ -3090,7 +3090,15 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // GCodePathConfig's own extrusion_mm3_per_mm is computed from
     // line_width/layer_thickness/flow at construction (see GCodePathConfig.h), so a
     // post-construction mutation of those would leave it stale.
-    if (! transition_lines.empty() && mesh.settings.get<bool>("bridge_settings_enabled"))
+    if (! transition_lines.empty() && ! mesh.settings.get<bool>("bridge_settings_enabled"))
+    {
+        // Bridging disabled (a stock profile's default): still print the Transition Layer's solid fill,
+        // just with the ordinary infill config. Dropping it left a layer where every domain
+        // transitioned with no corrugation at all - an empty corridor between the walls - while this
+        // function still reported having added geometry.
+        gcode_layer.addLinesByOptimizer(transition_lines, mesh_config.infill_config[0], SpaceFillType::Lines);
+    }
+    else if (! transition_lines.empty())
     {
         const GCodePathConfig bridge_config{
             .type = PrintFeatureType::Infill,
