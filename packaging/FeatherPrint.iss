@@ -167,6 +167,14 @@ begin
 end;
 
 { --------------------------------------------------------------------------- }
+{ Delete Cura's regenerable definition cache so it re-reads fdmprinter.def.json }
+{ --------------------------------------------------------------------------- }
+procedure ClearCuraDefinitionCache();
+begin
+  DelTree(ExpandConstant('{localappdata}\cura\{#TargetCuraVersion}\cache'), True, True, True);
+end;
+
+{ --------------------------------------------------------------------------- }
 { Installer startup — detect Cura and confirm with user                       }
 { --------------------------------------------------------------------------- }
 function InitializeSetup(): Boolean;
@@ -226,7 +234,9 @@ begin
     '  2. Replace CuraEngine.exe with FeatherPrint {#MyAppVersion}' + #13#10 +
     '  3. Copy required runtime DLLs (with .bak backups)' + #13#10 +
     '  4. Deploy modified fdmprinter.def.json (with .bak backup)' + #13#10 +
-    '  5. Install a validated "FeatherPrint Corrugated" print profile' + #13#10 + #13#10 +
+    '  5. Install a validated "FeatherPrint Corrugated" print profile' + #13#10 +
+    '  6. Clear Cura''s definition cache so the new settings show up' + #13#10 + #13#10 +
+    'Please close Cura before continuing.' + #13#10 + #13#10 +
     'To restore the original engine, run Uninstall from Add/Remove Programs.' + #13#10 + #13#10 +
     'Continue?';
 
@@ -302,6 +312,11 @@ begin
   CopyFile(StagingDir + 'fdmprinter_extruder_0_featherprint_corrugated.inst.cfg',
            QualityChangesDir + 'fdmprinter_extruder_0_featherprint_corrugated.inst.cfg', False);
 
+  { Cura caches parsed definitions and trusts the cache whenever it is newer than the source
+    file. CopyFile keeps the JSON's old modification date, so a cache built by any earlier
+    Cura launch (i.e. every real user) would hide the new infill patterns and settings. }
+  ClearCuraDefinitionCache();
+
   { Save install location so the uninstaller can find it }
   SaveStringToFile(ExpandConstant('{app}\install_location.txt'),
                    CuraInstallDir, False);
@@ -356,6 +371,9 @@ begin
   finally
     FileNames.Free;
   end;
+
+  { Same stale-cache problem in reverse: drop the cache built from FeatherPrint's JSON }
+  ClearCuraDefinitionCache();
 
   MsgBox(
     'FeatherPrint uninstalled.' + #13#10 +
