@@ -248,6 +248,93 @@ std::optional<int> hub_vertex_hint(const Chain& chain) {
     return std::nullopt;
 }
 
+// Connected components of a piece list, as vertex -> dense component id; `count` is the number of
+// components. Only membership matters to callers, never the id numbering.
+std::unordered_map<int, int> piece_components(const std::vector<Piece>& pieces, int& count) {
+    std::unordered_map<int, std::vector<int>> adj;
+    for (const auto& [p, q] : pieces) {
+        adj[p].push_back(q);
+        adj[q].push_back(p);
+    }
+    std::unordered_map<int, int> comp;
+    count = 0;
+    for (const auto& kv : adj) {
+        if (comp.count(kv.first)) continue;
+        std::vector<int> stack{kv.first};
+        comp[kv.first] = count;
+        while (!stack.empty()) {
+            int cur = stack.back();
+            stack.pop_back();
+            for (int nb : adj[cur]) {
+                if (!comp.count(nb)) {
+                    comp[nb] = count;
+                    stack.push_back(nb);
+                }
+            }
+        }
+        ++count;
+    }
+    return comp;
+}
+
+// side_of classifies each piece by which side of the skeleton's *local* direction it falls on, so
+// at a small notch/slot in a wall the direction perturbs for a step and the few pieces around the
+// notch can land on the opposite wall's list. That splits this wall's piece graph in two, and
+// stitch_indices then keeps only the larger half - silently truncating the wall (confirmed on
+// FPTF-45 - Body.stl stood up, layers 477-555: a 134mm inner bore wall built as ~64mm, so every
+// stringer's inner end bunched onto half the bore and the stringers fanned across the open
+// middle). Reattach such pieces: when `side` is split into several components, any *stray*
+// component of `other` (not its largest, i.e. not the real wall) that touches two or more of
+// them is exactly the missing bridge, so move it across. Everything moved is otherwise discarded
+// by stitch_indices as a non-largest component of `other`, so a layer where nothing bridges is
+// completely unaffected.
+void reattach_bridging_strays(std::vector<Piece>& side, std::vector<Piece>& other) {
+    for (int guard = 0; guard < 8; ++guard) {
+        int n_side = 0;
+        const auto side_comp = piece_components(side, n_side);
+        if (n_side < 2) return;
+        int n_other = 0;
+        const auto other_comp = piece_components(other, n_other);
+        if (n_other < 2) return;  // `other` is a single component: it is the real wall, nothing stray
+
+        std::vector<int> other_size(n_other, 0);
+        for (const auto& p : other) ++other_size[other_comp.at(p.first)];
+        int main_other = 0;
+        for (int c = 1; c < n_other; ++c) {
+            if (other_size[c] > other_size[main_other]) main_other = c;
+        }
+
+        std::vector<std::set<int>> touched(n_other);
+        for (const auto& [v, c] : other_comp) {
+            auto it = side_comp.find(v);
+            if (it != side_comp.end()) touched[c].insert(it->second);
+        }
+        std::vector<char> move(n_other, 0);
+        bool any = false;
+        for (int c = 0; c < n_other; ++c) {
+            // A stray is a tiny fragment (a notch's few pieces), never a substantial piece of a
+            // wall in its own right - without this cap, when both walls are fragmented the
+            // smaller half of one wall would count as a "stray" bridging the other's stubs.
+            const bool is_stray = other_size[c] * 10 <= other_size[main_other];
+            if (c != main_other && is_stray && touched[c].size() >= 2) {
+                move[c] = 1;
+                any = true;
+            }
+        }
+        if (!any) return;
+
+        std::vector<Piece> kept;
+        for (const auto& p : other) {
+            if (move[other_comp.at(p.first)]) {
+                side.push_back(p);
+            } else {
+                kept.push_back(p);
+            }
+        }
+        other = std::move(kept);
+    }
+}
+
 Domain walk_chain_domain(const Chain& chain, const Stage5Result& stage5, const Stage6Result& stage6) {
     const auto& verts = stage5.vertices;
     const auto& boundary_edges = stage5.boundary_edges;
@@ -263,6 +350,9 @@ Domain walk_chain_domain(const Chain& chain, const Stage5Result& stage5, const S
             (side == "left" ? left_pieces : right_pieces).push_back(piece);
         }
     }
+
+    reattach_bridging_strays(left_pieces, right_pieces);
+    reattach_bridging_strays(right_pieces, left_pieces);
 
     std::optional<int> hub_hint = hub_vertex_hint(chain);
     Wall left = materialize_wall(left_pieces, verts, hub_hint);

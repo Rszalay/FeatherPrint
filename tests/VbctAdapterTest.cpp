@@ -3128,5 +3128,61 @@ TEST(VbctAdapterTest, CorrugateChainTransitionLayerRequestOnlyAffectsMatchedDoma
     EXPECT_LT(result->size(), ordinary_lines->size()) << "the returned set should now hold only one bar's own ordinary stringers, not both";
 }
 
+/*!
+ * Real capture: FPTF-45 - Body.stl stood up (90 degrees about X), layer 500 at 0.1mm - a ring whose
+ * inner bore has two small notches at mid-height. Stage 8's side_of classification puts the few
+ * pieces around each notch on the *outer* wall's list, splitting the inner wall's piece graph into
+ * an upper and a lower half; stitch_indices then kept only the larger half, so the inner wall came
+ * out at ~64mm of a ~134mm bore and every stringer's inner end bunched onto half of it, fanning
+ * across the open middle (layers 477-555 of that print). The two notch stubs must be reattached to
+ * the inner wall so it is the whole bore.
+ */
+TEST(VbctAdapterTest, RingWithBoreNotchesKeepsTheWholeInnerWall)
+{
+    const std::vector<std::vector<vbct::Point2i>> raw_contours = {
+#include "vbct_stage8_bore_notch_fixture.inc"
+    };
+    ASSERT_EQ(raw_contours.size(), 2u);
+
+    std::vector<vbct::Contour> contours;
+    std::vector<double> perimeters_mm;
+    for (size_t i = 0; i < raw_contours.size(); ++i)
+    {
+        vbct::Contour contour;
+        contour.points = raw_contours[i];
+        contour.contour_id = "c" + std::to_string(i);
+        double perimeter = 0.0;
+        for (size_t k = 0; k < contour.points.size(); ++k)
+        {
+            const vbct::Point2i& a = contour.points[k];
+            const vbct::Point2i& b = contour.points[(k + 1) % contour.points.size()];
+            perimeter += std::hypot(static_cast<double>(b.x - a.x), static_cast<double>(b.y - a.y)) / vbct::SCALE;
+        }
+        perimeters_mm.push_back(perimeter);
+        contours.push_back(std::move(contour));
+    }
+    std::sort(perimeters_mm.begin(), perimeters_mm.end());
+
+    // The same sequence computeAnchorsForMesh runs per layer, with this project's stock
+    // corrugated_vbs_tolerance (0.3) and corrugated_prune_threshold (11mm).
+    const vbct::VbctResult r14 = vbct::run_vbct(contours, 0.3);
+    const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, 11.0);
+    const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+    const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+    const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+    const vbct::Stage9Result r9 = vbct::run_stage9(r5, r6, r7, r8, 11.0);
+
+    ASSERT_EQ(r9.domains.size(), 1u);
+    const vbct::Domain& ring = r9.domains[0];
+    ASSERT_EQ(ring.kind, "ring");
+    ASSERT_TRUE(ring.left.has_value());
+    ASSERT_TRUE(ring.right.has_value());
+
+    std::vector<double> wall_lengths = { vbct::wall_length(ring.left->points), vbct::wall_length(ring.right->points) };
+    std::sort(wall_lengths.begin(), wall_lengths.end());
+    EXPECT_GT(wall_lengths[0], 0.95 * perimeters_mm[0]) << "the inner wall must span the whole bore (" << perimeters_mm[0] << "mm), not just half of it";
+    EXPECT_GT(wall_lengths[1], 0.95 * perimeters_mm[1]) << "the outer wall must span the whole outer contour (" << perimeters_mm[1] << "mm)";
+}
+
 } // namespace cura
 // NOLINTEND(*-magic-numbers)
