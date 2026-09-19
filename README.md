@@ -20,7 +20,7 @@ Only one generator runs per mesh, dispatched from the same engine build — pick
 
 ## Installation
 
-1. Download **FeatherPrint-1.0.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
+1. Download **FeatherPrint-1.0.1-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
 2. Run the installer as Administrator
 3. The installer will detect your Cura 5.13.x installation, back up the original engine files, deploy FeatherPrint, and install a validated **"FeatherPrint Corrugated"** print profile (Print Settings → Profiles)
 
