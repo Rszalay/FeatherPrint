@@ -3184,5 +3184,36 @@ TEST(VbctAdapterTest, RingWithBoreNotchesKeepsTheWholeInnerWall)
     EXPECT_GT(wall_lengths[1], 0.95 * perimeters_mm[1]) << "the outer wall must span the whole outer contour (" << perimeters_mm[1] << "mm)";
 }
 
+/*!
+ * A Chain whose only junction is a self-loop hub (a ring whose notch leaves a short skeleton spur
+ * kept as its own domain) has closed-loop walls: front == back, so orient_toward's nearest-end
+ * test is always a tie and used to leave each wall in whatever direction Stage 9 emitted it. The
+ * two walls could come out wound opposite ways, pairing each stringer with the mirror point across
+ * the whole part (FPTF-45 Body stood up, layers ~867-868 and 881 with the tessellation filter off).
+ * Both walls must come out in the same winding regardless of how they arrive.
+ */
+TEST(VbctAdapterTest, OrientTowardGivesClosedLoopWallsOneWinding)
+{
+    const std::vector<vbct::Point2> ccw = { { 0, 0 }, { 10, 0 }, { 10, 10 }, { 0, 10 }, { 0, 0 } };
+    const std::vector<vbct::Point2> cw = { { 2, 2 }, { 2, 8 }, { 8, 8 }, { 8, 2 }, { 2, 2 } };
+    ASSERT_GT(vbct::signed_area(ccw), 0.0);
+    ASSERT_LT(vbct::signed_area(cw), 0.0);
+
+    const vbct::Point2 target{ 5, 5 };
+    for (const auto& wall : { ccw, cw })
+    {
+        const std::vector<vbct::Point2> oriented = vbct::orient_toward(wall, target);
+        EXPECT_GT(vbct::signed_area(oriented), 0.0) << "a closed wall must always come out counter-clockwise";
+        EXPECT_EQ(oriented.size(), wall.size());
+        EXPECT_EQ(oriented.front().x, oriented.back().x) << "reversing a closed loop must keep it closed";
+        EXPECT_EQ(oriented.front().y, oriented.back().y);
+    }
+
+    // An open wall is still just turned so its near end comes first.
+    const std::vector<vbct::Point2> open = { { 0, 0 }, { 5, 0 }, { 10, 0 } };
+    const std::vector<vbct::Point2> toward_far_end = vbct::orient_toward(open, { 10, 0 });
+    EXPECT_EQ(toward_far_end.front().x, 10.0);
+}
+
 } // namespace cura
 // NOLINTEND(*-magic-numbers)

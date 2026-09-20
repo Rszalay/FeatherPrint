@@ -8,6 +8,7 @@
 
 namespace vbct {
 
+
 // Not anonymous-namespace, unlike the rest of this file's helpers below: exposed via stage10.hpp
 // so VbctAdapter::computeAnchorsForMesh's cross-layer continuity pre-pass (spec REV 1.4 S:5.3)
 // can reuse this file's own wall-length/centroid/reference-angle logic for a fresh
@@ -33,6 +34,17 @@ double wall_length(const std::vector<Point2>& points) {
 // own logic instead of duplicating it" rationale wall_length/signed_area/match_winding/
 // reference_angle_arc_length were already exported for.
 std::vector<Point2> orient_toward(const std::vector<Point2>& points, const Point2& target) {
+    // A closed loop (front == back) has no near or far end to orient by: both ends are the same point, so the
+    // nearest-end test below is always a tie and returns the points untouched, leaving each wall in whatever
+    // direction Stage 9 happened to emit it. That is exactly what a Chain whose only junction is a self-loop hub
+    // looks like (a ring whose notch leaves a short skeleton spur kept as its own domain): the two walls came out
+    // wound opposite ways, so each stringer paired with the mirror point across the whole part instead of the
+    // adjacent one. Put every closed wall in one canonical winding (counter-clockwise) so both walls always agree,
+    // independent of emission order and identically for every caller (live path and cross-layer tracker).
+    if (points.size() > 2 && std::hypot(points.front().x - points.back().x, points.front().y - points.back().y) < 1e-6) {
+        if (signed_area(points) < 0.0) return std::vector<Point2>(points.rbegin(), points.rend());
+        return points;
+    }
     double d0 = std::hypot(points.front().x - target.x, points.front().y - target.y);
     double d1 = std::hypot(points.back().x - target.x, points.back().y - target.y);
     if (d0 <= d1) return points;
