@@ -1260,6 +1260,29 @@ std::vector<vbct::Domain> mergeStraightPassThroughChains(std::vector<vbct::Domai
 
 } // namespace
 
+// Evaluates vbct::assign_wall_ab on one run's own contours/walls, with the same centroid input the pre-pass and
+// the live per-layer call site use. True if this run's `left` wall is Wall A.
+static bool leftWallIsWallA(const std::vector<vbct::Contour>& contours, const std::vector<vbct::Point2>& left, const std::vector<vbct::Point2>& right)
+{
+    vbct::Point2 centroid{ 0.0, 0.0 };
+    size_t total_points = 0;
+    for (const auto& c : contours)
+    {
+        for (const auto& p : c.to_float())
+        {
+            centroid.x += p.x;
+            centroid.y += p.y;
+            ++total_points;
+        }
+    }
+    if (total_points > 0)
+    {
+        centroid.x /= static_cast<double>(total_points);
+        centroid.y /= static_cast<double>(total_points);
+    }
+    return vbct::assign_wall_ab(left, right, contours, centroid).left_label == vbct::WallLabel::A;
+}
+
 std::vector<ChainWallPoints> findAllChainDomainWalls(
     const SliceLayerPart& part,
     const Settings& settings,
@@ -1368,27 +1391,14 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
 
         const std::vector<vbct::Point2>& left_pts = dom.left->points;
         const std::vector<vbct::Point2>& right_pts = dom.right->points;
-        // Label this run's own left/right walls by proximity to the Wall A / Wall B mean points the pre-pass recorded,
-        // not by the pre-pass's own left/right flag: "left" is an arbitrary per-run choice (each run picks its own
-        // ridge direction), and this run's input geometry is not byte-identical to the pre-pass's (this function
-        // builds on the un-grown corrugation input, the pre-pass on the grown one), so the flag can come out
-        // swapped - which stripped the outer wall when only Wall B (the inner) was asked for. The two walls' means
-        // are several millimetres apart, far more than any such geometry difference.
-        bool a_is_left = matched->wall_a_is_left;
-        if (matched->has_wall_means)
-        {
-            const Point2LL left_mean = fromVbctMm(meanPoint(left_pts));
-            const Point2LL right_mean = fromVbctMm(meanPoint(right_pts));
-            auto distSq = [](const Point2LL& p, const Point2LL& q)
-            {
-                const double dx = static_cast<double>(p.X - q.X);
-                const double dy = static_cast<double>(p.Y - q.Y);
-                return dx * dx + dy * dy;
-            };
-            const double straight = distSq(left_mean, matched->wall_a_mean) + distSq(right_mean, matched->wall_b_mean);
-            const double swapped = distSq(left_mean, matched->wall_b_mean) + distSq(right_mean, matched->wall_a_mean);
-            a_is_left = straight <= swapped;
-        }
+        // Label this run's own left/right walls by evaluating the A/B rule fresh on THIS run's own geometry, exactly
+        // as the live per-layer call site does - not by the pre-pass's own wall_a_is_left flag. "Left" is an arbitrary
+        // per-run choice (each run picks its own ridge direction), and this run's input geometry is not identical to
+        // the pre-pass's (this function builds on the un-grown corrugation input, the pre-pass on the grown one), so
+        // carrying the flag across runs can swap A and B - which stripped the OUTER wall when only Wall B (the inner)
+        // was asked for. (Comparing wall mean points instead was tried and also failed: a U-shaped wall's mean shifts by
+        // millimetres with tip extent, comparable to the A-B separation.) The rule needs no cross-layer history.
+        const bool a_is_left = leftWallIsWallA(contours, dom.left->points, dom.right->points);
         const std::vector<vbct::Point2>& a_pts = a_is_left ? left_pts : right_pts;
         const std::vector<vbct::Point2>& b_pts = a_is_left ? right_pts : left_pts;
 
@@ -2209,13 +2219,6 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
                 ChainDomainWallIdentity identity;
                 identity.identity_point = fromVbctMm(identity_point);
                 identity.wall_a_is_left = (wall_ab.left_label == vbct::WallLabel::A);
-                {
-                    const std::vector<vbct::Point2>& a_wall = identity.wall_a_is_left ? dom.left->points : dom.right->points;
-                    const std::vector<vbct::Point2>& b_wall = identity.wall_a_is_left ? dom.right->points : dom.left->points;
-                    identity.wall_a_mean = fromVbctMm(meanPoint(a_wall));
-                    identity.wall_b_mean = fromVbctMm(meanPoint(b_wall));
-                    identity.has_wall_means = true;
-                }
                 current_identities.push_back(identity);
             }
             result[layer_nr].chain_domain_wall_identities = std::move(current_identities);

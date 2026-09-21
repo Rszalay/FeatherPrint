@@ -2167,11 +2167,6 @@ TEST(VbctAdapterTest, FindAllChainDomainWallsLabelsWallsByGeometryNotByTheLeftRi
     const std::vector<CorrugationAnchor> anchors = VbctAdapter::computeAnchorsForMesh(mesh);
     const std::vector<ChainDomainWallIdentity>& identities = anchors[0].chain_domain_wall_identities;
     ASSERT_EQ(identities.size(), 2u);
-    for (const ChainDomainWallIdentity& identity : identities)
-    {
-        ASSERT_TRUE(identity.has_wall_means) << "the pre-pass must record each label's geometric identity";
-    }
-
     const std::vector<VbctAdapter::ChainWallPoints> baseline = VbctAdapter::findAllChainDomainWalls(mesh.layers[0].parts[0], mesh.settings, identities);
     ASSERT_EQ(baseline.size(), 2u);
 
