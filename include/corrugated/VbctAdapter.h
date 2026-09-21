@@ -251,6 +251,27 @@ Shape insetOutline(const SliceLayerPart& part, const Settings& settings);
 Shape buildCorrugationInput(const SliceLayerPart& part, const Settings& settings);
 
 /*!
+ * rief Grow \p corrugation_input by \c infill_overlap_mm, exactly as FffGcodeWriter::processCorrugatedInfill
+ * hands it to VBCT, reverting the growth on a stripped Ring side.
+ *
+ * Every other infill pattern gets this growth from Infill::generate(), so the corrugation bonds with the wall
+ * rather than stopping exactly at the boundary. A stripped side's contour already runs along the true model
+ * surface (buildCorrugationInput's own expansion), so there the growth is reverted by swapping that contour
+ * back to its un-grown version. The revert is skipped when \p corrugation_input isn't a simple two-contour Ring
+ * or Raw Outline Mode is on (buildCorrugationInput ignores strip settings there, so nothing was expanded).
+ *
+ * The live per-layer call and computeAnchorsForMesh's pre-pass MUST both build the corrugation input through this
+ * one function: the anchors decided in the pre-pass (t0 fractions, winding correction) are only meaningful
+ * against a wall built from identical input, and two copies of this logic drifted apart before (Raw Outline Mode
+ * + Wall Strip mirrored the stringers on Ring layers).
+ *
+ * \param corrugation_input The input as built by buildCorrugationInput (plus any Chain boundary expansion).
+ * \param settings Read for infill_overlap_mm, corrugated_strip_wall_a/b, corrugated_raw_outline_mode.
+ * \param chain_strip_active True when a Chain Wall Strip boundary expansion is in effect - the growth is skipped.
+ */
+Shape growCorrugationInput(const Shape& corrugation_input, const Settings& settings, bool chain_strip_active);
+
+/*!
  * \brief TEMPORARY debug instrumentation for the layer-395 area-collapse investigation
  * (2026-09-13): appends "<stage>,<z_mm>,<polygon_count>,<area_mm2>" to a fixed scratchpad CSV,
  * gated to a single hardcoded target Z so it doesn't fire on every layer of every print. Pure

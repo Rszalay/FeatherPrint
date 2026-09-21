@@ -3215,5 +3215,83 @@ TEST(VbctAdapterTest, OrientTowardGivesClosedLoopWallsOneWinding)
     EXPECT_EQ(toward_far_end.front().x, 10.0);
 }
 
+/*!
+ * The corrugation input's overlap growth and stripped-side revert are shared by the live per-layer call and
+ * computeAnchorsForMesh's pre-pass (both must hand VBCT identical geometry, or the pre-pass's anchors mirror the
+ * stringers on Ring layers). A pre-pass copy of this once skipped the growth whenever either strip setting was on,
+ * but the live path only skips/reverts it with Raw Outline Mode off - so Raw Outline Mode + Wall Strip (the
+ * default raw mode with strip A/B on) chorded stringers across the part on layers 873-877 of FPTF-45 Body.
+ */
+TEST(VbctAdapterTest, GrowCorrugationInputMatchesLivePathForEveryStripAndRawModeCombination)
+{
+    Shape ring;
+    Polygon outer;
+    outer.push_back(Point2LL(0, 0));
+    outer.push_back(Point2LL(MM2INT(40), 0));
+    outer.push_back(Point2LL(MM2INT(40), MM2INT(40)));
+    outer.push_back(Point2LL(0, MM2INT(40)));
+    ring.push_back(outer);
+    Polygon hole;
+    hole.push_back(Point2LL(MM2INT(10), MM2INT(10)));
+    hole.push_back(Point2LL(MM2INT(10), MM2INT(30)));
+    hole.push_back(Point2LL(MM2INT(30), MM2INT(30)));
+    hole.push_back(Point2LL(MM2INT(30), MM2INT(10)));
+    ring.push_back(hole);
+    ASSERT_EQ(ring.size(), 2u);
+
+    auto areas = [](const Shape& shape)
+    {
+        std::vector<double> a = { std::abs(shape[0].area()), std::abs(shape[1].area()) };
+        std::sort(a.begin(), a.end());
+        return a; // [0] = the hole, [1] = the outer contour
+    };
+    const std::vector<double> ungrown = areas(ring);
+
+    auto growth = [&](const char* raw, const char* strip_a, const char* strip_b, bool chain_strip_active)
+    {
+        Settings settings;
+        settings.add("infill_overlap_mm", "0.2");
+        settings.add("corrugated_raw_outline_mode", raw);
+        settings.add("corrugated_strip_wall_a", strip_a);
+        settings.add("corrugated_strip_wall_b", strip_b);
+        return areas(VbctAdapter::growCorrugationInput(ring, settings, chain_strip_active));
+    };
+
+    // No strip: outer grows outward, the hole shrinks inward - in either raw mode.
+    for (const char* raw : { "True", "False" })
+    {
+        const auto g = growth(raw, "False", "False", false);
+        EXPECT_GT(g[1], ungrown[1]) << "outer contour must grow (raw=" << raw << ")";
+        EXPECT_LT(g[0], ungrown[0]) << "hole must shrink (raw=" << raw << ")";
+    }
+
+    // Raw Outline Mode ignores Wall Strip, so the growth must still be applied in full even with both sides stripped.
+    {
+        const auto g = growth("True", "True", "True", false);
+        EXPECT_GT(g[1], ungrown[1]) << "raw mode + strip: the live path still grows the outer contour";
+        EXPECT_LT(g[0], ungrown[0]) << "raw mode + strip: the live path still shrinks the hole";
+    }
+
+    // Raw mode off: a stripped side reverts to its un-grown contour.
+    {
+        const auto both = growth("False", "True", "True", false);
+        EXPECT_DOUBLE_EQ(both[1], ungrown[1]);
+        EXPECT_DOUBLE_EQ(both[0], ungrown[0]);
+        const auto a_only = growth("False", "True", "False", false);
+        EXPECT_DOUBLE_EQ(a_only[1], ungrown[1]) << "A (the outer contour) is stripped: not grown";
+        EXPECT_LT(a_only[0], ungrown[0]) << "B (the hole) is not stripped: still shrinks";
+        const auto b_only = growth("False", "False", "True", false);
+        EXPECT_GT(b_only[1], ungrown[1]) << "A is not stripped: the outer contour still grows";
+        EXPECT_DOUBLE_EQ(b_only[0], ungrown[0]) << "B (the hole) is stripped: not shrunk";
+    }
+
+    // An active Chain Wall Strip expansion skips the growth entirely.
+    {
+        const auto g = growth("False", "True", "False", true);
+        EXPECT_DOUBLE_EQ(g[1], ungrown[1]);
+        EXPECT_DOUBLE_EQ(g[0], ungrown[0]);
+    }
+}
+
 } // namespace cura
 // NOLINTEND(*-magic-numbers)

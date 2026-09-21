@@ -885,6 +885,31 @@ Shape buildCorrugationInput(const SliceLayerPart& part, const Settings& settings
     return expandCorrugationInputForStrippedWalls(part, settings, strip_wall_a, strip_wall_b);
 }
 
+Shape growCorrugationInput(const Shape& corrugation_input, const Settings& settings, const bool chain_strip_active)
+{
+    const coord_t infill_overlap = settings.get<coord_t>("infill_overlap_mm");
+    Shape grown = chain_strip_active ? corrugation_input : corrugation_input.offset(infill_overlap);
+
+    const bool strip_wall_a = settings.get<bool>("corrugated_strip_wall_a");
+    const bool strip_wall_b = settings.get<bool>("corrugated_strip_wall_b");
+    if ((strip_wall_a || strip_wall_b) && ! settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input.size() == 2 && grown.size() == 2)
+    {
+        // Done as a post-hoc swap rather than offsetting each contour separately, since Shape::offset() needs an
+        // outer contour and its own hole together to grow/shrink each by winding direction.
+        auto outerIndex = [](const Shape& shape) -> size_t
+        {
+            return std::abs(shape[0].area()) >= std::abs(shape[1].area()) ? 0 : 1;
+        };
+        const size_t orig_outer = outerIndex(corrugation_input);
+        const size_t grown_outer = outerIndex(grown);
+        Shape reverted;
+        reverted.push_back(strip_wall_a ? corrugation_input[orig_outer] : grown[grown_outer]);
+        reverted.push_back(strip_wall_b ? corrugation_input[1 - orig_outer] : grown[1 - grown_outer]);
+        grown = reverted;
+    }
+    return grown;
+}
+
 namespace
 {
 
@@ -1535,8 +1560,11 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
         // built from identical input: without this, the live wall came out wound the opposite way to
         // what this pre-pass planned on ~28% of Ring layers, mirroring the stringers there.
         const Shape corrugation_input_built = buildCorrugationInput(part, mesh.settings);
-        const bool strip_wall_active = mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b");
-        const Shape corrugation_input_raw = strip_wall_active ? corrugation_input_built : corrugation_input_built.offset(mesh.settings.get<coord_t>("infill_overlap_mm"));
+        // Chain Wall Strip's boundary expansion only exists for non-Ring, non-raw layers; the live path decides it from the
+        // chain domain it actually finds, which the pre-pass cannot know before running VBCT, so approximate it by shape.
+        const bool chain_strip_assumed = (mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b"))
+            && ! mesh.settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input_built.size() != 2;
+        const Shape corrugation_input_raw = growCorrugationInput(corrugation_input_built, mesh.settings, chain_strip_assumed);
 
         // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): decide, with hysteresis, which of
         // this layer's own holes to treat as ignored for domain-classification purposes, before

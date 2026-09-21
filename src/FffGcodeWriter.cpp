@@ -2732,39 +2732,9 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // same shared contour) isn't attempted yet, unlike Ring's own whole-contour revert below; a
     // known simplification, to refine via real-print testing the same way Ring's own inset/revert
     // fixes were found, rather than guessing at the right partial treatment blind.
-    const coord_t vbct_infill_overlap = mesh.settings.get<coord_t>("infill_overlap_mm");
-    Shape corrugation_input_grown = chain_strip_active ? corrugation_input : corrugation_input.offset(vbct_infill_overlap);
-
-    // Wall Strip (spec REV 2.6): a stripped side's own corrugation_input contour already runs
-    // along the true model surface (buildCorrugationInput's own expansion, VbctAdapter.cpp) -
-    // there's no wall left on that side to weld an overlap into any more, so growing it by
-    // infill_overlap_mm on top of that would push the corrugation past the part's own true
-    // surface. Confirmed directly by the user on a real print (an overshoot of about one line
-    // width, right where the growth above would place it). Reverts the growth for whichever
-    // contour corresponds to a stripped side, by swapping it back to corrugation_input's own
-    // un-grown version of the same contour - done as a post-hoc swap rather than offsetting each
-    // contour separately from the start, since Shape::offset() needs both an outer and its own
-    // hole together to grow/shrink each correctly by winding direction; splitting them apart
-    // first and offsetting each in isolation risks getting that sign wrong. Skipped entirely
-    // (falls back to the ordinary uniform growth above, unchanged) whenever corrugation_input
-    // doesn't look like a simple single-hole Ring (not exactly two contours before and after
-    // growth) or Raw Outline Mode is active (buildCorrugationInput already ignores strip settings
-    // there - see its own doc comment - so nothing was actually expanded to revert).
-    if ((vbct_strip_wall_a || vbct_strip_wall_b) && ! mesh.settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input.size() == 2
-        && corrugation_input_grown.size() == 2)
-    {
-        auto outerIndex = [](const Shape& shape) -> size_t
-        {
-            return std::abs(shape[0].area()) >= std::abs(shape[1].area()) ? 0 : 1;
-        };
-        const size_t orig_outer = outerIndex(corrugation_input);
-        const size_t grown_outer = outerIndex(corrugation_input_grown);
-        Shape reverted;
-        reverted.push_back(vbct_strip_wall_a ? corrugation_input[orig_outer] : corrugation_input_grown[grown_outer]);
-        reverted.push_back(vbct_strip_wall_b ? corrugation_input[1 - orig_outer] : corrugation_input_grown[1 - grown_outer]);
-        corrugation_input_grown = reverted;
-    }
-    corrugation_input = corrugation_input_grown;
+    // Overlap growth and the stripped-Ring-side revert live in one shared helper so the cross-layer pre-pass
+    // (computeAnchorsForMesh) builds exactly the same input - see VbctAdapter::growCorrugationInput.
+    corrugation_input = VbctAdapter::growCorrugationInput(corrugation_input, mesh.settings, chain_strip_active);
 
     // Stringer pitch is now the user-facing setting directly - a target arc-length spacing along
     // a domain's own governing (longer) wall, VBCT Stage 10's own native tunable, with no
