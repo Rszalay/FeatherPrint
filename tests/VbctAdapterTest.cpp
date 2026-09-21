@@ -2146,6 +2146,53 @@ TEST(VbctAdapterTest, ComputeAnchorsForMeshTracksWallIdentityForEveryChainDomain
 }
 
 /*!
+ * findAllChainDomainWalls re-derives each Chain domain's walls in its own VBCT run, and "left" vs "right" is an
+ * arbitrary per-run choice (each run picks its own ridge direction) - so labeling those walls with the pre-pass's
+ * own left/right flag (wall_a_is_left) can swap A and B whenever the two runs disagree, which stripped the OUTER
+ * wall when only Wall B (the inner) was asked for on FPTF-45 Body's Chain layers. The walls must be labeled by
+ * geometric identity (proximity to the pre-pass's recorded Wall A / Wall B mean points) instead, so the result is
+ * independent of that flag.
+ */
+TEST(VbctAdapterTest, FindAllChainDomainWallsLabelsWallsByGeometryNotByTheLeftRightFlag)
+{
+    Mesh cura_mesh;
+    addCorrugationAnchorSettings(cura_mesh.settings_);
+    SliceMeshStorage mesh(&cura_mesh, /*slice_layer_count=*/1);
+
+    SliceLayerPart tee_part;
+    tee_part.outline.push_back(makeTeePolygon());
+    tee_part.infill_area.push_back(makeTeePolygon());
+    mesh.layers[0].parts.push_back(tee_part);
+
+    const std::vector<CorrugationAnchor> anchors = VbctAdapter::computeAnchorsForMesh(mesh);
+    const std::vector<ChainDomainWallIdentity>& identities = anchors[0].chain_domain_wall_identities;
+    ASSERT_EQ(identities.size(), 2u);
+    for (const ChainDomainWallIdentity& identity : identities)
+    {
+        ASSERT_TRUE(identity.has_wall_means) << "the pre-pass must record each label's geometric identity";
+    }
+
+    const std::vector<VbctAdapter::ChainWallPoints> baseline = VbctAdapter::findAllChainDomainWalls(mesh.layers[0].parts[0], mesh.settings, identities);
+    ASSERT_EQ(baseline.size(), 2u);
+
+    // Simulate a run whose left/right ordering disagrees with the pre-pass's: every flag inverted.
+    std::vector<ChainDomainWallIdentity> flag_inverted = identities;
+    for (ChainDomainWallIdentity& identity : flag_inverted)
+    {
+        identity.wall_a_is_left = ! identity.wall_a_is_left;
+    }
+    const std::vector<VbctAdapter::ChainWallPoints> with_inverted_flag = VbctAdapter::findAllChainDomainWalls(mesh.layers[0].parts[0], mesh.settings, flag_inverted);
+    ASSERT_EQ(with_inverted_flag.size(), 2u);
+    for (size_t i = 0; i < 2; ++i)
+    {
+        ASSERT_FALSE(baseline[i].wall_a.empty());
+        ASSERT_FALSE(with_inverted_flag[i].wall_a.empty());
+        EXPECT_EQ(baseline[i].wall_a.front(), with_inverted_flag[i].wall_a.front()) << "domain " << i << ": Wall A must not depend on the left/right flag";
+        EXPECT_EQ(baseline[i].wall_b.front(), with_inverted_flag[i].wall_b.front()) << "domain " << i << ": Wall B must not depend on the left/right flag";
+    }
+}
+
+/*!
  * Investigation for VBCT-Stage8-Wall-Stitch-Nondeterminism-Brief.md: two fresh CuraEngine.exe
  * processes, byte-identical settings and input, produced a Ring wall that collapsed to 2
  * near-coincident points on different (and different-numbered) Z heights each run. The brief

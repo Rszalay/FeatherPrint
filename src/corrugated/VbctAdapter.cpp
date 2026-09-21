@@ -1368,8 +1368,29 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
 
         const std::vector<vbct::Point2>& left_pts = dom.left->points;
         const std::vector<vbct::Point2>& right_pts = dom.right->points;
-        const std::vector<vbct::Point2>& a_pts = matched->wall_a_is_left ? left_pts : right_pts;
-        const std::vector<vbct::Point2>& b_pts = matched->wall_a_is_left ? right_pts : left_pts;
+        // Label this run's own left/right walls by proximity to the Wall A / Wall B mean points the pre-pass recorded,
+        // not by the pre-pass's own left/right flag: "left" is an arbitrary per-run choice (each run picks its own
+        // ridge direction), and this run's input geometry is not byte-identical to the pre-pass's (this function
+        // builds on the un-grown corrugation input, the pre-pass on the grown one), so the flag can come out
+        // swapped - which stripped the outer wall when only Wall B (the inner) was asked for. The two walls' means
+        // are several millimetres apart, far more than any such geometry difference.
+        bool a_is_left = matched->wall_a_is_left;
+        if (matched->has_wall_means)
+        {
+            const Point2LL left_mean = fromVbctMm(meanPoint(left_pts));
+            const Point2LL right_mean = fromVbctMm(meanPoint(right_pts));
+            auto distSq = [](const Point2LL& p, const Point2LL& q)
+            {
+                const double dx = static_cast<double>(p.X - q.X);
+                const double dy = static_cast<double>(p.Y - q.Y);
+                return dx * dx + dy * dy;
+            };
+            const double straight = distSq(left_mean, matched->wall_a_mean) + distSq(right_mean, matched->wall_b_mean);
+            const double swapped = distSq(left_mean, matched->wall_b_mean) + distSq(right_mean, matched->wall_a_mean);
+            a_is_left = straight <= swapped;
+        }
+        const std::vector<vbct::Point2>& a_pts = a_is_left ? left_pts : right_pts;
+        const std::vector<vbct::Point2>& b_pts = a_is_left ? right_pts : left_pts;
 
         ChainWallPoints walls;
         walls.found = true;
@@ -2188,6 +2209,13 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
                 ChainDomainWallIdentity identity;
                 identity.identity_point = fromVbctMm(identity_point);
                 identity.wall_a_is_left = (wall_ab.left_label == vbct::WallLabel::A);
+                {
+                    const std::vector<vbct::Point2>& a_wall = identity.wall_a_is_left ? dom.left->points : dom.right->points;
+                    const std::vector<vbct::Point2>& b_wall = identity.wall_a_is_left ? dom.right->points : dom.left->points;
+                    identity.wall_a_mean = fromVbctMm(meanPoint(a_wall));
+                    identity.wall_b_mean = fromVbctMm(meanPoint(b_wall));
+                    identity.has_wall_means = true;
+                }
                 current_identities.push_back(identity);
             }
             result[layer_nr].chain_domain_wall_identities = std::move(current_identities);

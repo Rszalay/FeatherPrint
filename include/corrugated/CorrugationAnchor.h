@@ -30,6 +30,16 @@ struct ChainDomainWallIdentity
     //! means the reverse. See chain_domain_wall_identities' own doc comment for how this is kept
     //! stable across layers.
     bool wall_a_is_left{ true };
+
+    //! The mean point (microns) of this domain's own Wall A and Wall B as the pre-pass labeled them - the
+    //! geometric identity of each label. Which of a run's two walls is "left" is arbitrary and can differ between
+    //! two independent VBCT runs over the same layer (each picks its own ridge direction), so wall_a_is_left alone
+    //! is only meaningful against the exact run that produced it. A consumer that re-derives the walls in its own
+    //! run (VbctAdapter::findAllChainDomainWalls) labels them by proximity to these instead. Valid only when
+    //! has_wall_means is true.
+    Point2LL wall_a_mean;
+    Point2LL wall_b_mean;
+    bool has_wall_means{ false };
 };
 
 //! De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): cross-layer identity for one hole this layer
