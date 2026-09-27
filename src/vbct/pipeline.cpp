@@ -70,7 +70,8 @@ Stage10Result run_full_pipeline(
     const std::vector<std::vector<Point2>>& extra_clip_loops,
     bool transition_ring,
     const std::vector<Point2>& transition_chain_domain_identities,
-    double transition_solid_fill_spacing) {
+    double transition_solid_fill_spacing,
+    const std::vector<ChainDomainOverride>& chain_domain_overrides) {
     VbctResult r14 = run_vbct(contours, x);
     Stage5Result r5 = run_stage5(r14.mesh, threshold);
     Stage6Result r6 = run_stage6(r5);
@@ -80,7 +81,8 @@ Stage10Result run_full_pipeline(
     return run_stage10(
         r9, spacing, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, crosshatch_enabled, chain_anchor_point,
         chain_left_near_t_frac, chain_left_far_t_frac, chain_right_near_t_frac, chain_right_far_t_frac, extra_clip_loops,
-        /*chain_swap_left_right=*/false, transition_ring, transition_chain_domain_identities, transition_solid_fill_spacing);
+        /*chain_swap_left_right=*/false, transition_ring, transition_chain_domain_identities, transition_solid_fill_spacing,
+        chain_domain_overrides);
 }
 
 }  // namespace vbct

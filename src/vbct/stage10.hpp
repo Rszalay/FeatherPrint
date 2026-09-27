@@ -20,6 +20,24 @@ struct Stringer {
     std::vector<StringerEdge> pieces;  // >=1 segment; >1 only when clipping split it
 };
 
+// FeatherPrint Corrugated extension: one Chain domain's cross-layer continuity overrides, decided by
+// VbctAdapter::computeAnchorsForMesh for EVERY Chain domain on the layer, not just one. Matched to this call's own
+// freshly-derived domain by identity (nearest whole-domain mean point, within a few mm): a layer can have several
+// Chain domains, and neither their count nor their order in Stage 9's output says which is which. mm space.
+struct ChainDomainOverride {
+    Point2 identity;      // mean of the domain's own left+right wall points, for matching
+    Point2 anchor_point;  // the tracked "same real end" - both walls are oriented toward it
+    std::optional<double> left_near_t_frac;
+    std::optional<double> left_far_t_frac;
+    std::optional<double> right_near_t_frac;
+    std::optional<double> right_far_t_frac;
+    bool swap_left_right = false;
+};
+
+// The override nearest this domain's own mean point, or nullptr when none is within the match tolerance (a
+// domain the tracker has no entry for falls back to the untracked default).
+const ChainDomainOverride* match_chain_domain_override(const Domain& domain, const std::vector<ChainDomainOverride>& overrides);
+
 struct DomainStringers {
     std::vector<Stringer> stringers;
     // Transition Layer (FeatherPrint Corrugated extension, spec REV 3.3/3.6/5.10): true when this
@@ -235,7 +253,11 @@ Stage10Result run_stage10(
     // false (the default for both) reproduces today's exact pre-feature behavior for every domain.
     bool transition_ring = false,
     const std::vector<Point2>& transition_chain_domain_identities = {},
-    double transition_solid_fill_spacing = 0.0);
+    double transition_solid_fill_spacing = 0.0,
+    // Per-Chain-domain continuity overrides (see ChainDomainOverride). When non-empty, every Chain domain gets its
+    // own matched override and the single chain_anchor_point / chain_*_t_frac overrides above are ignored for Chain
+    // domains; chain_swap_left_right then only enables each override's own swap flag.
+    const std::vector<ChainDomainOverride>& chain_domain_overrides = {});
 
 // FeatherPrint Corrugated extension (not present in upstream VBCT): one crossing event - a single
 // place where the linked corrugation skin (VbctAdapter::corrugateLinkedSkin) switches from
@@ -430,6 +452,9 @@ std::vector<DomainEvents> build_domain_events(
     const std::vector<std::vector<Point2>>& extra_clip_loops = {},
     // Chain wall outer/inner identity continuity - see run_stage10's own doc comment for this
     // same parameter for the full rationale.
-    bool chain_swap_left_right = false);
+    bool chain_swap_left_right = false,
+    // Per-Chain-domain continuity overrides - see run_stage10's parameter of the same name. When non-empty, each
+    // Chain domain uses its own matched override, including its own swap flag.
+    const std::vector<ChainDomainOverride>& chain_domain_overrides = {});
 
 }  // namespace vbct

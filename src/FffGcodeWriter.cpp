@@ -2878,7 +2878,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
             chain_right_far_t_frac,
             mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
             chain_swap_left_right,
-            transition_layer_request);
+            transition_layer_request,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
         stringer_lines_are_linked_skin = stringer_lines.has_value();
     }
     if (! stringer_lines.has_value())
@@ -2901,7 +2902,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
             chain_right_far_t_frac,
             mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
             transition_layer_request,
-            &transition_lines);
+            &transition_lines,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
     }
     // Wall Strip fallback (multi-domain Chain increment): VBCT itself is the only reliable judge of
     // whether expandChainContourRange's own per-domain boundary displacement (above) produced valid
@@ -2938,7 +2940,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
                 chain_right_far_t_frac,
                 mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
                 chain_swap_left_right,
-                transition_layer_request);
+                transition_layer_request,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
             stringer_lines_are_linked_skin = stringer_lines.has_value();
         }
         if (! stringer_lines.has_value())
@@ -2962,7 +2965,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
                 chain_right_far_t_frac,
                 mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
                 transition_layer_request,
-                &transition_lines);
+                &transition_lines,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
         }
     }
     if (! stringer_lines.has_value())
@@ -3003,7 +3007,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
             chain_right_far_t_frac,
             mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
             transition_layer_request,
-            &transition_lines);
+            &transition_lines,
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
     }
 
     // Chain end-linking connector (spec REV 2.6 design, implemented here): when exactly one of a

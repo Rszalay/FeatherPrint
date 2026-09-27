@@ -9,6 +9,7 @@
 namespace vbct {
 
 
+
 // Not anonymous-namespace, unlike the rest of this file's helpers below: exposed via stage10.hpp
 // so VbctAdapter::computeAnchorsForMesh's cross-layer continuity pre-pass (spec REV 1.4 S:5.3)
 // can reuse this file's own wall-length/centroid/reference-angle logic for a fresh
@@ -1065,7 +1066,8 @@ Stage10Result run_stage10(
     bool chain_swap_left_right,
     bool transition_ring,
     const std::vector<Point2>& transition_chain_domain_identities,
-    double transition_solid_fill_spacing) {
+    double transition_solid_fill_spacing,
+    const std::vector<ChainDomainOverride>& chain_domain_overrides) {
     Stage10Result result;
     bool anchor_applied = false;
     bool chain_anchor_applied = false;
@@ -1123,6 +1125,8 @@ Stage10Result run_stage10(
         const double effective_spacing = is_transition ? transition_solid_fill_spacing : spacing;
         const bool effective_crosshatch = is_transition ? false : crosshatch_enabled;
 
+        const bool per_domain_chain = d.kind == "chain" && ! chain_domain_overrides.empty();
+        const ChainDomainOverride* co = per_domain_chain ? match_chain_domain_override(d, chain_domain_overrides) : nullptr;
         result.domains.push_back(domain_stringers(
             d,
             effective_spacing,
@@ -1131,16 +1135,46 @@ Stage10Result run_stage10(
             apply_anchor_here ? other_wall_t0_frac : std::nullopt,
             apply_anchor_here ? reverse_canonical_wall : std::nullopt,
             effective_crosshatch,
-            apply_chain_anchor_here ? chain_anchor_point : std::nullopt,
-            apply_chain_anchor_here ? chain_left_near_t_frac : std::nullopt,
-            apply_chain_anchor_here ? chain_left_far_t_frac : std::nullopt,
-            apply_chain_anchor_here ? chain_right_near_t_frac : std::nullopt,
-            apply_chain_anchor_here ? chain_right_far_t_frac : std::nullopt,
+            per_domain_chain ? (co ? std::make_optional(co->anchor_point) : std::nullopt) : (apply_chain_anchor_here ? chain_anchor_point : std::nullopt),
+            per_domain_chain ? (co ? co->left_near_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_left_near_t_frac : std::nullopt),
+            per_domain_chain ? (co ? co->left_far_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_left_far_t_frac : std::nullopt),
+            per_domain_chain ? (co ? co->right_near_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_right_near_t_frac : std::nullopt),
+            per_domain_chain ? (co ? co->right_far_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_right_far_t_frac : std::nullopt),
             extra_clip_loops,
-            apply_chain_anchor_here ? chain_swap_left_right : false));
+            per_domain_chain ? (co != nullptr && chain_swap_left_right && co->swap_left_right) : (apply_chain_anchor_here ? chain_swap_left_right : false)));
         result.domains.back().is_transition_layer = is_transition;
     }
     return result;
+}
+
+const ChainDomainOverride* match_chain_domain_override(const Domain& domain, const std::vector<ChainDomainOverride>& overrides) {
+    // Distinct Chain domains on one layer sit many millimetres apart; a domain's own mean moves far less than that
+    // between the pre-pass and this call.
+    constexpr double kMatchCapMm = 5.0;
+    if (! domain.left || ! domain.right) return nullptr;
+    double sum_x = 0.0, sum_y = 0.0;
+    size_t n = 0;
+    for (const auto* wall : { &domain.left, &domain.right }) {
+        for (const Point2& p : (*wall)->points) {
+            sum_x += p.x;
+            sum_y += p.y;
+            ++n;
+        }
+    }
+    if (n == 0) return nullptr;
+    const Point2 mean{ sum_x / static_cast<double>(n), sum_y / static_cast<double>(n) };
+    const ChainDomainOverride* best = nullptr;
+    double best_dist_sq = kMatchCapMm * kMatchCapMm;
+    for (const ChainDomainOverride& o : overrides) {
+        const double dx = mean.x - o.identity.x;
+        const double dy = mean.y - o.identity.y;
+        const double dist_sq = dx * dx + dy * dy;
+        if (dist_sq <= best_dist_sq) {
+            best_dist_sq = dist_sq;
+            best = &o;
+        }
+    }
+    return best;
 }
 
 std::vector<DomainEvents> build_domain_events(
@@ -1158,7 +1192,8 @@ std::vector<DomainEvents> build_domain_events(
     std::optional<double> chain_right_near_t_frac,
     std::optional<double> chain_right_far_t_frac,
     const std::vector<std::vector<Point2>>& extra_clip_loops,
-    bool chain_swap_left_right) {
+    bool chain_swap_left_right,
+    const std::vector<ChainDomainOverride>& chain_domain_overrides) {
     std::vector<DomainEvents> result;
     bool anchor_applied = false;
     bool chain_anchor_applied = false;
@@ -1171,6 +1206,8 @@ std::vector<DomainEvents> build_domain_events(
         if (apply_anchor_here) anchor_applied = true;
         const bool apply_chain_anchor_here = chain_anchor_point.has_value() && ! chain_anchor_applied && d.kind == "chain";
         if (apply_chain_anchor_here) chain_anchor_applied = true;
+        const bool per_domain_chain = d.kind == "chain" && ! chain_domain_overrides.empty();
+        const ChainDomainOverride* co = per_domain_chain ? match_chain_domain_override(d, chain_domain_overrides) : nullptr;
         result.push_back(build_domain_events_for_domain(
             d,
             spacing,
@@ -1179,14 +1216,14 @@ std::vector<DomainEvents> build_domain_events(
             apply_anchor_here ? other_wall_t0_frac : std::nullopt,
             apply_anchor_here ? reverse_canonical_wall : std::nullopt,
             crosshatch_enabled,
-            apply_chain_anchor_here ? chain_anchor_point : std::nullopt,
+            per_domain_chain ? (co ? std::make_optional(co->anchor_point) : std::nullopt) : (apply_chain_anchor_here ? chain_anchor_point : std::nullopt),
             chain_crosshatch_enabled,
-            apply_chain_anchor_here ? chain_left_near_t_frac : std::nullopt,
-            apply_chain_anchor_here ? chain_left_far_t_frac : std::nullopt,
-            apply_chain_anchor_here ? chain_right_near_t_frac : std::nullopt,
-            apply_chain_anchor_here ? chain_right_far_t_frac : std::nullopt,
+            per_domain_chain ? (co ? co->left_near_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_left_near_t_frac : std::nullopt),
+            per_domain_chain ? (co ? co->left_far_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_left_far_t_frac : std::nullopt),
+            per_domain_chain ? (co ? co->right_near_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_right_near_t_frac : std::nullopt),
+            per_domain_chain ? (co ? co->right_far_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_right_far_t_frac : std::nullopt),
             extra_clip_loops,
-            apply_chain_anchor_here ? chain_swap_left_right : false));
+            per_domain_chain ? (co != nullptr && co->swap_left_right) : (apply_chain_anchor_here ? chain_swap_left_right : false)));
     }
     return result;
 }

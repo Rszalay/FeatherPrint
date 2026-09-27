@@ -178,6 +178,30 @@ OpenLinesSet stage10ToLines(const vbct::Stage10Result& result, OpenLinesSet* tra
     return lines;
 }
 
+// ChainDomainTrack (microns, pre-pass) -> vbct::ChainDomainOverride (mm, Stage 10). A track whose end positions
+// aren't tracked yet leaves its fractions unset, reproducing the untracked default for them.
+static std::vector<vbct::ChainDomainOverride> toChainDomainOverrides(const std::vector<ChainDomainTrack>& tracks)
+{
+    std::vector<vbct::ChainDomainOverride> result;
+    result.reserve(tracks.size());
+    for (const ChainDomainTrack& t : tracks)
+    {
+        vbct::ChainDomainOverride o;
+        o.identity = toVbctMm(t.identity_point);
+        o.anchor_point = toVbctMm(t.anchor_point);
+        if (t.position_tracked)
+        {
+            o.left_near_t_frac = t.left_near_t_frac;
+            o.left_far_t_frac = t.left_far_t_frac;
+            o.right_near_t_frac = t.right_near_t_frac;
+            o.right_far_t_frac = t.right_far_t_frac;
+        }
+        o.swap_left_right = t.swap_left_right;
+        result.push_back(o);
+    }
+    return result;
+}
+
 std::optional<OpenLinesSet> corrugate(
     const Shape& infill_area,
     const double x,
@@ -196,7 +220,8 @@ std::optional<OpenLinesSet> corrugate(
     const std::optional<double> chain_right_far_t_frac,
     const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
     const TransitionLayerRequest& transition_layer_request,
-    OpenLinesSet* transition_lines_out)
+    OpenLinesSet* transition_lines_out,
+    const std::vector<ChainDomainTrack>& chain_domain_tracks)
 {
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): applies this layer's own already-decided
     // suppression set (VbctAdapter::computeAnchorsForMesh's own pre-pass) before VBCT ever sees
@@ -308,7 +333,8 @@ std::optional<OpenLinesSet> corrugate(
             extra_clip_loops_mm,
             transition_layer_request.ring,
             transition_chain_domain_identities_mm,
-            transition_solid_fill_spacing_mm);
+            transition_solid_fill_spacing_mm,
+            toChainDomainOverrides(chain_domain_tracks));
     }
     catch (const std::runtime_error& e)
     {
@@ -1419,6 +1445,168 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
     return result;
 }
 
+// Per-Chain-domain continuity state (see CorrugationAnchor::chain_domain_tracks): one entry per Chain domain
+// tracked on the previous layer, matched to this layer's domains by identity (whole-domain mean point).
+struct ChainTrackState
+{
+    vbct::Point2 identity;
+    vbct::Point2 anchor;
+    bool seeded{ false };
+    vbct::Point2 left_near, left_far, right_near, right_far, left_mean, right_mean;
+    double left_near_frac{ 0.0 }, left_far_frac{ 1.0 }, right_near_frac{ 0.0 }, right_far_frac{ 1.0 };
+};
+
+static vbct::Point2 meanOfPoints(const std::vector<vbct::Point2>& points)
+{
+    double sum_x = 0.0, sum_y = 0.0;
+    for (const vbct::Point2& p : points)
+    {
+        sum_x += p.x;
+        sum_y += p.y;
+    }
+    const double n = static_cast<double>(std::max<size_t>(points.size(), 1));
+    return { sum_x / n, sum_y / n };
+}
+
+// The same anchor-end choice, Wall A/B swap flag and windowed near/far end tracking computeAnchorsForMesh's single
+// tracked-Chain block does, for every Chain domain of one part's Stage 9 result. `prev_used` keeps the matching
+// one-to-one across all parts of the layer.
+static void trackChainDomains(
+    const vbct::Stage9Result& r9,
+    const std::vector<vbct::Contour>& contours,
+    const std::vector<ChainTrackState>& prev_tracks,
+    std::vector<bool>& prev_used,
+    std::vector<ChainTrackState>& next_tracks,
+    std::vector<ChainDomainTrack>& tracks_out)
+{
+    constexpr double kChainTrackMatchCapMm = 5.0;
+    vbct::Point2 centroid{ 0.0, 0.0 };
+    size_t total_points = 0;
+    for (const auto& c : contours)
+    {
+        for (const auto& p : c.to_float())
+        {
+            centroid.x += p.x;
+            centroid.y += p.y;
+            ++total_points;
+        }
+    }
+    if (total_points > 0)
+    {
+        centroid.x /= static_cast<double>(total_points);
+        centroid.y /= static_cast<double>(total_points);
+    }
+
+    for (const auto& dom : r9.domains)
+    {
+        if (dom.kind != "chain" || ! dom.left || ! dom.right || dom.left->points.empty() || dom.right->points.empty() || ! dom.cap_start.has_value()
+            || ! dom.cap_end.has_value())
+        {
+            continue;
+        }
+        std::vector<vbct::Point2> combined = dom.left->points;
+        combined.insert(combined.end(), dom.right->points.begin(), dom.right->points.end());
+        const vbct::Point2 identity = meanOfPoints(combined);
+
+        const ChainTrackState* prev = nullptr;
+        size_t prev_index = 0;
+        double best_dist_sq = kChainTrackMatchCapMm * kChainTrackMatchCapMm;
+        for (size_t k = 0; k < prev_tracks.size(); ++k)
+        {
+            if (prev_used[k])
+            {
+                continue;
+            }
+            const double dx = identity.x - prev_tracks[k].identity.x;
+            const double dy = identity.y - prev_tracks[k].identity.y;
+            if (dx * dx + dy * dy <= best_dist_sq)
+            {
+                best_dist_sq = dx * dx + dy * dy;
+                prev = &prev_tracks[k];
+                prev_index = k;
+            }
+        }
+        if (prev != nullptr)
+        {
+            prev_used[prev_index] = true;
+        }
+
+        const vbct::Point2& cap_start = *dom.cap_start;
+        const vbct::Point2& cap_end = *dom.cap_end;
+        vbct::Point2 anchor = cap_start;
+        if (prev != nullptr)
+        {
+            const double d_start = std::hypot(cap_start.x - prev->anchor.x, cap_start.y - prev->anchor.y);
+            const double d_end = std::hypot(cap_end.x - prev->anchor.x, cap_end.y - prev->anchor.y);
+            anchor = (d_start <= d_end) ? cap_start : cap_end;
+        }
+
+        ChainTrackState state;
+        state.identity = identity;
+        state.anchor = anchor;
+        ChainDomainTrack out;
+        out.identity_point = fromVbctMm(identity);
+        out.anchor_point = fromVbctMm(anchor);
+        out.swap_left_right = vbct::assign_wall_ab(dom.left->points, dom.right->points, contours, centroid).left_label != vbct::WallLabel::A;
+
+        const std::vector<vbct::Point2> oriented_left = vbct::orient_toward(dom.left->points, anchor);
+        const std::vector<vbct::Point2> oriented_right = vbct::orient_toward(dom.right->points, anchor);
+        const double left_len = vbct::wall_length(oriented_left);
+        const double right_len = vbct::wall_length(oriented_right);
+        if (left_len > 0.0 && right_len > 0.0)
+        {
+            const vbct::Point2 left_mean = meanOfPoints(oriented_left);
+            const vbct::Point2 right_mean = meanOfPoints(oriented_right);
+            if (prev != nullptr && prev->seeded)
+            {
+                const double same = std::hypot(left_mean.x - prev->left_mean.x, left_mean.y - prev->left_mean.y)
+                                  + std::hypot(right_mean.x - prev->right_mean.x, right_mean.y - prev->right_mean.y);
+                const double swapped = std::hypot(left_mean.x - prev->right_mean.x, left_mean.y - prev->right_mean.y)
+                                     + std::hypot(right_mean.x - prev->left_mean.x, right_mean.y - prev->left_mean.y);
+                constexpr double kRoleSwapMargin = 0.8; // same hysteresis as the single tracked-Chain block
+                const bool role_swapped = swapped < same * kRoleSwapMargin;
+                const vbct::Point2& t_left_near = role_swapped ? prev->right_near : prev->left_near;
+                const vbct::Point2& t_left_far = role_swapped ? prev->right_far : prev->left_far;
+                const vbct::Point2& t_right_near = role_swapped ? prev->left_near : prev->right_near;
+                const vbct::Point2& t_right_far = role_swapped ? prev->left_far : prev->right_far;
+                const double e_left_near = role_swapped ? prev->right_near_frac : prev->left_near_frac;
+                const double e_left_far = role_swapped ? prev->right_far_frac : prev->left_far_frac;
+                const double e_right_near = role_swapped ? prev->left_near_frac : prev->right_near_frac;
+                const double e_right_far = role_swapped ? prev->left_far_frac : prev->right_far_frac;
+                const NearestPointOnWall left_near = nearestPointOnWallNear(oriented_left, t_left_near, e_left_near * left_len, 0.25 * left_len);
+                const NearestPointOnWall left_far = nearestPointOnWallNear(oriented_left, t_left_far, e_left_far * left_len, 0.25 * left_len);
+                const NearestPointOnWall right_near = nearestPointOnWallNear(oriented_right, t_right_near, e_right_near * right_len, 0.25 * right_len);
+                const NearestPointOnWall right_far = nearestPointOnWallNear(oriented_right, t_right_far, e_right_far * right_len, 0.25 * right_len);
+                out.position_tracked = true;
+                out.left_near_t_frac = left_near.arc_length / left_len;
+                out.left_far_t_frac = left_far.arc_length / left_len;
+                out.right_near_t_frac = right_near.arc_length / right_len;
+                out.right_far_t_frac = right_far.arc_length / right_len;
+                state.left_near = left_near.point;
+                state.left_far = left_far.point;
+                state.right_near = right_near.point;
+                state.right_far = right_far.point;
+                state.left_near_frac = out.left_near_t_frac;
+                state.left_far_frac = out.left_far_t_frac;
+                state.right_near_frac = out.right_near_t_frac;
+                state.right_far_frac = out.right_far_t_frac;
+            }
+            else
+            {
+                state.left_near = oriented_left.front();
+                state.left_far = oriented_left.back();
+                state.right_near = oriented_right.front();
+                state.right_far = oriented_right.back();
+            }
+            state.left_mean = left_mean;
+            state.right_mean = right_mean;
+            state.seeded = true;
+        }
+        next_tracks.push_back(state);
+        tracks_out.push_back(out);
+    }
+}
+
 std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mesh)
 {
     const double x = mesh.settings.get<double>("corrugated_vbs_tolerance");
@@ -1502,7 +1690,6 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
     // point - "identity_point" - to the previous tracked layer's own), computed independently
     // here to keep this block self-contained per this function's own established convention.
     std::optional<vbct::Point2> prev_tracked_chain_identity_point;
-
     // The role-swap decision itself (which of this layer's own left/right walls corresponds to
     // which of the previous layer's own tracked left/right) is based on each wall's own
     // whole-wall mean point, not either wall's own near-end position - see the swap-check's own
@@ -2464,6 +2651,56 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
     }
 
 
+    // Per-Chain-domain continuity (CorrugationAnchor::chain_domain_tracks), as its own sequential pass over EVERY
+    // part of every layer. The pre-pass above only looks at parts[0], but a slot can split a layer into separate parts
+    // (both halves of a fuselage around a hatch): the live path corrugates each part independently, so each part's
+    // Chain domains need their own tracking or they fall back to Stage 9's per-layer cap_start and flip ends/direction.
+    // Builds each part's input exactly as the live path does (buildCorrugationInput + growCorrugationInput + the same
+    // suppressed-hole filter), so identities match the live call's domains.
+    {
+        const bool strip_any = mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b");
+        const bool raw_outline = mesh.settings.get<bool>("corrugated_raw_outline_mode");
+        std::vector<ChainTrackState> prev_tracks;
+        for (size_t layer_nr = 0; layer_nr < result.size(); ++layer_nr)
+        {
+            std::vector<ChainTrackState> next_tracks;
+            std::vector<ChainDomainTrack> tracks_out;
+            std::vector<bool> prev_used(prev_tracks.size(), false);
+            for (const SliceLayerPart& part : mesh.layers[layer_nr].parts)
+            {
+                const Shape built = buildCorrugationInput(part, mesh.settings);
+                const bool chain_strip_assumed = strip_any && ! raw_outline && built.size() != 2;
+                const Shape grown = growCorrugationInput(built, mesh.settings, chain_strip_assumed);
+                std::vector<std::vector<Point2LL>> unused_ignored_hole_loops;
+                const Shape filtered = filterDeminimisHoles(grown, result[layer_nr].suppressed_hole_identities, unused_ignored_hole_loops);
+                const std::vector<vbct::Contour> contours = shapeToContours(filtered);
+                if (contours.empty())
+                {
+                    continue;
+                }
+                vbct::Stage9Result r9;
+                try
+                {
+                    const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
+                    const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
+                    const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+                    const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+                    const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+                    r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+                }
+                catch (const std::runtime_error&)
+                {
+                    continue; // the live call hits the same rejection and logs it
+                }
+                // Same pass-through merge as the tracked-Chain block above and corrugateLinkedSkin, so domains match.
+                r9.domains = mergeStraightPassThroughChains(std::move(r9.domains), chain_junction_merge_angle_deg);
+                trackChainDomains(r9, contours, prev_tracks, prev_used, next_tracks, tracks_out);
+            }
+            result[layer_nr].chain_domain_tracks = std::move(tracks_out);
+            prev_tracks = std::move(next_tracks);
+        }
+    }
+
     return result;
 }
 
@@ -2901,7 +3138,8 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     const std::optional<double> chain_right_far_t_frac,
     const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
     const bool chain_swap_left_right,
-    const TransitionLayerRequest& transition_layer_request)
+    const TransitionLayerRequest& transition_layer_request,
+    const std::vector<ChainDomainTrack>& chain_domain_tracks)
 {
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9) - see corrugate()'s own identical comment.
     std::vector<std::vector<Point2LL>> ignored_hole_loops;
@@ -3030,7 +3268,7 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     const std::vector<vbct::DomainEvents> domain_events = vbct::build_domain_events(
         r9, spacing_mm, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, /*crosshatch_enabled=*/true, chain_anchor_point_mm,
         chain_crosshatch_enabled, chain_left_near_t_frac, chain_left_far_t_frac, chain_right_near_t_frac, chain_right_far_t_frac, extra_clip_loops_mm,
-        chain_swap_left_right);
+        chain_swap_left_right, toChainDomainOverrides(chain_domain_tracks));
 
     // Chain junction (Hub) support (spec REV 2.1): generalized from "exactly one linkable domain"
     // to "every domain independently" - a multi-domain Chain layer (e.g. a Tee's crossbar-plus-stem

@@ -72,6 +72,7 @@ Stage10Result run_full_pipeline(
     const std::vector<std::vector<Point2>>& extra_clip_loops = {},
     bool transition_ring = false,
     const std::vector<Point2>& transition_chain_domain_identities = {},
-    double transition_solid_fill_spacing = 0.0);
+    double transition_solid_fill_spacing = 0.0,
+    const std::vector<ChainDomainOverride>& chain_domain_overrides = {});
 
 }  // namespace vbct

@@ -32,6 +32,25 @@ struct ChainDomainWallIdentity
     bool wall_a_is_left{ true };
 };
 
+//! Cross-layer continuity for ONE Chain domain (see CorrugationAnchor::chain_domain_tracks). Same quantities the
+//! single-domain has_chain / chain_anchor_point / chain_*_t_frac / chain_swap_left_right fields carry, but kept for
+//! every Chain domain on the layer and matched layer to layer by identity_point, so a layer with several Chain
+//! domains (e.g. both halves of a part split by a slot) keeps every one of them stable - not just one.
+struct ChainDomainTrack
+{
+    //! Mean of the domain's own left+right wall points (microns) - matches it to the live call's domain.
+    Point2LL identity_point;
+    //! The tracked "same real end" both walls are oriented toward.
+    Point2LL anchor_point;
+    //! False on a domain's first tracked layer: the four fractions are then not applied.
+    bool position_tracked{ false };
+    double left_near_t_frac{ 0.0 };
+    double left_far_t_frac{ 1.0 };
+    double right_near_t_frac{ 0.0 };
+    double right_far_t_frac{ 1.0 };
+    bool swap_left_right{ false };
+};
+
 //! De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): cross-layer identity for one hole this layer
 //! is currently treating as ignored (below `corrugated_deminimis_hole_area`, with hysteresis - see
 //! CorrugationAnchor::suppressed_hole_identities' own doc comment for the full context).
@@ -194,6 +213,14 @@ struct CorrugationAnchor
     //! per-layer domain lookup (findAllChainDomainWalls) matches a freshly-derived VBCT domain back
     //! to the correct entry here.
     std::vector<ChainDomainWallIdentity> chain_domain_wall_identities;
+
+    //! Per-Chain-domain continuity (see ChainDomainTrack), one entry per Chain domain this layer. When non-empty
+    //! the live call hands these to Stage 10, which matches each of its domains to its own entry; the single
+    //! has_chain / chain_anchor_point fields then no longer drive Chain orientation. Before this, only ONE Chain
+    //! domain (the longest) was tracked and its override was applied to whichever Chain VBCT listed first - on a
+    //! two-Chain layer the other domain got another domain's anchor/fractions (or none), flipping wall direction
+    //! and end positions layer to layer (FPTF-45 Body, layers 25-557).
+    std::vector<ChainDomainTrack> chain_domain_tracks;
 
     //! De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): every hole this layer is currently
     //! treating as ignored for VBCT's own domain classification (below

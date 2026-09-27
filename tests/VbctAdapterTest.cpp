@@ -2146,6 +2146,61 @@ TEST(VbctAdapterTest, ComputeAnchorsForMeshTracksWallIdentityForEveryChainDomain
 }
 
 /*!
+ * A slot can split a layer into separate parts, each a Chain (both halves of a fuselage around a hatch). The
+ * pre-pass used to track only one Chain domain, and only in parts[0]; the live call then applied that one override
+ * to whichever Chain came first and left the other untracked, so its wall direction and end positions flipped layer
+ * to layer (FPTF-45 Body, layers 25-557). Every Chain domain in every part must get its own track, and each track's
+ * anchor end must stay put across Z-invariant layers.
+ */
+TEST(VbctAdapterTest, ComputeAnchorsForMeshTracksEveryChainInEveryPart)
+{
+    Mesh cura_mesh;
+    addCorrugationAnchorSettings(cura_mesh.settings_);
+    constexpr size_t n_layers = 4;
+    SliceMeshStorage mesh(&cura_mesh, n_layers);
+    for (size_t layer = 0; layer < n_layers; ++layer)
+    {
+        for (const coord_t x0 : { coord_t(0), MM2INT(60) })
+        {
+            SliceLayerPart bar;
+            const Polygon rect = makeRectPolygon(x0, 0, x0 + MM2INT(8), MM2INT(50));
+            bar.outline.push_back(rect);
+            bar.infill_area.push_back(rect);
+            mesh.layers[layer].parts.push_back(bar);
+        }
+    }
+
+    const std::vector<CorrugationAnchor> anchors = VbctAdapter::computeAnchorsForMesh(mesh);
+    ASSERT_EQ(anchors.size(), n_layers);
+    for (size_t layer = 0; layer < n_layers; ++layer)
+    {
+        ASSERT_EQ(anchors[layer].chain_domain_tracks.size(), 2u) << "layer " << layer << ": both parts' Chain domains must be tracked";
+    }
+    for (size_t layer = 1; layer < n_layers; ++layer)
+    {
+        for (const ChainDomainTrack& current : anchors[layer].chain_domain_tracks)
+        {
+            EXPECT_TRUE(current.position_tracked) << "layer " << layer << ": end positions must be tracked after the first layer";
+            const ChainDomainTrack* matched = nullptr;
+            double best = std::numeric_limits<double>::max();
+            for (const ChainDomainTrack& first : anchors[0].chain_domain_tracks)
+            {
+                const double d = std::hypot(double(current.identity_point.X - first.identity_point.X), double(current.identity_point.Y - first.identity_point.Y));
+                if (d < best)
+                {
+                    best = d;
+                    matched = &first;
+                }
+            }
+            ASSERT_NE(matched, nullptr);
+            EXPECT_LT(best, 100.0) << "layer " << layer << ": a domain's identity must stay put";
+            EXPECT_LT(std::hypot(double(current.anchor_point.X - matched->anchor_point.X), double(current.anchor_point.Y - matched->anchor_point.Y)), 100.0)
+                << "layer " << layer << ": each domain's anchor must stay on the same end";
+        }
+    }
+}
+
+/*!
  * findAllChainDomainWalls re-derives each Chain domain's walls in its own VBCT run, and "left" vs "right" is an
  * arbitrary per-run choice (each run picks its own ridge direction) - so labeling those walls with the pre-pass's
  * own left/right flag (wall_a_is_left) can swap A and B whenever the two runs disagree, which stripped the OUTER

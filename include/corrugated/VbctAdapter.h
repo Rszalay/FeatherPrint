@@ -212,7 +212,10 @@ std::optional<OpenLinesSet> corrugate(
     std::optional<double> chain_right_far_t_frac = std::nullopt,
     const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities = {},
     const TransitionLayerRequest& transition_layer_request = {},
-    OpenLinesSet* transition_lines_out = nullptr);
+    OpenLinesSet* transition_lines_out = nullptr,
+    // Per-Chain-domain continuity from the pre-pass (CorrugationAnchor::chain_domain_tracks). When non-empty,
+    // every Chain domain is matched to its own entry; the single chain_* overrides above then don't apply to Chains.
+    const std::vector<ChainDomainTrack>& chain_domain_tracks = {});
 
 /*!
  * \brief Experimental (see the "Corrugated Raw Outline Mode" setting): a simple, fixed-width
@@ -536,7 +539,9 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     // CorrugationAnchor::chain_swap_left_right's own doc comment for the full rationale. Pass
     // mesh.corrugation_anchors[layer_nr].chain_swap_left_right directly.
     bool chain_swap_left_right = false,
-    const TransitionLayerRequest& transition_layer_request = {});
+    const TransitionLayerRequest& transition_layer_request = {},
+    // Per-Chain-domain continuity - see corrugate()'s parameter of the same name.
+    const std::vector<ChainDomainTrack>& chain_domain_tracks = {});
 
 } // namespace VbctAdapter
 } // namespace cura
