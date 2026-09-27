@@ -2145,6 +2145,110 @@ TEST(VbctAdapterTest, ComputeAnchorsForMeshTracksWallIdentityForEveryChainDomain
     }
 }
 
+namespace
+{
+// A straight Chain channel along +x: outer wall y=0, inner wall y=4 (1mm point spacing), dead-ending at a flat
+// face x=20 between (20,0) and (20,4). Each case below is one of the endings Stage 6 picks between at random.
+std::vector<vbct::Point2> channelWall(double y, double x_to)
+{
+    std::vector<vbct::Point2> w;
+    for (double x = 0.0; x <= x_to + 1e-9; x += 1.0)
+    {
+        w.push_back({ x, y });
+    }
+    return w;
+}
+vbct::Domain channelDomain(std::vector<vbct::Point2> outer, std::vector<vbct::Point2> inner, vbct::Point2 cap_end)
+{
+    vbct::Domain d;
+    d.kind = "chain";
+    d.left = vbct::Wall{ std::move(outer) };
+    d.right = vbct::Wall{ std::move(inner) };
+    d.cap_start = vbct::Point2{ 0.0, 2.0 };
+    d.cap_end = cap_end;
+    return d;
+}
+void expectNormalizedEnd(const vbct::Domain& d, const char* what)
+{
+    ASSERT_TRUE(d.cap_end.has_value());
+    EXPECT_NEAR(d.cap_end->x, 20.0, 1e-6) << what << ": cap must sit at the face midpoint";
+    EXPECT_NEAR(d.cap_end->y, 2.0, 1e-6) << what;
+    EXPECT_NEAR(d.left->points.back().x, 20.0, 1e-6) << what << ": outer wall must end at its own corner";
+    EXPECT_NEAR(d.left->points.back().y, 0.0, 1e-6) << what;
+    EXPECT_NEAR(d.right->points.back().x, 20.0, 1e-6) << what << ": inner wall must end at its own corner";
+    EXPECT_NEAR(d.right->points.back().y, 4.0, 1e-6) << what;
+    EXPECT_NEAR(vbct::wall_length(d.left->points), 20.0, 1e-6) << what << ": neither wall may carry the face";
+    EXPECT_NEAR(vbct::wall_length(d.right->points), 20.0, 1e-6) << what;
+}
+} // namespace
+
+/*!
+ * At a flat dead-end face (a slot cut across a tube wall) Stage 6 ends the skeleton at either face corner, on the
+ * face, or just short of a corner, flipping between adjacent layers; each choice hands the face (or a piece of side
+ * wall) to a different wall, so the cap jumped ~4mm and a wall's length ~13mm layer to layer (FPTF-45 Body, layers
+ * 25-61 / 521-557 at the slot's round ends and the Chain ends in 148-479). normalize_chain_dead_ends must give the
+ * same end for every one of those shapes.
+ */
+TEST(VbctAdapterTest, NormalizeChainDeadEndsGivesOneEndingForEveryFaceShape)
+{
+    // Skeleton ended at the outer corner: the inner wall wraps across the face to meet it.
+    {
+        std::vector<vbct::Point2> inner = channelWall(4.0, 20.0);
+        for (double y = 3.0; y >= 0.0; y -= 1.0) inner.push_back({ 20.0, y });
+        std::vector<vbct::Domain> ds{ channelDomain(channelWall(0.0, 20.0), inner, { 20.0, 0.0 }) };
+        vbct::normalize_chain_dead_ends(ds);
+        expectNormalizedEnd(ds[0], "corner ending");
+    }
+    // Skeleton ended on a subdivided face: both walls end partway along it.
+    {
+        std::vector<vbct::Point2> outer = channelWall(0.0, 20.0);
+        outer.push_back({ 20.0, 1.0 });
+        std::vector<vbct::Point2> inner = channelWall(4.0, 20.0);
+        inner.push_back({ 20.0, 3.0 });
+        inner.push_back({ 20.0, 2.0 });
+        std::vector<vbct::Domain> ds{ channelDomain(outer, inner, { 20.0, 1.5 }) };
+        vbct::normalize_chain_dead_ends(ds);
+        expectNormalizedEnd(ds[0], "face ending");
+    }
+    // Skeleton ended short of the outer corner: the inner wall runs down the face and on along the outer side.
+    {
+        std::vector<vbct::Point2> inner = channelWall(4.0, 20.0);
+        for (double y = 3.0; y >= 0.0; y -= 1.0) inner.push_back({ 20.0, y });
+        inner.push_back({ 19.0, 0.0 });
+        inner.push_back({ 18.0, 0.0 });
+        std::vector<vbct::Domain> ds{ channelDomain(channelWall(0.0, 18.0), inner, { 18.0, 0.0 }) };
+        vbct::normalize_chain_dead_ends(ds);
+        expectNormalizedEnd(ds[0], "short-of-corner overrun");
+    }
+    // Skeleton ended at the outer corner, but the outer wall stops short of it along its side.
+    {
+        std::vector<vbct::Point2> inner = channelWall(4.0, 20.0);
+        for (double y = 3.0; y >= 0.0; y -= 1.0) inner.push_back({ 20.0, y });
+        std::vector<vbct::Domain> ds{ channelDomain(channelWall(0.0, 18.0), inner, { 19.0, 0.0 }) };
+        vbct::normalize_chain_dead_ends(ds);
+        expectNormalizedEnd(ds[0], "short-of-corner gap");
+    }
+    // A rounded end (a stadium) has no face: both walls must be left exactly as they are.
+    {
+        std::vector<vbct::Point2> outer = channelWall(0.0, 20.0);
+        std::vector<vbct::Point2> inner = channelWall(4.0, 20.0);
+        for (int k = 1; k <= 8; ++k)
+        {
+            const double a_out = -std::numbers::pi / 2.0 + k * (std::numbers::pi / 16.0);
+            const double a_in = std::numbers::pi / 2.0 - k * (std::numbers::pi / 16.0);
+            outer.push_back({ 20.0 + 2.0 * std::cos(a_out), 2.0 + 2.0 * std::sin(a_out) });
+            inner.push_back({ 20.0 + 2.0 * std::cos(a_in), 2.0 + 2.0 * std::sin(a_in) });
+        }
+        const std::vector<vbct::Point2> outer_before = outer, inner_before = inner;
+        std::vector<vbct::Domain> ds{ channelDomain(outer, inner, outer.back()) };
+        vbct::normalize_chain_dead_ends(ds);
+        EXPECT_EQ(ds[0].left->points.size(), outer_before.size()) << "rounded end: outer wall untouched";
+        EXPECT_EQ(ds[0].right->points.size(), inner_before.size()) << "rounded end: inner wall untouched";
+        EXPECT_NEAR(ds[0].cap_end->x, outer_before.back().x, 1e-9);
+        EXPECT_NEAR(ds[0].cap_end->y, outer_before.back().y, 1e-9);
+    }
+}
+
 /*!
  * A slot can split a layer into separate parts, each a Chain (both halves of a fuselage around a hatch). The
  * pre-pass used to track only one Chain domain, and only in parts[0]; the live call then applied that one override

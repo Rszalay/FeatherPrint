@@ -1024,6 +1024,7 @@ Stage9Result run_stage9(const Stage5Result&, const Stage6Result&, const Stage7Re
     }
     domains.insert(domains.end(), new_domains.begin(), new_domains.end());
     domains.insert(domains.end(), passthrough.begin(), passthrough.end());
+    normalize_chain_dead_ends(domains);
     return {domains};
 }
 

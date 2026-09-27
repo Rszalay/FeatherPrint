@@ -1,5 +1,8 @@
 #include "stage8.hpp"
 
+#include <cmath>
+#include <optional>
+#include <string>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -335,6 +338,201 @@ void reattach_bridging_strays(std::vector<Piece>& side, std::vector<Piece>& othe
     }
 }
 
+// ---- Dead-end face normalization ---------------------------------------------------------
+//
+// A Chain that dead-ends at a square end face (e.g. a slot cut across a tube wall) has three
+// equally valid skeleton endings - the face's outer corner, its inner corner, or a point on the
+// face - and Stage 6 picks between them by scoring near-tied candidates against a noisy local
+// sleeve direction, while CDT decides which corner even becomes the terminal tip. The pick
+// flips from layer to layer, and with it which wall carries the face: ending at a corner makes
+// the other wall wrap all the way across the face to meet it (confirmed on FPTF-45 Body: an
+// inner wall jumping 118 <-> 131mm and the cap jumping ~4mm between adjacent layers). Every
+// consumer downstream (stringer distribution, end tracking, Wall A/B) sees that as noise.
+//
+// Normalize after the walls are built, so the result no longer depends on which ending was
+// picked: at each dead end, trim any straight trailing run of a wall that runs ACROSS the
+// sleeve (the end face) back to its own corner, and put the cap at the midpoint of the two
+// walls' resulting ends. Only applied when the geometry is unambiguously a flat face:
+//   - one wall has a straight across-sleeve run and the other runs along the sleeve and ends
+//     where the first run ends (skeleton ended at a corner), or
+//   - both walls end in straight across-sleeve runs that lie on one common line (skeleton
+//     ended on a subdivided face).
+// A rounded end (both runs curve) or a pointed tip (both runs along the sleeve) is untouched.
+namespace {
+
+constexpr double kFaceAcrossCos = 0.5;    // |cos(segment, sleeve)| below this = runs across the sleeve
+constexpr double kSideAlongCos = 0.8;     // |cos| above this = runs along the sleeve
+constexpr double kFaceStraightTol = 0.05; // mm: a real face is straight to within this
+
+double seg_cos(const Point2& a, const Point2& b, const Point2& dir) {
+    const double dx = b.x - a.x, dy = b.y - a.y;
+    const double len = std::hypot(dx, dy);
+    if (len < 1e-9) return 1.0;
+    return std::abs((dx * dir.x + dy * dir.y) / len);
+}
+
+// Number of trailing points (counted from the wall end nearest `cap`) forming a straight run
+// across the sleeve; 0 if none. `from_back` says which end of the point array that is.
+size_t face_run(const std::vector<Point2>& w, bool from_back, const Point2& dir) {
+    const size_t n = w.size();
+    auto at = [&](size_t i) -> const Point2& { return from_back ? w[n - 1 - i] : w[i]; };
+    size_t k = 0;
+    while (k + 1 < n - 1 && seg_cos(at(k), at(k + 1), dir) < kFaceAcrossCos) ++k;
+    if (k == 0) return 0;
+    const Point2& e = at(0);
+    const Point2& c = at(k);
+    const double lx = c.x - e.x, ly = c.y - e.y, ll = std::hypot(lx, ly);
+    if (ll < 1e-6) return 0;
+    for (size_t i = 1; i < k; ++i) {
+        const double d = std::abs((at(i).x - e.x) * ly - (at(i).y - e.y) * lx) / ll;
+        if (d > kFaceStraightTol) return 0;  // curved: a rounded end, not a face
+    }
+    return k;
+}
+
+// Unit direction of a wall between arc lengths `a` and `b` back from its end nearest `cap`,
+// pointing toward that end. Far enough back to be past any end face, so it runs along the
+// sleeve regardless of which corner the skeleton ended at.
+std::optional<Point2> wall_tangent(const std::vector<Point2>& w, bool from_back, double a, double b) {
+    const size_t n = w.size();
+    auto at = [&](size_t i) -> const Point2& { return from_back ? w[n - 1 - i] : w[i]; };
+    std::optional<Point2> pa, pb;
+    double acc = 0.0;
+    for (size_t k = 1; k < n; ++k) {
+        acc += std::hypot(at(k).x - at(k - 1).x, at(k).y - at(k - 1).y);
+        if (! pa && acc >= a) pa = at(k);
+        if (acc >= b) { pb = at(k); break; }
+    }
+    if (! pa || ! pb) return std::nullopt;
+    const double dx = pa->x - pb->x, dy = pa->y - pb->y, len = std::hypot(dx, dy);
+    if (len < 1e-6) return std::nullopt;
+    return Point2{ dx / len, dy / len };
+}
+
+bool wall_end_is_back(const std::vector<Point2>& w, const Point2& cap) {
+    return std::hypot(w.back().x - cap.x, w.back().y - cap.y) < std::hypot(w.front().x - cap.x, w.front().y - cap.y);
+}
+
+void trim(std::vector<Point2>& w, bool from_back, size_t k) {
+    if (from_back) w.resize(w.size() - k);
+    else w.erase(w.begin(), w.begin() + static_cast<std::ptrdiff_t>(k));
+}
+
+// The skeleton can also end a little way BEFORE a face corner, on one side wall: that wall then
+// stops short, and the other wall runs the remaining stretch along the side to the corner and then
+// down the face. Recognized as: both walls end at the same point, one wall's trailing run is a
+// short along-sleeve piece collinear with the other wall's own direction, immediately followed by
+// a straight across-sleeve face. The along piece is handed to the other wall (which then ends at
+// the corner) and the face is trimmed, giving the same result as a clean corner ending.
+std::optional<Point2> normalize_short_side_overrun(std::vector<Point2>& w, bool wb, std::vector<Point2>& o, bool ob, const Point2& dir) {
+    constexpr double kMaxOverrun = 3.0;  // mm
+    const size_t n = w.size();
+    auto at = [&](size_t i) -> const Point2& { return wb ? w[n - 1 - i] : w[i]; };
+    const Point2& oe = ob ? o.back() : o.front();
+    const Point2& oprev = ob ? o[o.size() - 2] : o[1];
+    if (std::hypot(at(0).x - oe.x, at(0).y - oe.y) > kFaceStraightTol) return std::nullopt;
+    const double ox = oe.x - oprev.x, oy = oe.y - oprev.y, ol = std::hypot(ox, oy);
+    if (ol < 1e-9) return std::nullopt;
+    size_t a = 0;
+    double run = 0.0;
+    while (a + 1 < n - 1) {
+        const Point2& p0 = at(a);
+        const Point2& p1 = at(a + 1);
+        const double sx = p1.x - p0.x, sy = p1.y - p0.y, sl = std::hypot(sx, sy);
+        if (sl < 1e-9) break;
+        if (seg_cos(p0, p1, dir) <= kSideAlongCos) break;
+        if ((sx * ox + sy * oy) / (sl * ol) < 0.9) break;  // must continue the other wall's own direction
+        run += sl;
+        if (run > kMaxOverrun) return std::nullopt;
+        ++a;
+    }
+    if (a == 0) return std::nullopt;
+    size_t k = a;
+    while (k + 1 < n - 1 && seg_cos(at(k), at(k + 1), dir) < kFaceAcrossCos) ++k;
+    if (k == a) return std::nullopt;
+    const Point2 corner = at(a);
+    const Point2 inner = at(k);
+    const double lx = inner.x - corner.x, ly = inner.y - corner.y, ll = std::hypot(lx, ly);
+    if (ll < 1e-6) return std::nullopt;
+    for (size_t i = a + 1; i < k; ++i) {
+        if (std::abs((at(i).x - corner.x) * ly - (at(i).y - corner.y) * lx) / ll > kFaceStraightTol) return std::nullopt;
+    }
+    std::vector<Point2> handed;
+    for (size_t i = 1; i <= a; ++i) handed.push_back(at(i));
+    if (ob) o.insert(o.end(), handed.begin(), handed.end());
+    else o.insert(o.begin(), handed.rbegin(), handed.rend());
+    trim(w, wb, k);
+    return Point2{ (corner.x + inner.x) / 2.0, (corner.y + inner.y) / 2.0 };
+}
+
+// Mirror of the overrun case: one wall ends at a face corner and runs down the face, while the other
+// wall stops a little SHORT of that corner along its side (the stretch between belongs to neither
+// wall). The short wall is extended to the corner and the face trimmed.
+std::optional<Point2> normalize_short_side_gap(std::vector<Point2>& w, bool wb, std::vector<Point2>& o, bool ob, const Point2& dir) {
+    constexpr double kMaxGap = 3.0;  // mm
+    const size_t k = face_run(w, wb, dir);
+    if (k == 0) return std::nullopt;
+    const size_t n = w.size();
+    const Point2 corner = wb ? w[n - 1] : w[0];
+    const Point2 inner = wb ? w[n - 1 - k] : w[k];
+    const Point2& oe = ob ? o.back() : o.front();
+    const Point2& oprev = ob ? o[o.size() - 2] : o[1];
+    const double gx = corner.x - oe.x, gy = corner.y - oe.y, gl = std::hypot(gx, gy);
+    if (gl < kFaceStraightTol || gl > kMaxGap) return std::nullopt;
+    const double ox = oe.x - oprev.x, oy = oe.y - oprev.y, ol = std::hypot(ox, oy);
+    if (ol < 1e-9 || (gx * ox + gy * oy) / (gl * ol) < 0.9) return std::nullopt;  // gap continues the other wall
+    if (std::abs((gx * dir.x + gy * dir.y) / gl) <= kSideAlongCos) return std::nullopt;  // and runs along the sleeve
+    if (ob) o.push_back(corner);
+    else o.insert(o.begin(), corner);
+    trim(w, wb, k);
+    return Point2{ (corner.x + inner.x) / 2.0, (corner.y + inner.y) / 2.0 };
+}
+
+// Returns the new cap point when the end was normalized.
+std::optional<Point2> normalize_dead_end(std::vector<Point2>& left, std::vector<Point2>& right, const Point2& cap, const Point2& dir) {
+    if (left.size() < 4 || right.size() < 4) return std::nullopt;
+    const bool lb = wall_end_is_back(left, cap), rb = wall_end_is_back(right, cap);
+    const Point2 le = lb ? left.back() : left.front();
+    const Point2 re = rb ? right.back() : right.front();
+    if (const auto c = normalize_short_side_overrun(right, rb, left, lb, dir)) return c;
+    if (const auto c = normalize_short_side_overrun(left, lb, right, rb, dir)) return c;
+    if (const auto c = normalize_short_side_gap(right, rb, left, lb, dir)) return c;
+    if (const auto c = normalize_short_side_gap(left, lb, right, rb, dir)) return c;
+    const size_t lk = face_run(left, lb, dir);
+    const size_t rk = face_run(right, rb, dir);
+    auto last_cos = [&](const std::vector<Point2>& w, bool b) {
+        return b ? seg_cos(w[w.size() - 2], w.back(), dir) : seg_cos(w[1], w.front(), dir);
+    };
+    // A run is the end face only if the other wall's end lies on the same straight line: either
+    // both walls meet at one face corner (Stage 6 ended the skeleton at that corner), or the other
+    // wall ends partway along the face (Stage 6 ended it on a face sub-edge).
+    auto on_line = [](const Point2& a, const Point2& b, const Point2& p) {
+        const double lx = b.x - a.x, ly = b.y - a.y, ll = std::hypot(lx, ly);
+        if (ll < 1e-6) return false;
+        return std::abs((p.x - a.x) * ly - (p.y - a.y) * lx) / ll < kFaceStraightTol;
+    };
+    const Point2 lc = lk > 0 ? (lb ? left[left.size() - 1 - lk] : left[lk]) : le;
+    const Point2 rc = rk > 0 ? (rb ? right[right.size() - 1 - rk] : right[rk]) : re;
+    const bool l_face = lk > 0 && on_line(le, lc, re);
+    const bool r_face = rk > 0 && on_line(re, rc, le);
+    if (lk > 0 && rk > 0) {
+        if (! (l_face && r_face)) return std::nullopt;
+        trim(left, lb, lk);
+        trim(right, rb, rk);
+    } else if (l_face && last_cos(right, rb) > kSideAlongCos) {
+        trim(left, lb, lk);
+    } else if (r_face && last_cos(left, lb) > kSideAlongCos) {
+        trim(right, rb, rk);
+    } else {
+        return std::nullopt;
+    }
+    const Point2 nle = lb ? left.back() : left.front();
+    const Point2 nre = rb ? right.back() : right.front();
+    return Point2{ (nle.x + nre.x) / 2.0, (nle.y + nre.y) / 2.0 };
+}
+
+}  // namespace
+
 Domain walk_chain_domain(const Chain& chain, const Stage5Result& stage5, const Stage6Result& stage6) {
     const auto& verts = stage5.vertices;
     const auto& boundary_edges = stage5.boundary_edges;
@@ -359,8 +557,6 @@ Domain walk_chain_domain(const Chain& chain, const Stage5Result& stage5, const S
     Wall right = materialize_wall(right_pieces, verts, hub_hint);
 
     Domain d;
-    d.left = std::move(left);
-    d.right = std::move(right);
     if (chain.closed) {
         d.kind = "ring";
     } else {
@@ -368,10 +564,43 @@ Domain walk_chain_domain(const Chain& chain, const Stage5Result& stage5, const S
         d.cap_start = chain.points.front();
         d.cap_end = chain.points.back();
     }
+    d.left = std::move(left);
+    d.right = std::move(right);
     return d;
 }
 
 }  // namespace
+
+void normalize_chain_dead_ends(std::vector<Domain>& domains) {
+    constexpr double kJunctionTol = 0.1;  // mm: a cap shared with another domain is a junction, not a dead end
+    std::vector<Point2> caps;
+    for (const Domain& d : domains) {
+        if (d.kind != "chain") continue;
+        if (d.cap_start) caps.push_back(*d.cap_start);
+        if (d.cap_end) caps.push_back(*d.cap_end);
+    }
+    auto shared = [&](const Point2& c) {
+        int n = 0;
+        for (const Point2& q : caps)
+            if (std::hypot(q.x - c.x, q.y - c.y) < kJunctionTol) ++n;
+        return n > 1;
+    };
+    for (Domain& d : domains) {
+        if (d.kind != "chain" || ! d.left || ! d.right || ! d.cap_start || ! d.cap_end) continue;
+        for (const bool at_start : { true, false }) {
+            Point2& cap = at_start ? *d.cap_start : *d.cap_end;
+            if (shared(cap)) continue;
+            constexpr double kTangentFrom = 5.0, kTangentTo = 8.0;  // mm back from the wall end: past a face, local enough for a curving wall
+            const auto tl = wall_tangent(d.left->points, wall_end_is_back(d.left->points, cap), kTangentFrom, kTangentTo);
+            const auto tr = wall_tangent(d.right->points, wall_end_is_back(d.right->points, cap), kTangentFrom, kTangentTo);
+            if (! tl || ! tr) continue;
+            const double sx = tl->x + tr->x, sy = tl->y + tr->y, sl = std::hypot(sx, sy);
+            if (sl < 1e-6) continue;
+            const Point2 dir{ sx / sl, sy / sl };
+            if (const auto moved = normalize_dead_end(d.left->points, d.right->points, cap, dir)) cap = *moved;
+        }
+    }
+}
 
 Stage8Result run_stage8(const Stage5Result& stage5, const Stage6Result& stage6, const Stage7Result& stage7) {
     std::vector<Domain> domains;

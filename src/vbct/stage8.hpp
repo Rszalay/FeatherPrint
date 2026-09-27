@@ -45,4 +45,11 @@ struct Stage8Result {
 
 Stage8Result run_stage8(const Stage5Result& stage5, const Stage6Result& stage6, const Stage7Result& stage7);
 
+// FeatherPrint Corrugated extension: make every Chain dead end independent of which ending the
+// skeleton happened to pick at a flat end face (a face corner, the other corner, or a point on the
+// face - a near-tie that flips between layers). Trims a wall's straight run across the end face back
+// to its own corner and puts the cap at the face midpoint; rounded ends, pointed tips and junction
+// ends (a cap shared with another domain) are left alone. Run on Stage 9's final domains.
+void normalize_chain_dead_ends(std::vector<Domain>& domains);
+
 }  // namespace vbct
