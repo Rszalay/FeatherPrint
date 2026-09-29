@@ -1156,7 +1156,9 @@ Stage10Result run_stage10(
             per_domain_chain ? (co ? co->right_near_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_right_near_t_frac : std::nullopt),
             per_domain_chain ? (co ? co->right_far_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_right_far_t_frac : std::nullopt),
             extra_clip_loops,
-            per_domain_chain ? (co != nullptr && chain_swap_left_right && co->swap_left_right) : (apply_chain_anchor_here ? chain_swap_left_right : false)));
+            // Per-domain: the domain's own tracked swap, as build_domain_events applies it. Its near/far fractions
+            // were measured against the swapped walls, so applying them without the swap puts them on the wrong walls.
+            per_domain_chain ? (co != nullptr && co->swap_left_right) : (apply_chain_anchor_here ? chain_swap_left_right : false)));
         result.domains.back().is_transition_layer = is_transition;
     }
     return result;

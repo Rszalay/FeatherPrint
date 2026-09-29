@@ -3547,5 +3547,91 @@ TEST(VbctAdapterTest, GrowCorrugationInputMatchesLivePathForEveryStripAndRawMode
     }
 }
 
+/*!
+ * A per-domain Chain override's left/right swap must apply on the unlinked path (run_stage10) exactly as on the
+ * linked path (build_domain_events). Its near/far end fractions are measured against the swapped walls, so ignoring
+ * the swap - which run_stage10 did until 2026-09-29 - put each wall's fractions on the other wall. With an
+ * asymmetric, swapped override on a plain bar, every unlinked stringer must land on the same pair of wall points as
+ * the corresponding linked event, and swap on/off must actually change the stringers (so the check isn't vacuous).
+ */
+TEST(VbctAdapterTest, ChainOverrideSwapAppliesOnBothPaths)
+{
+    Shape bar_shape;
+    bar_shape.push_back(makeRectPolygon(0, 0, 60000, 10000)); // 60mm x 10mm bar - one Chain domain.
+    const std::vector<vbct::Contour> contours = VbctAdapter::shapeToContours(bar_shape);
+    const vbct::VbctResult r14 = vbct::run_vbct(contours, 0.3);
+    const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh);
+    const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+    const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+    const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+    const vbct::Stage9Result r9 = vbct::run_stage9(r5, r6, r7, r8, 0.8);
+    ASSERT_EQ(r9.domains.size(), 1u);
+    const vbct::Domain& d = r9.domains[0];
+    ASSERT_EQ(d.kind, "chain");
+    ASSERT_TRUE(d.left && d.right && d.cap_start);
+
+    vbct::ChainDomainOverride co;
+    double sx = 0.0, sy = 0.0;
+    size_t n = 0;
+    for (const auto* wall : { &d.left, &d.right })
+    {
+        for (const vbct::Point2& p : (*wall)->points)
+        {
+            sx += p.x;
+            sy += p.y;
+            ++n;
+        }
+    }
+    co.identity = { sx / n, sy / n };
+    co.anchor_point = *d.cap_start;
+    co.left_near_t_frac = 0.10; // deliberately different per wall, so which wall gets which matters
+    co.left_far_t_frac = 0.70;
+    co.right_near_t_frac = 0.30;
+    co.right_far_t_frac = 0.95;
+    co.swap_left_right = true;
+
+    auto unlinked = [&](const vbct::ChainDomainOverride& o)
+    {
+        return vbct::run_stage10(
+            r9, 2.0, 0.0, std::nullopt, std::nullopt, std::nullopt, /*crosshatch_enabled=*/false, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, {}, /*chain_swap_left_right=*/false, false, {}, 0.0, { o });
+    };
+    const vbct::Stage10Result swapped = unlinked(co);
+    vbct::ChainDomainOverride co_unswapped = co;
+    co_unswapped.swap_left_right = false;
+    const vbct::Stage10Result unswapped = unlinked(co_unswapped);
+
+    const std::vector<vbct::DomainEvents> events = vbct::build_domain_events(
+        r9, 2.0, 0.0, std::nullopt, std::nullopt, std::nullopt, /*crosshatch_enabled=*/true, std::nullopt, /*chain_crosshatch_enabled=*/false,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, {}, /*chain_swap_left_right=*/false, { co });
+    ASSERT_EQ(events.size(), 1u);
+    ASSERT_TRUE(events[0].ok);
+
+    ASSERT_EQ(swapped.domains.size(), 1u);
+    const std::vector<vbct::Stringer>& stringers = swapped.domains[0].stringers;
+    ASSERT_EQ(stringers.size(), events[0].events.size());
+    auto near = [](const vbct::Point2& a, const vbct::Point2& b) { return std::hypot(a.x - b.x, a.y - b.y) < 1e-6; };
+    for (const vbct::DomainEvent& e : events[0].events)
+    {
+        const bool found = std::any_of(
+            stringers.begin(),
+            stringers.end(),
+            [&](const vbct::Stringer& s)
+            {
+                return ! s.pieces.empty() && near(s.pieces.front().first, e.outer_pt) && near(s.pieces.back().second, e.inner_pt);
+            });
+        EXPECT_TRUE(found) << "linked event (" << e.outer_pt.x << "," << e.outer_pt.y << ")-(" << e.inner_pt.x << "," << e.inner_pt.y
+                           << ") has no matching unlinked stringer";
+    }
+
+    ASSERT_EQ(unswapped.domains.size(), 1u);
+    bool any_differs = unswapped.domains[0].stringers.size() != stringers.size();
+    for (size_t i = 0; ! any_differs && i < stringers.size(); ++i)
+    {
+        any_differs = ! near(stringers[i].pieces.front().first, unswapped.domains[0].stringers[i].pieces.front().first);
+    }
+    EXPECT_TRUE(any_differs) << "the swap flag should change where an asymmetric override's stringers land";
+}
+
 } // namespace cura
 // NOLINTEND(*-magic-numbers)
