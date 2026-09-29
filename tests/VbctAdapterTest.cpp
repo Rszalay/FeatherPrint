@@ -183,6 +183,57 @@ TEST(VbctAdapterTest, CrosshatchFamilyDiffersFromCcwAtNonzeroPhaseOffset)
 }
 
 /*!
+ * The two crosshatch families coincide as sets whenever 2 * phase_offset is an integer, i.e. at
+ * every z that is a multiple of crossover_pitch_mm / 2 - not only at phase 0. The coincidence gate
+ * used to test the wrong period (and a tolerance below VbctAdapter's own 1e-7 phase bias), so every
+ * such layer printed each stringer twice. Checked for both a Ring and a Chain domain: no two emitted
+ * lines may share both endpoints (either orientation, within 10 microns).
+ */
+TEST(VbctAdapterTest, CrosshatchEmitsNoDuplicateStringersAtPitchMultiples)
+{
+    Shape ring_shape;
+    ring_shape.push_back(makeCirclePolygon(0, 0, 30000, 64));
+    ring_shape.push_back(makeCirclePolygon(0, 0, 15000, 48));
+    Shape bar_shape;
+    bar_shape.push_back(makeRectPolygon(0, 0, 60000, 10000)); // 60mm x 10mm bar - a Chain domain.
+
+    auto near = [](const Point2LL& a, const Point2LL& b) { return std::abs(a.X - b.X) <= 10 && std::abs(a.Y - b.Y) <= 10; };
+    for (const Shape* shape : { &ring_shape, &bar_shape })
+    {
+        for (const coord_t z : { coord_t(5000), coord_t(10000), coord_t(20000), coord_t(30000) })
+        {
+            const std::optional<OpenLinesSet> lines = VbctAdapter::corrugate(
+                *shape,
+                /*x=*/0.3,
+                /*threshold=*/800,
+                /*spacing=*/2000,
+                z,
+                /*crossover_pitch_mm=*/10.0,
+                /*anchor_t0_frac=*/std::nullopt,
+                /*other_wall_t0_frac=*/std::nullopt,
+                /*reverse_canonical_wall=*/std::nullopt,
+                /*crosshatch_enabled=*/true);
+            ASSERT_TRUE(lines.has_value());
+            ASSERT_GT(lines->size(), 2u);
+            size_t duplicates = 0;
+            for (size_t a = 0; a < lines->size(); ++a)
+            {
+                for (size_t b = a + 1; b < lines->size(); ++b)
+                {
+                    const OpenPolyline& la = (*lines)[a];
+                    const OpenPolyline& lb = (*lines)[b];
+                    if ((near(la.front(), lb.front()) && near(la.back(), lb.back())) || (near(la.front(), lb.back()) && near(la.back(), lb.front())))
+                    {
+                        ++duplicates;
+                    }
+                }
+            }
+            EXPECT_EQ(duplicates, 0u) << (shape == &ring_shape ? "Ring" : "Chain") << " at z=" << z;
+        }
+    }
+}
+
+/*!
  * Linked corrugation skin (VbctAdapter::corrugateLinkedSkin): on a plain concentric ring at a
  * nonzero phase offset (so the CW family it always builds internally is genuinely distinct from
  * the CCW one - see corrugateLinkedSkin's own doc comment), the result should be exactly one
@@ -910,8 +961,8 @@ TEST(VbctAdapterTest, ElongatedBarShapeProducesStringers)
 }
 
 /*!
- * Chain-specific Crosshatch (spec REV 2.3/2.4): crosshatch_enabled=true now always doubles the
- * stringer count for a Chain domain, *including* at phase_offset exactly 0 (z=0, crossover_pitch_mm=0) -
+ * Chain-specific Crosshatch (spec REV 2.3/2.4): crosshatch_enabled=true always switches a Chain
+ * domain to the wraparound family, *including* at phase_offset exactly 0 (z=0, crossover_pitch_mm=0) -
  * this replaces an earlier version of this test (ChainCrosshatchProducesNoExtraStringersAt
  * ZeroPhaseOffset) that expected the opposite. That earlier expectation came from a per-layer
  * gate that turned crosshatch off whenever phase_offset itself was near a multiple of 1.0 -
@@ -924,7 +975,7 @@ TEST(VbctAdapterTest, ElongatedBarShapeProducesStringers)
  * offset rather than silently falling back to the single-family default - a deliberate, accepted
  * trade-off, not an oversight.
  */
-TEST(VbctAdapterTest, ChainCrosshatchAlwaysDoublesStringerCountIncludingAtZeroPhaseOffset)
+TEST(VbctAdapterTest, ChainCrosshatchStaysOnAtZeroPhaseOffsetWithoutDuplicates)
 {
     Shape bar_shape;
     bar_shape.push_back(makeRectPolygon(0, 0, 60000, 10000));
@@ -944,10 +995,12 @@ TEST(VbctAdapterTest, ChainCrosshatchAlwaysDoublesStringerCountIncludingAtZeroPh
 
     ASSERT_TRUE(lines_single.has_value());
     ASSERT_TRUE(lines_cross.has_value());
-    // *2 for the crosshatch family's own doubling, +2 for the always-added true t=0/t=1 cap
-    // stringers (spec REV 2.5) - see domain_stringers' own doc comment for why those two are
-    // unconditionally present whenever chain_crosshatch_active, on top of the doubled count.
-    EXPECT_EQ(lines_cross->size(), lines_single->size() * 2 + 2);
+    // 2026-09-28 review fix: at phase 0 the CW family is the CCW family exactly, so it is no longer
+    // printed a second time, and the wraparound sample at t=0 is dropped in favour of the cap
+    // stringer. The wraparound family itself stays on (no per-layer switch back to the base
+    // family, which is what caused the discontinuity described above): n-1 wraparound stringers
+    // plus the two always-added t=0/t=1 caps (spec REV 2.5) = the base family's n, plus one.
+    EXPECT_EQ(lines_cross->size(), lines_single->size() + 1);
 }
 
 namespace

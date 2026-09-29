@@ -676,9 +676,19 @@ DomainStringers domain_stringers(
     // their first coincidence at different Z heights even though every domain shared the same
     // raw phase_offset - confirmed on real capture (Multi-Domain Two-Hole.stl) as the actual
     // mechanism behind three Chain domains crossing over at different, uncoordinated layers.
-    double phase_shift_wrapped = wrap01(2.0 * effective_phase_offset / denominator);
-    phase_shift_wrapped = std::min(phase_shift_wrapped, 1.0 - phase_shift_wrapped); // shortest distance around the wrap
-    const bool crosshatch_active = crosshatch_enabled && is_ring && phase_shift_wrapped > 1e-9;
+    //
+    // Coincidence test (2026-09-28 review fix): the CCW set {(i + phi)/n} and CW set {(i - phi)/n}
+    // (mod 1, over all i) are the same set whenever 2*phi is any integer - the index shift absorbs
+    // it - not only when 2*phi is a multiple of n, which is what the old wrap01(2*phi/denominator)
+    // test checked. It also compared against 1e-9, below the 1e-7 degeneracy bias VbctAdapter adds
+    // to phi, so it never fired at all and every z = k * pitch layer printed each stringer twice.
+    // The tolerance below sits well above that bias (2e-7 in 2*phi) and far below any real phase
+    // step between layers.
+    auto families_coincide = [](double phase) {
+        const double two_phi = 2.0 * phase;
+        return std::abs(two_phi - std::round(two_phi)) < 1e-4;
+    };
+    const bool crosshatch_active = crosshatch_enabled && is_ring && !families_coincide(effective_phase_offset);
 
     // Chain-specific Crosshatch (spec REV 2.3 through spec REV 2.4's "fifth round" - see this
     // file's own top-of-file history note for the four earlier rounds and why each was replaced):
@@ -714,6 +724,7 @@ DomainStringers domain_stringers(
     // Exempts both the base family (t=0/1 at i=0/n-1 exactly) and Chain crosshatch (whose own
     // wrapped output can also land exactly on a cap for some phase_offset).
     auto is_chain_cap_t = [is_ring](double t) { return !is_ring && (t <= 1e-9 || t >= 1.0 - 1e-9); };
+    auto on_chain_cap = [](double t) { return t < 1e-6 || t > 1.0 - 1e-6; };
     auto make_chain_stringer = [&](double t, const Point2& v1t, const Point2& v2t) {
         if (is_chain_cap_t(t)) {
             Stringer stringer;
@@ -772,10 +783,14 @@ DomainStringers domain_stringers(
             : (chain_crosshatch_active ? t_chain_wrap : (left_t0_frac + base_t * (left_t1_frac - left_t0_frac)));
         const double t_right = is_ring ? std::fmod(base_t + right_t0_frac, 1.0)
             : (chain_crosshatch_active ? t_chain_wrap : (right_t0_frac + base_t * (right_t1_frac - right_t0_frac)));
-        Point2 v1t = sample_at_t(left, left_len, t_left);
-        Point2 v2t = sample_at_t(right, right_len, t_right);
-        Stringer stringer = make_chain_stringer(t_left, v1t, v2t);
-        if (!stringer.pieces.empty()) result.stringers.push_back(std::move(stringer));
+        // A wraparound sample sitting on a real end duplicates the cap stringer added after this
+        // loop (and, just off exact 0/1, would go through clip_stringer instead of the cap exemption).
+        if (!(chain_crosshatch_active && on_chain_cap(t_chain_wrap))) {
+            Point2 v1t = sample_at_t(left, left_len, t_left);
+            Point2 v2t = sample_at_t(right, right_len, t_right);
+            Stringer stringer = make_chain_stringer(t_left, v1t, v2t);
+            if (!stringer.pieces.empty()) result.stringers.push_back(std::move(stringer));
+        }
 
         // Crosshatch's CW stringer at this same index - see crosshatch_active's own doc comment
         // above for the construction (same left_t0_frac/right_t0_frac as the CCW stringer above,
@@ -796,8 +811,11 @@ DomainStringers domain_stringers(
         // move in genuinely opposite directions). Both walls sample from the same t (Chain's own
         // base family already does this too, since left_t0_frac/right_t0_frac are always 0.0 for
         // Chain).
-        if (chain_crosshatch_active) {
+        // Skipped when the two families coincide (see families_coincide above) - the wraparound
+        // family stays active so the base spacing is unchanged; only the duplicate is dropped.
+        if (chain_crosshatch_active && !families_coincide(phase_offset)) {
             const double t_chain_cw = wrap01((static_cast<double>(i) - phase_offset) / chain_wrap_denominator);
+            if (on_chain_cap(t_chain_cw)) continue;
             Point2 v1t_chain_cw = sample_at_t(left, left_len, t_chain_cw);
             Point2 v2t_chain_cw = sample_at_t(right, right_len, t_chain_cw);
             Stringer stringer_chain_cw = make_chain_stringer(t_chain_cw, v1t_chain_cw, v2t_chain_cw);
