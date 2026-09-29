@@ -2281,6 +2281,16 @@ TEST(VbctAdapterTest, NormalizeChainDeadEndsGivesOneEndingForEveryFaceShape)
         vbct::normalize_chain_dead_ends(ds);
         expectNormalizedEnd(ds[0], "short-of-corner gap");
     }
+    // Skeleton split the face a short way up: the outer wall keeps a 0.8mm face run whose split point sits 0.012mm off
+    // the face line. Extending that short run 4mm to the inner corner misses by 0.06mm; the whole face is still
+    // straight (FPTF-45 Body top slot end, where this alternated with the other endings every few layers).
+    {
+        std::vector<vbct::Point2> outer = channelWall(0.0, 20.0);
+        outer.push_back({ 20.012, 0.8 });
+        std::vector<vbct::Domain> ds{ channelDomain(outer, channelWall(4.0, 20.0), { 20.0, 2.4 }) };
+        vbct::normalize_chain_dead_ends(ds);
+        expectNormalizedEnd(ds[0], "split face with a short run");
+    }
     // A rounded end (a stadium) has no face: both walls must be left exactly as they are.
     {
         std::vector<vbct::Point2> outer = channelWall(0.0, 20.0);

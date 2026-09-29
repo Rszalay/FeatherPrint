@@ -513,8 +513,12 @@ std::optional<Point2> normalize_dead_end(std::vector<Point2>& left, std::vector<
     };
     const Point2 lc = lk > 0 ? (lb ? left[left.size() - 1 - lk] : left[lk]) : le;
     const Point2 rc = rk > 0 ? (rb ? right[right.size() - 1 - rk] : right[rk]) : re;
-    const bool l_face = lk > 0 && on_line(le, lc, re);
-    const bool r_face = rk > 0 && on_line(re, rc, le);
+    // Test the wall's end (where the skeleton split the face) against the whole face - from that wall's face corner to
+    // the other wall's end - rather than extending the wall's own short face run out to the other wall: a run well
+    // under a millimetre long, extrapolated several millimetres, turns a 0.01mm kink into a miss of the tolerance
+    // (FPTF-45 Body top slot end, layers 148-186 and alternate layers 241-263).
+    const bool l_face = lk > 0 && on_line(lc, re, le);
+    const bool r_face = rk > 0 && on_line(rc, le, re);
     if (lk > 0 && rk > 0) {
         if (! (l_face && r_face)) return std::nullopt;
         trim(left, lb, lk);
