@@ -3017,7 +3017,7 @@
                         "cdt": "Triangulation",
                         "voronoi": "Medial Axis"
                     },
-                    "default_value": "cdt",
+                    "default_value": "voronoi",
                     "enabled": "infill_pattern == 'corrugated'",
                     "settable_per_mesh": true,
                     "settable_globally": true
@@ -3033,7 +3033,7 @@
                         "aligned": "Aligned",
                         "harmonic": "Harmonic"
                     },
-                    "default_value": "arc_length",
+                    "default_value": "harmonic",
                     "enabled": "infill_pattern == 'corrugated'",
                     "settable_per_mesh": true,
                     "settable_globally": true
