@@ -5,11 +5,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 #include <spdlog/spdlog.h>
 
+#include "Application.h"
 #include "geometry/OpenLinesSet.h"
 #include "geometry/OpenPolyline.h"
 #include "geometry/Point2LL.h"
@@ -17,6 +20,7 @@
 #include "geometry/Shape.h"
 #include "settings/Settings.h"
 #include "sliceDataStorage.h"
+#include "utils/ThreadPool.h"
 #include "pipeline.hpp" // Vendored VBCT.
 #include "stage5.hpp" // Individual pipeline stages - needed by computeAnchorsForMesh's cross-layer
 #include "stage6.hpp" // continuity pre-pass (spec REV 1.4 S:5.3), which calls Stages 1-9 directly
@@ -1623,10 +1627,12 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
     const coord_t vbct_stringer_pitch = mesh.settings.get<coord_t>("corrugated_stringer_pitch");
 
     std::vector<CorrugationAnchor> result(mesh.layers.size());
-    // Stage 9 output for parts[0] of each layer, kept from the main pass below so the per-part Chain tracking pass at
-    // the end reuses it instead of running Stages 1-9 on the identical input a second time. nullopt: not run (fall
-    // back to computing it); a value with no Stage9Result: VBCT rejected the input.
-    std::vector<std::optional<std::optional<vbct::Stage9Result>>> part0_stage9(mesh.layers.size());
+    // Every part's VBCT input and Stages 1-9 output, computed up front (Phase A/Phase B, just before the main tracking
+    // loop) so the expensive, independent per-layer pipeline runs in parallel and only the cross-layer tracking stays
+    // sequential. part_contours[layer][part] empty: no corrugatable geometry; part_stage9[layer][part] nullopt with
+    // non-empty contours: VBCT rejected the input.
+    std::vector<std::vector<std::vector<vbct::Contour>>> part_contours(mesh.layers.size());
+    std::vector<std::vector<std::optional<vbct::Stage9Result>>> part_stage9(mesh.layers.size());
     // Both walls are tracked independently (see this function's own header doc for why tracking
     // only the canonical wall wasn't sufficient in practice) - both reset together whenever
     // tracking breaks, since they always come from the same Ring domain at the same layer.
@@ -1748,6 +1754,193 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
     // function - only a raw part-count change catches it.
     std::vector<size_t> part_counts(mesh.layers.size(), 0);
 
+    // Phase A (sequential, cheap): each part's VBCT input, built exactly as the live path builds it. The De Minimis
+    // hole decision is the only cross-layer state the input depends on, and it depends only on the geometry, never on
+    // a VBCT result - so every layer's input is known before any VBCT run.
+    {
+        const bool strip_any = mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b");
+        const bool raw_outline = mesh.settings.get<bool>("corrugated_raw_outline_mode");
+        for (size_t layer_nr = 0; layer_nr < mesh.layers.size(); ++layer_nr)
+        {
+            const SliceLayer& layer = mesh.layers[layer_nr];
+            if (layer.parts.empty())
+            {
+                prev_hole_tracks.clear();
+                continue;
+            }
+            part_contours[layer_nr].resize(layer.parts.size());
+            part_stage9[layer_nr].resize(layer.parts.size());
+            {
+                const SliceLayerPart& part = layer.parts[0];
+                // Must be the same geometry FffGcodeWriter::processCorrugatedInfill hands VBCT, which grows
+                // this by infill_overlap_mm (unless a Wall Strip side is active - see that function's own
+                // comment). Stage 9's Ring wall start point, vertex count and winding are sensitive to even
+                // that ~0.02-0.04mm growth, and the anchors decided here (t0_frac as an arc fraction from the
+                // wall's start, plus the winding-direction correction) are only meaningful against a wall
+                // built from identical input: without this, the live wall came out wound the opposite way to
+                // what this pre-pass planned on ~28% of Ring layers, mirroring the stringers there.
+                const Shape corrugation_input_built = buildCorrugationInput(part, mesh.settings);
+                // Chain Wall Strip's boundary expansion only exists for non-Ring, non-raw layers; the live path decides it from the
+                // chain domain it actually finds, which the pre-pass cannot know before running VBCT, so approximate it by shape.
+                const bool chain_strip_assumed = (mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b"))
+                    && ! mesh.settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input_built.size() != 2;
+                const Shape corrugation_input_raw = growCorrugationInput(corrugation_input_built, mesh.settings, chain_strip_assumed);
+
+                // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): decide, with hysteresis, which of
+                // this layer's own holes to treat as ignored for domain-classification purposes, before
+                // anything else in this pre-pass (or any live per-layer call site) ever sees the geometry
+                // - see CorrugationAnchor::suppressed_hole_identities' own doc comment for why this has to
+                // be decided once, here, and only ever applied (never re-decided) everywhere else.
+                {
+                    const double deminimis_area_mm2 = mesh.settings.get<double>("corrugated_deminimis_hole_area");
+                    std::vector<PrevHoleTrack> current_hole_tracks;
+                    for (const Polygon& polygon : corrugation_input_raw)
+                    {
+                        if (polygon.size() < 3 || polygon.area() >= 0.0)
+                        {
+                            continue; // not a hole (Clipper convention: a hole's own signed area is negative)
+                        }
+                        Point2LL sum(0, 0);
+                        for (const Point2LL& p : polygon)
+                        {
+                            sum += p;
+                        }
+                        const Point2LL identity_point = sum / static_cast<coord_t>(polygon.size());
+                        const double area_mm2 = std::abs(polygon.area()) / 1.0e6; // engine units are microns; 1mm^2 == 1e6 micron^2
+
+                        // Match cap - same rationale/fix as filterDeminimisHoles' own identical fixed cap
+                        // (this is the same "presence/absence against a set that may hold entries irrelevant
+                        // to this particular hole" problem, one layer apart in Z rather than one
+                        // re-derivation apart in geometry): without it, a genuinely new/unrelated hole always
+                        // matches *some* previous hole once prev_hole_tracks is non-empty, letting its own
+                        // suppressed state leak across via hysteresis rather than starting fresh from the
+                        // bare-threshold rule. A hole's own layer-to-layer drift is normally sub-millimeter
+                        // even for a tapering model; this stays well clear of that while still rejecting a
+                        // different, unrelated hole several millimeters away.
+                        constexpr double kMaxHoleIdentityDriftMicrons = 2000.0; // 2mm
+                        constexpr double kMaxHoleIdentityDriftMicronsSq = kMaxHoleIdentityDriftMicrons * kMaxHoleIdentityDriftMicrons;
+
+                        const PrevHoleTrack* matched = nullptr;
+                        double best_dist_sq = std::numeric_limits<double>::max();
+                        for (const PrevHoleTrack& prev : prev_hole_tracks)
+                        {
+                            const double dx = static_cast<double>(identity_point.X - prev.identity_point.X);
+                            const double dy = static_cast<double>(identity_point.Y - prev.identity_point.Y);
+                            const double dist_sq = dx * dx + dy * dy;
+                            if (dist_sq < best_dist_sq && dist_sq <= kMaxHoleIdentityDriftMicronsSq)
+                            {
+                                best_dist_sq = dist_sq;
+                                matched = &prev;
+                            }
+                        }
+
+                        // Hysteresis (spec REV 3.0's own confirmed design decision - "require a decisive
+                        // change, not a bare threshold crossing," the same principle this project's other
+                        // continuity fixes already use): a hole already suppressed stays suppressed until
+                        // its own area grows decisively *past* the threshold; a hole not currently
+                        // suppressed only becomes suppressed once its own area shrinks decisively *below*
+                        // it. A hole with no previous match (first tracked layer, a genuinely new hole, or
+                        // immediately after a reset) uses today's bare-threshold default, matching this
+                        // project's own established "new entry picks an arbitrary but deterministic
+                        // default" convention. The exact margin is not yet real-print-validated - see this
+                        // feature's own spec section.
+                        constexpr double kHysteresisMarginFraction = 0.2;
+                        const double margin_mm2 = deminimis_area_mm2 * kHysteresisMarginFraction;
+                        bool suppressed;
+                        if (matched != nullptr)
+                        {
+                            suppressed = matched->suppressed ? (area_mm2 < deminimis_area_mm2 + margin_mm2) : (area_mm2 < deminimis_area_mm2 - margin_mm2);
+                        }
+                        else
+                        {
+                            suppressed = area_mm2 < deminimis_area_mm2;
+                        }
+
+                        current_hole_tracks.push_back(PrevHoleTrack{ identity_point, suppressed });
+                        if (suppressed)
+                        {
+                            result[layer_nr].suppressed_hole_identities.push_back(DeminimisHoleIdentity{ identity_point });
+                        }
+                    }
+                    prev_hole_tracks = std::move(current_hole_tracks);
+                }
+
+                std::vector<std::vector<Point2LL>> unused_ignored_hole_loops; // this pre-pass only needs the classification-time filter, not the geometry itself
+                const Shape corrugation_input = filterDeminimisHoles(corrugation_input_raw, result[layer_nr].suppressed_hole_identities, unused_ignored_hole_loops);
+                part_contours[layer_nr][0] = shapeToContours(corrugation_input);
+            }
+            // The remaining parts use parts[0]'s hole decision, as the live path does.
+            for (size_t part_idx = 1; part_idx < layer.parts.size(); ++part_idx)
+            {
+                const Shape built = buildCorrugationInput(layer.parts[part_idx], mesh.settings);
+                const bool chain_strip_assumed = strip_any && ! raw_outline && built.size() != 2;
+                const Shape grown = growCorrugationInput(built, mesh.settings, chain_strip_assumed);
+                std::vector<std::vector<Point2LL>> unused_ignored_hole_loops;
+                const Shape filtered = filterDeminimisHoles(grown, result[layer_nr].suppressed_hole_identities, unused_ignored_hole_loops);
+                part_contours[layer_nr][part_idx] = shapeToContours(filtered);
+            }
+        }
+    }
+
+    // Phase B (parallel): Stages 1-9 for every part of every layer - independent runs on fixed inputs.
+    {
+        std::vector<std::pair<size_t, size_t>> jobs;
+        for (size_t layer_nr = 0; layer_nr < part_contours.size(); ++layer_nr)
+        {
+            for (size_t part_idx = 0; part_idx < part_contours[layer_nr].size(); ++part_idx)
+            {
+                if (! part_contours[layer_nr][part_idx].empty())
+                {
+                    jobs.emplace_back(layer_nr, part_idx);
+                }
+            }
+        }
+        std::mutex failure_mutex;
+        std::exception_ptr failure;
+        const auto run_job = [&](const size_t job_idx)
+        {
+            const auto [layer_nr, part_idx] = jobs[job_idx];
+            try
+            {
+                const vbct::VbctResult r14 = vbct::run_vbct(part_contours[layer_nr][part_idx], x);
+                const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
+                const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+                const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+                const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+                part_stage9[layer_nr][part_idx] = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+            }
+            catch (const std::runtime_error&)
+            {
+                // VBCT rejected the input: left as nullopt (the live call logs it).
+            }
+            catch (...)
+            {
+                // Anything else escaped this function before; rethrow it after the join instead of letting it
+                // terminate a worker thread.
+                std::lock_guard<std::mutex> lock(failure_mutex);
+                if (! failure)
+                {
+                    failure = std::current_exception();
+                }
+            }
+        };
+        if (Application::getInstance().thread_pool_ != nullptr)
+        {
+            cura::parallel_for<size_t>(0, jobs.size(), run_job);
+        }
+        else
+        {
+            for (size_t job_idx = 0; job_idx < jobs.size(); ++job_idx)
+            {
+                run_job(job_idx);
+            }
+        }
+        if (failure)
+        {
+            std::rethrow_exception(failure);
+        }
+    }
+
     for (size_t layer_nr = 0; layer_nr < mesh.layers.size(); ++layer_nr)
     {
         // Scope limitation (confirmed acceptable - see this function's own header doc): only
@@ -1769,107 +1962,10 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             prev_chain_left_mean.reset();
             prev_chain_right_mean.reset();
             prev_tracked_chain_identity_point.reset();
-            prev_hole_tracks.clear();
             prev_stringer_n.reset();
             continue;
         }
-        const SliceLayerPart& part = layer.parts[0];
-        // Must be the same geometry FffGcodeWriter::processCorrugatedInfill hands VBCT, which grows
-        // this by infill_overlap_mm (unless a Wall Strip side is active - see that function's own
-        // comment). Stage 9's Ring wall start point, vertex count and winding are sensitive to even
-        // that ~0.02-0.04mm growth, and the anchors decided here (t0_frac as an arc fraction from the
-        // wall's start, plus the winding-direction correction) are only meaningful against a wall
-        // built from identical input: without this, the live wall came out wound the opposite way to
-        // what this pre-pass planned on ~28% of Ring layers, mirroring the stringers there.
-        const Shape corrugation_input_built = buildCorrugationInput(part, mesh.settings);
-        // Chain Wall Strip's boundary expansion only exists for non-Ring, non-raw layers; the live path decides it from the
-        // chain domain it actually finds, which the pre-pass cannot know before running VBCT, so approximate it by shape.
-        const bool chain_strip_assumed = (mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b"))
-            && ! mesh.settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input_built.size() != 2;
-        const Shape corrugation_input_raw = growCorrugationInput(corrugation_input_built, mesh.settings, chain_strip_assumed);
-
-        // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): decide, with hysteresis, which of
-        // this layer's own holes to treat as ignored for domain-classification purposes, before
-        // anything else in this pre-pass (or any live per-layer call site) ever sees the geometry
-        // - see CorrugationAnchor::suppressed_hole_identities' own doc comment for why this has to
-        // be decided once, here, and only ever applied (never re-decided) everywhere else.
-        {
-            const double deminimis_area_mm2 = mesh.settings.get<double>("corrugated_deminimis_hole_area");
-            std::vector<PrevHoleTrack> current_hole_tracks;
-            for (const Polygon& polygon : corrugation_input_raw)
-            {
-                if (polygon.size() < 3 || polygon.area() >= 0.0)
-                {
-                    continue; // not a hole (Clipper convention: a hole's own signed area is negative)
-                }
-                Point2LL sum(0, 0);
-                for (const Point2LL& p : polygon)
-                {
-                    sum += p;
-                }
-                const Point2LL identity_point = sum / static_cast<coord_t>(polygon.size());
-                const double area_mm2 = std::abs(polygon.area()) / 1.0e6; // engine units are microns; 1mm^2 == 1e6 micron^2
-
-                // Match cap - same rationale/fix as filterDeminimisHoles' own identical fixed cap
-                // (this is the same "presence/absence against a set that may hold entries irrelevant
-                // to this particular hole" problem, one layer apart in Z rather than one
-                // re-derivation apart in geometry): without it, a genuinely new/unrelated hole always
-                // matches *some* previous hole once prev_hole_tracks is non-empty, letting its own
-                // suppressed state leak across via hysteresis rather than starting fresh from the
-                // bare-threshold rule. A hole's own layer-to-layer drift is normally sub-millimeter
-                // even for a tapering model; this stays well clear of that while still rejecting a
-                // different, unrelated hole several millimeters away.
-                constexpr double kMaxHoleIdentityDriftMicrons = 2000.0; // 2mm
-                constexpr double kMaxHoleIdentityDriftMicronsSq = kMaxHoleIdentityDriftMicrons * kMaxHoleIdentityDriftMicrons;
-
-                const PrevHoleTrack* matched = nullptr;
-                double best_dist_sq = std::numeric_limits<double>::max();
-                for (const PrevHoleTrack& prev : prev_hole_tracks)
-                {
-                    const double dx = static_cast<double>(identity_point.X - prev.identity_point.X);
-                    const double dy = static_cast<double>(identity_point.Y - prev.identity_point.Y);
-                    const double dist_sq = dx * dx + dy * dy;
-                    if (dist_sq < best_dist_sq && dist_sq <= kMaxHoleIdentityDriftMicronsSq)
-                    {
-                        best_dist_sq = dist_sq;
-                        matched = &prev;
-                    }
-                }
-
-                // Hysteresis (spec REV 3.0's own confirmed design decision - "require a decisive
-                // change, not a bare threshold crossing," the same principle this project's other
-                // continuity fixes already use): a hole already suppressed stays suppressed until
-                // its own area grows decisively *past* the threshold; a hole not currently
-                // suppressed only becomes suppressed once its own area shrinks decisively *below*
-                // it. A hole with no previous match (first tracked layer, a genuinely new hole, or
-                // immediately after a reset) uses today's bare-threshold default, matching this
-                // project's own established "new entry picks an arbitrary but deterministic
-                // default" convention. The exact margin is not yet real-print-validated - see this
-                // feature's own spec section.
-                constexpr double kHysteresisMarginFraction = 0.2;
-                const double margin_mm2 = deminimis_area_mm2 * kHysteresisMarginFraction;
-                bool suppressed;
-                if (matched != nullptr)
-                {
-                    suppressed = matched->suppressed ? (area_mm2 < deminimis_area_mm2 + margin_mm2) : (area_mm2 < deminimis_area_mm2 - margin_mm2);
-                }
-                else
-                {
-                    suppressed = area_mm2 < deminimis_area_mm2;
-                }
-
-                current_hole_tracks.push_back(PrevHoleTrack{ identity_point, suppressed });
-                if (suppressed)
-                {
-                    result[layer_nr].suppressed_hole_identities.push_back(DeminimisHoleIdentity{ identity_point });
-                }
-            }
-            prev_hole_tracks = std::move(current_hole_tracks);
-        }
-
-        std::vector<std::vector<Point2LL>> unused_ignored_hole_loops; // this pre-pass only needs the classification-time filter, not the geometry itself
-        const Shape corrugation_input = filterDeminimisHoles(corrugation_input_raw, result[layer_nr].suppressed_hole_identities, unused_ignored_hole_loops);
-        const std::vector<vbct::Contour> contours = shapeToContours(corrugation_input);
+        const std::vector<vbct::Contour>& contours = part_contours[layer_nr][0];
         if (contours.empty())
         {
             prev_canonical_anchor_point.reset();
@@ -1886,20 +1982,8 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             continue;
         }
 
-        vbct::Stage9Result r9;
-        try
+        if (! part_stage9[layer_nr][0].has_value())
         {
-            const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
-            const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
-            const vbct::Stage6Result r6 = vbct::run_stage6(r5);
-            const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
-            const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
-            r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
-            part0_stage9[layer_nr].emplace(r9);
-        }
-        catch (const std::runtime_error&)
-        {
-            part0_stage9[layer_nr].emplace(std::nullopt);
             // VBCT rejects input it can't handle (a self-intersecting ring after this engine's
             // own polygon simplification, etc.) - not this function's job to log it, since the
             // per-layer corrugate() call for this exact layer hits the identical rejection and
@@ -1918,6 +2002,7 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             prev_stringer_n.reset();
             continue;
         }
+        vbct::Stage9Result r9 = *part_stage9[layer_nr][0]; // a copy - the per-part Chain tracking pass below consumes the stored one
 
         // Chain junction (Hub) support (spec REV 2.1): fold any straight pass-through pair of
         // Chain domains sharing a hub point back into one continuous Chain, before any of this
@@ -2661,55 +2746,23 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
     // part of every layer. The pre-pass above only looks at parts[0], but a slot can split a layer into separate parts
     // (both halves of a fuselage around a hatch): the live path corrugates each part independently, so each part's
     // Chain domains need their own tracking or they fall back to Stage 9's per-layer cap_start and flip ends/direction.
-    // Builds each part's input exactly as the live path does (buildCorrugationInput + growCorrugationInput + the same
-    // suppressed-hole filter), so identities match the live call's domains.
+    // Uses each part's input and Stage 9 result from Phase A/B above (built exactly as the live path builds them), so
+    // identities match the live call's domains.
     {
-        const bool strip_any = mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b");
-        const bool raw_outline = mesh.settings.get<bool>("corrugated_raw_outline_mode");
         std::vector<ChainTrackState> prev_tracks;
         for (size_t layer_nr = 0; layer_nr < result.size(); ++layer_nr)
         {
             std::vector<ChainTrackState> next_tracks;
             std::vector<ChainDomainTrack> tracks_out;
             std::vector<bool> prev_used(prev_tracks.size(), false);
-            for (size_t part_idx = 0; part_idx < mesh.layers[layer_nr].parts.size(); ++part_idx)
+            for (size_t part_idx = 0; part_idx < part_contours[layer_nr].size(); ++part_idx)
             {
-                const SliceLayerPart& part = mesh.layers[layer_nr].parts[part_idx];
-                const Shape built = buildCorrugationInput(part, mesh.settings);
-                const bool chain_strip_assumed = strip_any && ! raw_outline && built.size() != 2;
-                const Shape grown = growCorrugationInput(built, mesh.settings, chain_strip_assumed);
-                std::vector<std::vector<Point2LL>> unused_ignored_hole_loops;
-                const Shape filtered = filterDeminimisHoles(grown, result[layer_nr].suppressed_hole_identities, unused_ignored_hole_loops);
-                const std::vector<vbct::Contour> contours = shapeToContours(filtered);
-                if (contours.empty())
+                const std::vector<vbct::Contour>& contours = part_contours[layer_nr][part_idx];
+                if (contours.empty() || ! part_stage9[layer_nr][part_idx].has_value())
                 {
-                    continue;
+                    continue; // no geometry, or VBCT rejected it (the live call hits the same rejection and logs it)
                 }
-                vbct::Stage9Result r9;
-                if (part_idx == 0 && part0_stage9[layer_nr].has_value())
-                {
-                    if (! part0_stage9[layer_nr]->has_value())
-                    {
-                        continue; // the main pass's VBCT run rejected this same input
-                    }
-                    r9 = std::move(**part0_stage9[layer_nr]);
-                }
-                else
-                {
-                    try
-                    {
-                        const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
-                        const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
-                        const vbct::Stage6Result r6 = vbct::run_stage6(r5);
-                        const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
-                        const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
-                        r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
-                    }
-                    catch (const std::runtime_error&)
-                    {
-                        continue; // the live call hits the same rejection and logs it
-                    }
-                }
+                vbct::Stage9Result r9 = std::move(*part_stage9[layer_nr][part_idx]);
                 // Same pass-through merge as the tracked-Chain block above and corrugateLinkedSkin, so domains match.
                 r9.domains = mergeStraightPassThroughChains(std::move(r9.domains), chain_junction_merge_angle_deg);
                 trackChainDomains(r9, contours, prev_tracks, prev_used, next_tracks, tracks_out);
