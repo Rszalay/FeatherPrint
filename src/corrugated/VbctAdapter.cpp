@@ -4,6 +4,8 @@
 #include "corrugated/VbctAdapter.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <exception>
 #include <limits>
@@ -12,6 +14,7 @@
 #include <unordered_map>
 #include <stdexcept>
 
+#include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
 #include "Application.h"
@@ -29,6 +32,7 @@
 #include "stage7.hpp" // rather than via run_full_pipeline, since it needs the Stage 9 domain data
 #include "stage8.hpp" // itself (Ring/Chain/Glob composition, wall point arrays), not just Stage
 #include "stage9.hpp" // 10's final stringers.
+#include "voronoi_decomp.hpp" // vbct::decompose_voronoi (corrugated_decomposition = voronoi)
 #include "wall_ab_assignment.hpp" // vbct::assign_wall_ab - Chain Wall A/B canonical assignment
 
 namespace cura
@@ -211,6 +215,11 @@ static std::vector<vbct::ChainDomainOverride> toChainDomainOverrides(const std::
 class Stage9Memo
 {
 public:
+    explicit Stage9Memo(bool voronoi)
+        : voronoi_(voronoi)
+    {
+    }
+
     // Stages 1-9 for `contours`, from the cache when this exact input was run before. Throws the same
     // std::runtime_error message a fresh run would when VBCT rejects the input.
     std::shared_ptr<const vbct::Stage9Result> getOrRun(const std::vector<vbct::Contour>& contours, const double x, const double threshold_mm)
@@ -226,12 +235,19 @@ public:
         Entry entry{ contours, x, threshold_mm, nullptr, {} };
         try
         {
-            const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
-            const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
-            const vbct::Stage6Result r6 = vbct::run_stage6(r5);
-            const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
-            const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
-            entry.stage9 = std::make_shared<const vbct::Stage9Result>(vbct::run_stage9(r5, r6, r7, r8, threshold_mm));
+            if (voronoi_)
+            {
+                entry.stage9 = std::make_shared<const vbct::Stage9Result>(vbct::decompose_voronoi(contours, threshold_mm));
+            }
+            else
+            {
+                const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
+                const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
+                const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+                const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+                const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+                entry.stage9 = std::make_shared<const vbct::Stage9Result>(vbct::run_stage9(r5, r6, r7, r8, threshold_mm));
+            }
         }
         catch (const std::runtime_error& e)
         {
@@ -301,11 +317,12 @@ private:
 
     std::mutex mutex_;
     std::unordered_multimap<size_t, Entry> entries_;
+    bool voronoi_;
 };
 
-std::shared_ptr<Stage9Memo> makeStage9Memo()
+std::shared_ptr<Stage9Memo> makeStage9Memo(const bool voronoi)
 {
-    return std::make_shared<Stage9Memo>();
+    return std::make_shared<Stage9Memo>(voronoi);
 }
 
 namespace
@@ -324,6 +341,105 @@ vbct::Stage9Result runStages1to9(const std::vector<vbct::Contour>& contours, con
     const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
     const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
     return vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+}
+
+// Slice-view debug dump (developer tool, see tools/slice_view.py): when FP_SLICE_DUMP names a directory, the
+// pre-pass writes one JSON file per part for the layers in FP_SLICE_DUMP_LAYERS ("a-b" or "n"; default all) with the
+// input outline, both decompositions' domains and the medial-axis graph with each edge's pruning status.
+void writeSliceDump(const size_t layer_nr, const size_t part_idx, const std::vector<vbct::Contour>& contours, const double x, const double threshold_mm)
+{
+    const char* dir = std::getenv("FP_SLICE_DUMP");
+    if (dir == nullptr || *dir == '\0')
+    {
+        return;
+    }
+    if (const char* range = std::getenv("FP_SLICE_DUMP_LAYERS"))
+    {
+        long lo = 0, hi = 0;
+        const int n = std::sscanf(range, "%ld-%ld", &lo, &hi);
+        if (n == 1)
+        {
+            hi = lo;
+        }
+        if (n >= 1 && (static_cast<long>(layer_nr) < lo || static_cast<long>(layer_nr) > hi))
+        {
+            return;
+        }
+    }
+    auto pt = [](const vbct::Point2& p) { return fmt::format("[{:.4f},{:.4f}]", p.x, p.y); };
+    auto poly = [&](const std::vector<vbct::Point2>& ps)
+    {
+        std::string s = "[";
+        for (size_t i = 0; i < ps.size(); ++i)
+        {
+            s += (i ? "," : "") + pt(ps[i]);
+        }
+        return s + "]";
+    };
+    auto domains = [&](const vbct::Stage9Result& r)
+    {
+        std::string s = "[";
+        for (size_t i = 0; i < r.domains.size(); ++i)
+        {
+            const vbct::Domain& d = r.domains[i];
+            s += fmt::format(
+                "{}{{\"kind\":\"{}\",\"left\":{},\"right\":{},\"cap_start\":{},\"cap_end\":{}}}",
+                i ? "," : "",
+                d.kind,
+                d.left ? poly(d.left->points) : "[]",
+                d.right ? poly(d.right->points) : "[]",
+                d.cap_start ? pt(*d.cap_start) : "null",
+                d.cap_end ? pt(*d.cap_end) : "null");
+        }
+        return s + "]";
+    };
+    std::string outline = "[";
+    for (size_t i = 0; i < contours.size(); ++i)
+    {
+        std::vector<vbct::Point2> ps;
+        for (const vbct::Point2i& p : contours[i].points)
+        {
+            ps.push_back({ static_cast<double>(p.x) / vbct::SCALE, static_cast<double>(p.y) / vbct::SCALE });
+        }
+        outline += (i ? "," : "") + poly(ps);
+    }
+    outline += "]";
+    std::string cdt = "null", vor = "null", graph = "[]";
+    try
+    {
+        cdt = domains(runStages1to9(contours, x, threshold_mm, nullptr));
+    }
+    catch (const std::runtime_error&)
+    {
+    }
+    try
+    {
+        vbct::VoronoiDebug dbg;
+        vor = domains(vbct::decompose_voronoi(contours, threshold_mm, &dbg));
+        graph = "[";
+        for (size_t i = 0; i < dbg.edges.size(); ++i)
+        {
+            graph += fmt::format("{}{{\"s\":{},\"r\":{:.2f},\"p\":{}}}", i ? "," : "", dbg.edges[i].status, dbg.edges[i].ratio, poly(dbg.edges[i].points));
+        }
+        graph += "]";
+    }
+    catch (const std::runtime_error&)
+    {
+    }
+    const std::string path = fmt::format("{}/layer{:04d}_part{}.json", dir, layer_nr, part_idx);
+    if (FILE* f = std::fopen(path.c_str(), "w"))
+    {
+        std::fprintf(
+            f,
+            "{\"layer\":%zu,\"part\":%zu,\"outline\":%s,\"cdt\":%s,\"voronoi\":%s,\"graph\":%s}\n",
+            layer_nr,
+            part_idx,
+            outline.c_str(),
+            cdt.c_str(),
+            vor.c_str(),
+            graph.c_str());
+        std::fclose(f);
+    }
 }
 
 } // namespace
@@ -2023,6 +2139,7 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             const auto [layer_nr, part_idx] = jobs[job_idx];
             try
             {
+                writeSliceDump(layer_nr, part_idx, part_contours[layer_nr][part_idx], x, threshold_mm);
                 part_stage9[layer_nr][part_idx] = runStages1to9(part_contours[layer_nr][part_idx], x, threshold_mm, mesh.corrugation_stage9_memo.get());
             }
             catch (const std::runtime_error&)

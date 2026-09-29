@@ -3007,6 +3007,21 @@
                     "settable_per_mesh": true,
                     "settable_globally": true
                 },
+                "corrugated_decomposition":
+                {
+                    "label": "Corrugated Decomposition",
+                    "description": "How each slice is split into Ring and Chain domains. Triangulation builds a skeleton from a constrained Delaunay triangulation of the outline plus a set of corrections. Medial Axis takes the exact medial axis of the outline from a segment Voronoi diagram, pruned by corridor width, which does not depend on how the outline is sampled. Medial Axis is experimental.",
+                    "type": "enum",
+                    "options":
+                    {
+                        "cdt": "Triangulation",
+                        "voronoi": "Medial Axis"
+                    },
+                    "default_value": "cdt",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
                 "corrugated_wall_pairing":
                 {
                     "label": "Corrugated Wall Pairing",

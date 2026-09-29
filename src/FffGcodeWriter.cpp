@@ -343,7 +343,7 @@ void FffGcodeWriter::computeCorrugationAnchors(SliceDataStorage& storage) const
         {
             continue;
         }
-        mesh.corrugation_stage9_memo = VbctAdapter::makeStage9Memo();
+        mesh.corrugation_stage9_memo = VbctAdapter::makeStage9Memo(mesh.settings.get<std::string>("corrugated_decomposition") == "voronoi");
         mesh.corrugation_anchors = VbctAdapter::computeAnchorsForMesh(mesh);
     }
 }

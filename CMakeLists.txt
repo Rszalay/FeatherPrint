@@ -207,6 +207,7 @@ set(engine_SRCS # Except main.cpp.
 
         src/vbct/contour.cpp
         src/vbct/harmonic.cpp
+        src/vbct/voronoi_decomp.cpp
         src/vbct/mesh.cpp
         src/vbct/pipeline.cpp
         src/vbct/stage10.cpp

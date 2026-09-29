@@ -28,6 +28,7 @@
 #include "stage7.hpp"
 #include "stage8.hpp"
 #include "stage9.hpp"
+#include "voronoi_decomp.hpp"
 
 #include "real_tab_geometry.h"
 #include "real_tab_geometry_multiz.h"
@@ -3701,6 +3702,65 @@ TEST(VbctAdapterTest, AlignedAndHarmonicPairingGiveShorterRungsOnOffCentreRing)
     const double arc_mean = mean_length(arc.domains[0].stringers);
     const double aligned_mean = mean_length(a);
     EXPECT_LT(aligned_mean, arc_mean) << name << " " << aligned_mean << " vs arc-length " << arc_mean;
+    }
+}
+
+/*!
+ * Medial-axis decomposition (corrugated_decomposition = voronoi): a plain bar is one Chain whose walls run corner to
+ * corner along the long sides with the caps at the end faces' midpoints; a bar with one rounded end caps that end at
+ * its tip; a concentric annulus is one Ring whose walls are the two whole contours.
+ */
+TEST(VbctAdapterTest, VoronoiDecompositionBarRoundedEndAndRing)
+{
+    auto contours_of = [](const Shape& shape) { return VbctAdapter::shapeToContours(shape); };
+    {
+        Shape bar;
+        bar.push_back(makeRectPolygon(0, 0, 60000, 10000));
+        const vbct::Stage9Result r = vbct::decompose_voronoi(contours_of(bar), 0.8);
+        ASSERT_EQ(r.domains.size(), 1u);
+        const vbct::Domain& d = r.domains[0];
+        ASSERT_EQ(d.kind, "chain");
+        ASSERT_TRUE(d.cap_start && d.cap_end && d.left && d.right);
+        const double xa = std::min(d.cap_start->x, d.cap_end->x), xb = std::max(d.cap_start->x, d.cap_end->x);
+        EXPECT_NEAR(xa, 0.0, 0.05);
+        EXPECT_NEAR(xb, 60.0, 0.05);
+        EXPECT_NEAR(d.cap_start->y, 5.0, 0.05);
+        EXPECT_NEAR(d.cap_end->y, 5.0, 0.05);
+        EXPECT_NEAR(vbct::wall_length(d.left->points), 60.0, 0.1) << "a wall runs corner to corner, without the end faces";
+        EXPECT_NEAR(vbct::wall_length(d.right->points), 60.0, 0.1);
+    }
+    {
+        Polygon rounded; // 40mm x 10mm, right end a semicircle of radius 5 centred at (40, 5)
+        rounded.push_back(Point2LL(0, 0));
+        rounded.push_back(Point2LL(40000, 0));
+        for (int k = 1; k < 24; ++k)
+        {
+            const double a = -std::numbers::pi / 2.0 + k * std::numbers::pi / 24.0;
+            rounded.push_back(Point2LL(40000 + static_cast<coord_t>(5000 * std::cos(a)), 5000 + static_cast<coord_t>(5000 * std::sin(a))));
+        }
+        rounded.push_back(Point2LL(40000, 10000));
+        rounded.push_back(Point2LL(0, 10000));
+        Shape shape;
+        shape.push_back(rounded);
+        const vbct::Stage9Result r = vbct::decompose_voronoi(contours_of(shape), 0.8);
+        ASSERT_EQ(r.domains.size(), 1u);
+        const vbct::Domain& d = r.domains[0];
+        ASSERT_TRUE(d.cap_start && d.cap_end);
+        const vbct::Point2 tip = d.cap_start->x > d.cap_end->x ? *d.cap_start : *d.cap_end;
+        EXPECT_NEAR(tip.x, 45.0, 0.1) << "the rounded end is capped at its tip";
+        EXPECT_NEAR(tip.y, 5.0, 0.1);
+    }
+    {
+        Shape ring;
+        ring.push_back(makeCirclePolygon(0, 0, 30000, 64));
+        ring.push_back(makeCirclePolygon(0, 0, 15000, 48));
+        const vbct::Stage9Result r = vbct::decompose_voronoi(contours_of(ring), 0.8);
+        ASSERT_EQ(r.domains.size(), 1u);
+        EXPECT_EQ(r.domains[0].kind, "ring");
+        ASSERT_TRUE(r.domains[0].left && r.domains[0].right);
+        const double la = vbct::wall_length(r.domains[0].left->points), lb = vbct::wall_length(r.domains[0].right->points);
+        EXPECT_NEAR(std::max(la, lb), 2 * std::numbers::pi * 30.0, 1.0);
+        EXPECT_NEAR(std::min(la, lb), 2 * std::numbers::pi * 15.0, 1.0);
     }
 }
 

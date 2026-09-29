@@ -85,7 +85,8 @@ Shape filterDeminimisHoles(const Shape& shape, const std::vector<DeminimisHoleId
  * by SliceMeshStorage::corrugation_stage9_memo; a null pointer anywhere below just means "no cache, run it".
  */
 class Stage9Memo;
-std::shared_ptr<Stage9Memo> makeStage9Memo();
+// voronoi: decompose with the medial axis (vbct::decompose_voronoi) instead of VBCT Stages 1-9 (corrugated_decomposition).
+std::shared_ptr<Stage9Memo> makeStage9Memo(bool voronoi = false);
 
 struct TransitionLayerRequest
 {
