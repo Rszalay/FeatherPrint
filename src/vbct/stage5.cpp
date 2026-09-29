@@ -5,6 +5,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <span>
 #include <unordered_map>
 
 #include "tri_query.hpp"
@@ -74,9 +75,23 @@ SliverFlipResult flip_sliver_triangles(const std::vector<Point2>& vertices, std:
                                         const std::set<Edge>& boundary_edges, double height_epsilon) {
     int flip_count = 0;
     bool changed = true;
+    // Built once and kept up to date across flips (a flip only replaces triangles si and ni) instead of being
+    // rebuilt from scratch after every flip. Per edge only the set of triangles matters here - an edge is used
+    // only when it has exactly two - so updating in place gives the same answers a rebuild would.
+    auto e2t = edge_to_tris(triangles);
+    auto remove_tri = [&e2t](const Triangle& t, int idx) {
+        for (const auto& [a, b] : tri_raw_edges(t)) {
+            auto it = e2t.find(make_edge(a, b));
+            auto pos = std::find(it->second.begin(), it->second.end(), idx);
+            it->second.erase(pos);
+            if (it->second.empty()) e2t.erase(it);
+        }
+    };
+    auto add_tri = [&e2t](const Triangle& t, int idx) {
+        for (const auto& [a, b] : tri_raw_edges(t)) e2t[make_edge(a, b)].push_back(idx);
+    };
     while (changed) {
         changed = false;
-        auto e2t = edge_to_tris(triangles);
         for (int si = 0; si < static_cast<int>(triangles.size()) && !changed; ++si) {
             const Triangle& S = triangles[si];
             if (triangle_height(vertices[S[0]], vertices[S[1]], vertices[S[2]]) >= height_epsilon) continue;
@@ -109,8 +124,13 @@ SliverFlipResult flip_sliver_triangles(const std::vector<Point2>& vertices, std:
                 if (sign_eps(signed_area2(vertices[t1[0]], vertices[t1[1]], vertices[t1[2]])) != ref_sign) std::swap(t1[1], t1[2]);
                 if (sign_eps(signed_area2(vertices[t2[0]], vertices[t2[1]], vertices[t2[2]])) != ref_sign) std::swap(t2[1], t2[2]);
 
+                const Triangle old_s = S, old_n = N;
                 triangles[si] = t1;
                 triangles[ni] = t2;
+                remove_tri(old_s, si);
+                remove_tri(old_n, ni);
+                add_tri(t1, si);
+                add_tri(t2, ni);
                 ++flip_count;
                 changed = true;
                 break;
@@ -325,20 +345,43 @@ struct Correction1Result {
 // processes the first eligible vertex in this order and restarts, so
 // order fidelity (not just eligibility-set fidelity) is preserved here on
 // purpose, even though it isn't proven necessary for the final result.
-std::vector<std::pair<int, std::vector<int>>> vertex_to_tris_ordered(const std::vector<Triangle>& triangles) {
-    std::unordered_map<int, size_t> index_of;
-    std::vector<std::pair<int, std::vector<int>>> result;
-    for (int i = 0; i < static_cast<int>(triangles.size()); ++i) {
-        for (int v : triangles[i]) {
-            auto it = index_of.find(v);
-            if (it == index_of.end()) {
-                index_of[v] = result.size();
-                result.push_back({v, {}});
-                it = index_of.find(v);
+// Flat (CSR) form of that map: `order` holds the vertices in first-seen order, and vertex order[k]'s incident
+// triangle indices (ascending, one entry per occurrence - same as the map's push_back order) are
+// tris[start[k] .. start[k+1]). Rebuilt after every merge by the fixed-point loops below, so it avoids the hash map
+// and the per-vertex vectors, which were most of Stage 5's time.
+struct VertexTris {
+    std::vector<int> order;
+    std::vector<int> start;
+    std::vector<int> tris;
+
+    size_t size() const { return order.size(); }
+    int vertex(size_t k) const { return order[k]; }
+    std::span<const int> tris_of(size_t k) const { return {tris.data() + start[k], tris.data() + start[k + 1]}; }
+};
+
+VertexTris vertex_to_tris_ordered(const std::vector<Triangle>& triangles) {
+    int max_v = -1;
+    for (const Triangle& t : triangles)
+        for (int v : t) max_v = std::max(max_v, v);
+    std::vector<int> pos(static_cast<size_t>(max_v + 1), -1);
+    std::vector<int> count;
+    VertexTris result;
+    for (const Triangle& t : triangles) {
+        for (int v : t) {
+            if (pos[v] < 0) {
+                pos[v] = static_cast<int>(result.order.size());
+                result.order.push_back(v);
+                count.push_back(0);
             }
-            result[it->second].second.push_back(i);
+            ++count[pos[v]];
         }
     }
+    result.start.resize(result.order.size() + 1, 0);
+    for (size_t k = 0; k < result.order.size(); ++k) result.start[k + 1] = result.start[k] + count[k];
+    result.tris.resize(static_cast<size_t>(result.start.back()));
+    std::vector<int> cursor(result.start.begin(), result.start.end() - 1);
+    for (int i = 0; i < static_cast<int>(triangles.size()); ++i)
+        for (int v : triangles[i]) result.tris[cursor[pos[v]]++] = i;
     return result;
 }
 
@@ -350,7 +393,9 @@ Correction1Result correct_straight_vertices(std::vector<Triangle> triangles, con
         auto vtx_to_tris = vertex_to_tris_ordered(triangles);
         bool changed = false;
 
-        for (auto& [p, tri_idxs] : vtx_to_tris) {
+        for (size_t k = 0; k < vtx_to_tris.size(); ++k) {
+            const int p = vtx_to_tris.vertex(k);
+            const std::span<const int> tri_idxs = vtx_to_tris.tris_of(k);
             if (!is_vbs_point[p] || tri_idxs.size() != 2) continue;
             int t1i = tri_idxs[0], t2i = tri_idxs[1];
             std::set<int> t1(triangles[t1i].begin(), triangles[t1i].end());
@@ -978,7 +1023,9 @@ Correction1cResult correct_straight_vertices_k3(std::vector<Triangle> triangles,
         auto vtx_to_tris = vertex_to_tris_ordered(triangles);
         bool changed = false;
 
-        for (auto& [v, tri_idxs] : vtx_to_tris) {
+        for (size_t k = 0; k < vtx_to_tris.size(); ++k) {
+            const int v = vtx_to_tris.vertex(k);
+            const std::span<const int> tri_idxs = vtx_to_tris.tris_of(k);
             // Upper bound on K, not just a lower one: a VBS point with a
             // huge number of incident triangles is not the debridge-created
             // "one hop from a junction" shape this correction targets -- it
@@ -1063,7 +1110,7 @@ Correction1cResult correct_straight_vertices_k3(std::vector<Triangle> triangles,
             auto retriangulated = ear_clip_gated(chain, vertices, /*height_epsilon=*/0.05, chain_length_limit);
             if (!retriangulated.has_value()) continue;
 
-            std::vector<int> desc = tri_idxs;
+            std::vector<int> desc(tri_idxs.begin(), tri_idxs.end());
             std::sort(desc.rbegin(), desc.rend());
             for (int ti : desc) triangles.erase(triangles.begin() + ti);
             for (const Triangle& t : *retriangulated) triangles.push_back(t);
