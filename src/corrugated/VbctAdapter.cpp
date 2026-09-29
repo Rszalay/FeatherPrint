@@ -1623,6 +1623,10 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
     const coord_t vbct_stringer_pitch = mesh.settings.get<coord_t>("corrugated_stringer_pitch");
 
     std::vector<CorrugationAnchor> result(mesh.layers.size());
+    // Stage 9 output for parts[0] of each layer, kept from the main pass below so the per-part Chain tracking pass at
+    // the end reuses it instead of running Stages 1-9 on the identical input a second time. nullopt: not run (fall
+    // back to computing it); a value with no Stage9Result: VBCT rejected the input.
+    std::vector<std::optional<std::optional<vbct::Stage9Result>>> part0_stage9(mesh.layers.size());
     // Both walls are tracked independently (see this function's own header doc for why tracking
     // only the canonical wall wasn't sufficient in practice) - both reset together whenever
     // tracking breaks, since they always come from the same Ring domain at the same layer.
@@ -1891,9 +1895,11 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
             const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
             r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+            part0_stage9[layer_nr].emplace(r9);
         }
         catch (const std::runtime_error&)
         {
+            part0_stage9[layer_nr].emplace(std::nullopt);
             // VBCT rejects input it can't handle (a self-intersecting ring after this engine's
             // own polygon simplification, etc.) - not this function's job to log it, since the
             // per-layer corrugate() call for this exact layer hits the identical rejection and
@@ -2666,8 +2672,9 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             std::vector<ChainTrackState> next_tracks;
             std::vector<ChainDomainTrack> tracks_out;
             std::vector<bool> prev_used(prev_tracks.size(), false);
-            for (const SliceLayerPart& part : mesh.layers[layer_nr].parts)
+            for (size_t part_idx = 0; part_idx < mesh.layers[layer_nr].parts.size(); ++part_idx)
             {
+                const SliceLayerPart& part = mesh.layers[layer_nr].parts[part_idx];
                 const Shape built = buildCorrugationInput(part, mesh.settings);
                 const bool chain_strip_assumed = strip_any && ! raw_outline && built.size() != 2;
                 const Shape grown = growCorrugationInput(built, mesh.settings, chain_strip_assumed);
@@ -2679,18 +2686,29 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
                     continue;
                 }
                 vbct::Stage9Result r9;
-                try
+                if (part_idx == 0 && part0_stage9[layer_nr].has_value())
                 {
-                    const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
-                    const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
-                    const vbct::Stage6Result r6 = vbct::run_stage6(r5);
-                    const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
-                    const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
-                    r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+                    if (! part0_stage9[layer_nr]->has_value())
+                    {
+                        continue; // the main pass's VBCT run rejected this same input
+                    }
+                    r9 = std::move(**part0_stage9[layer_nr]);
                 }
-                catch (const std::runtime_error&)
+                else
                 {
-                    continue; // the live call hits the same rejection and logs it
+                    try
+                    {
+                        const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
+                        const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
+                        const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+                        const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+                        const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+                        r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+                    }
+                    catch (const std::runtime_error&)
+                    {
+                        continue; // the live call hits the same rejection and logs it
+                    }
                 }
                 // Same pass-through merge as the tracked-Chain block above and corrugateLinkedSkin, so domains match.
                 r9.domains = mergeStraightPassThroughChains(std::move(r9.domains), chain_junction_merge_angle_deg);
