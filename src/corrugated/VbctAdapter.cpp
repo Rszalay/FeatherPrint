@@ -2816,44 +2816,13 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
         // (including why this match must be capped, unlike chain_domain_wall_identities' own
         // uncapped nearest-match). A separate loop from the whole-part one above, not merged with
         // it, so the two trigger mechanisms stay independently reasoned-about.
-        constexpr double kChainDomainAppearCapMicrons = 10000.0; // 10mm - materially larger than
-            // De Minimis Hole Threshold's own 2mm cap (VbctAdapter.cpp's filterDeminimisHoles): a
-            // whole domain's own mean point can move meaningfully more between layers than a small
-            // hole's own centroid does. Placeholder value, pending real-print tuning like every
-            // other first-shipped tuning constant in this project.
-        constexpr double kChainDomainAppearCapMicronsSq = kChainDomainAppearCapMicrons * kChainDomainAppearCapMicrons;
 
         for (size_t layer_nr = 0; layer_nr < result.size(); ++layer_nr)
         {
             const bool prev_has_ring = (layer_nr > 0) && result[layer_nr - 1].has_ring;
             result[layer_nr].ring_transition_layer_triggered = result[layer_nr].has_ring && ! prev_has_ring;
 
-            if (! result[layer_nr].chain_domain_wall_identities.empty())
-            {
-                const std::vector<ChainDomainWallIdentity> empty_prev_identities;
-                const std::vector<ChainDomainWallIdentity>& prev_identities
-                    = (layer_nr > 0) ? result[layer_nr - 1].chain_domain_wall_identities : empty_prev_identities;
-                std::vector<Point2LL> appeared;
-                for (const ChainDomainWallIdentity& current : result[layer_nr].chain_domain_wall_identities)
-                {
-                    bool matched_prev = false;
-                    for (const ChainDomainWallIdentity& prev : prev_identities)
-                    {
-                        const double dx = static_cast<double>(current.identity_point.X - prev.identity_point.X);
-                        const double dy = static_cast<double>(current.identity_point.Y - prev.identity_point.Y);
-                        if (dx * dx + dy * dy <= kChainDomainAppearCapMicronsSq)
-                        {
-                            matched_prev = true;
-                            break;
-                        }
-                    }
-                    if (! matched_prev)
-                    {
-                        appeared.push_back(current.identity_point);
-                    }
-                }
-                result[layer_nr].chain_transition_layer_domain_identities = std::move(appeared);
-            }
+            // Chain domains: decided after the per-part tracking pass below, against every part's Chains.
         }
     }
 
@@ -2885,6 +2854,48 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             }
             result[layer_nr].chain_domain_tracks = std::move(tracks_out);
             prev_tracks = std::move(next_tracks);
+        }
+    }
+
+    // Transition Layer, per-Chain-domain trigger: a Chain domain with no Chain domain within the cap on the previous
+    // layer, in ANY part, has just appeared. Checked across all parts (chain_domain_tracks), not parts[0] alone:
+    // Cura's part order can swap which half of a split section is parts[0] from one layer to the next, and a
+    // parts[0]-only check then saw the other half "appear" at every swap - one-layer solid fills alternating between
+    // the halves, at layers that moved with the model's orientation on the plate (FPTF-45 Body, 17 layers at 0 deg,
+    // none at 180 deg).
+    if (mesh.settings.get<bool>("corrugated_transition_layer_enabled"))
+    {
+        constexpr double kChainDomainAppearCapMicrons = 10000.0; // 10mm - materially larger than
+            // De Minimis Hole Threshold's own 2mm cap (VbctAdapter.cpp's filterDeminimisHoles): a
+            // whole domain's own mean point can move meaningfully more between layers than a small
+            // hole's own centroid does. Placeholder value, pending real-print tuning like every
+            // other first-shipped tuning constant in this project.
+        constexpr double kChainDomainAppearCapMicronsSq = kChainDomainAppearCapMicrons * kChainDomainAppearCapMicrons;
+        for (size_t layer_nr = 0; layer_nr < result.size(); ++layer_nr)
+        {
+            std::vector<Point2LL> appeared;
+            for (const ChainDomainTrack& current : result[layer_nr].chain_domain_tracks)
+            {
+                bool matched_prev = false;
+                if (layer_nr > 0)
+                {
+                    for (const ChainDomainTrack& prev : result[layer_nr - 1].chain_domain_tracks)
+                    {
+                        const double dx = static_cast<double>(current.identity_point.X - prev.identity_point.X);
+                        const double dy = static_cast<double>(current.identity_point.Y - prev.identity_point.Y);
+                        if (dx * dx + dy * dy <= kChainDomainAppearCapMicronsSq)
+                        {
+                            matched_prev = true;
+                            break;
+                        }
+                    }
+                }
+                if (! matched_prev)
+                {
+                    appeared.push_back(current.identity_point);
+                }
+            }
+            result[layer_nr].chain_transition_layer_domain_identities = std::move(appeared);
         }
     }
 
