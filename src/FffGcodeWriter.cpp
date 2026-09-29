@@ -343,6 +343,7 @@ void FffGcodeWriter::computeCorrugationAnchors(SliceDataStorage& storage) const
         {
             continue;
         }
+        mesh.corrugation_stage9_memo = VbctAdapter::makeStage9Memo();
         mesh.corrugation_anchors = VbctAdapter::computeAnchorsForMesh(mesh);
     }
 }
@@ -1983,7 +1984,8 @@ void FffGcodeWriter::addMeshPartToGCode(
                 part,
                 mesh.settings,
                 mesh.corrugation_anchors[strip_layer_nr].chain_domain_wall_identities,
-                mesh.corrugation_anchors[strip_layer_nr].suppressed_hole_identities);
+                mesh.corrugation_anchors[strip_layer_nr].suppressed_hole_identities,
+                mesh.corrugation_stage9_memo.get());
             std::vector<std::vector<Point2LL>> chain_strip_sets;
             for (const VbctAdapter::ChainWallPoints& chain_walls : all_chain_walls)
             {
@@ -2688,7 +2690,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
             part,
             mesh.settings,
             mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_wall_identities,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities);
+            mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
+            mesh.corrugation_stage9_memo.get());
         // Same half-infill_line_width inset convention expandCorrugationInputForStrippedWalls uses
         // for Ring, computed the same way (VbctAdapter.cpp) - the corrugation's own centerline
         // prints at infill_line_width, not zero width, so it needs to sit half that width in from
@@ -2879,7 +2882,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
             mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
             chain_swap_left_right,
             transition_layer_request,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
+            mesh.corrugation_stage9_memo.get());
         stringer_lines_are_linked_skin = stringer_lines.has_value();
     }
     if (! stringer_lines.has_value())
@@ -2903,7 +2907,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
             mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
             transition_layer_request,
             &transition_lines,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
+            mesh.corrugation_stage9_memo.get());
     }
     // Wall Strip fallback (multi-domain Chain increment): VBCT itself is the only reliable judge of
     // whether expandChainContourRange's own per-domain boundary displacement (above) produced valid
@@ -2941,7 +2946,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
                 mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
                 chain_swap_left_right,
                 transition_layer_request,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
+            mesh.corrugation_stage9_memo.get());
             stringer_lines_are_linked_skin = stringer_lines.has_value();
         }
         if (! stringer_lines.has_value())
@@ -2966,7 +2972,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
                 mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
                 transition_layer_request,
                 &transition_lines,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
+            mesh.corrugation_stage9_memo.get());
         }
     }
     if (! stringer_lines.has_value())
@@ -3008,7 +3015,8 @@ bool FffGcodeWriter::processCorrugatedInfill(
             mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
             transition_layer_request,
             &transition_lines,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks);
+            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
+            mesh.corrugation_stage9_memo.get());
     }
 
     // Chain end-linking connector (spec REV 2.6 design, implemented here): when exactly one of a

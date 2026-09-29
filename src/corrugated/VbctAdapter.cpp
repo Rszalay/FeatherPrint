@@ -8,6 +8,8 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <stdexcept>
 
 #include <spdlog/spdlog.h>
@@ -206,6 +208,126 @@ static std::vector<vbct::ChainDomainOverride> toChainDomainOverrides(const std::
     return result;
 }
 
+class Stage9Memo
+{
+public:
+    // Stages 1-9 for `contours`, from the cache when this exact input was run before. Throws the same
+    // std::runtime_error message a fresh run would when VBCT rejects the input.
+    std::shared_ptr<const vbct::Stage9Result> getOrRun(const std::vector<vbct::Contour>& contours, const double x, const double threshold_mm)
+    {
+        const size_t key = hashInput(contours, x, threshold_mm);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (const Entry* hit = find(key, contours, x, threshold_mm))
+            {
+                return unpack(*hit);
+            }
+        }
+        Entry entry{ contours, x, threshold_mm, nullptr, {} };
+        try
+        {
+            const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
+            const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
+            const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+            const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+            const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+            entry.stage9 = std::make_shared<const vbct::Stage9Result>(vbct::run_stage9(r5, r6, r7, r8, threshold_mm));
+        }
+        catch (const std::runtime_error& e)
+        {
+            entry.error = e.what();
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const Entry* hit = find(key, contours, x, threshold_mm)) // another thread got there first
+        {
+            return unpack(*hit);
+        }
+        return unpack(entries_.emplace(key, std::move(entry))->second);
+    }
+
+private:
+    struct Entry
+    {
+        std::vector<vbct::Contour> contours;
+        double x;
+        double threshold_mm;
+        std::shared_ptr<const vbct::Stage9Result> stage9; // null: rejected, see error
+        std::string error;
+    };
+
+    static size_t hashInput(const std::vector<vbct::Contour>& contours, const double x, const double threshold_mm)
+    {
+        size_t h = std::hash<double>{}(x) ^ (std::hash<double>{}(threshold_mm) * 31);
+        for (const vbct::Contour& c : contours)
+        {
+            h = h * 1000003 ^ c.points.size();
+            for (const vbct::Point2i& p : c.points)
+            {
+                h = h * 1000003 ^ static_cast<size_t>(p.x);
+                h = h * 1000003 ^ static_cast<size_t>(p.y);
+            }
+        }
+        return h;
+    }
+
+    static bool sameContour(const vbct::Contour& a, const vbct::Contour& b)
+    {
+        return a.points == b.points && a.contour_id == b.contour_id && a.vbs_inserted == b.vbs_inserted;
+    }
+
+    const Entry* find(const size_t key, const std::vector<vbct::Contour>& contours, const double x, const double threshold_mm) const
+    {
+        const auto [first, last] = entries_.equal_range(key);
+        for (auto it = first; it != last; ++it)
+        {
+            const Entry& e = it->second;
+            if (e.x == x && e.threshold_mm == threshold_mm && e.contours.size() == contours.size()
+                && std::equal(e.contours.begin(), e.contours.end(), contours.begin(), sameContour))
+            {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    static std::shared_ptr<const vbct::Stage9Result> unpack(const Entry& e)
+    {
+        if (! e.stage9)
+        {
+            throw std::runtime_error(e.error);
+        }
+        return e.stage9;
+    }
+
+    std::mutex mutex_;
+    std::unordered_multimap<size_t, Entry> entries_;
+};
+
+std::shared_ptr<Stage9Memo> makeStage9Memo()
+{
+    return std::make_shared<Stage9Memo>();
+}
+
+namespace
+{
+
+// VBCT Stages 1-9, through `memo` when there is one. Returns a copy: every caller edits the domains afterwards.
+vbct::Stage9Result runStages1to9(const std::vector<vbct::Contour>& contours, const double x, const double threshold_mm, Stage9Memo* memo)
+{
+    if (memo != nullptr)
+    {
+        return *memo->getOrRun(contours, x, threshold_mm);
+    }
+    const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
+    const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
+    const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+    const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+    const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+    return vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+}
+
+} // namespace
+
 std::optional<OpenLinesSet> corrugate(
     const Shape& infill_area,
     const double x,
@@ -225,7 +347,8 @@ std::optional<OpenLinesSet> corrugate(
     const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
     const TransitionLayerRequest& transition_layer_request,
     OpenLinesSet* transition_lines_out,
-    const std::vector<ChainDomainTrack>& chain_domain_tracks)
+    const std::vector<ChainDomainTrack>& chain_domain_tracks,
+    Stage9Memo* stage9_memo)
 {
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): applies this layer's own already-decided
     // suppression set (VbctAdapter::computeAnchorsForMesh's own pre-pass) before VBCT ever sees
@@ -317,10 +440,9 @@ std::optional<OpenLinesSet> corrugate(
     vbct::Stage10Result result;
     try
     {
-        result = vbct::run_full_pipeline(
-            contours,
-            x,
-            threshold_mm,
+        // Same as vbct::run_full_pipeline, with Stages 1-9 shared through the memo.
+        result = vbct::run_stage10(
+            runStages1to9(contours, x, threshold_mm, stage9_memo),
             spacing_mm,
             phase_offset,
             anchor_t0_frac,
@@ -335,6 +457,7 @@ std::optional<OpenLinesSet> corrugate(
             chain_right_near_t_frac,
             chain_right_far_t_frac,
             extra_clip_loops_mm,
+            /*chain_swap_left_right=*/false,
             transition_layer_request.ring,
             transition_chain_domain_identities_mm,
             transition_solid_fill_spacing_mm,
@@ -1317,7 +1440,8 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
     const SliceLayerPart& part,
     const Settings& settings,
     const std::vector<ChainDomainWallIdentity>& chain_domain_wall_identities,
-    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities)
+    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
+    Stage9Memo* stage9_memo)
 {
     std::vector<ChainWallPoints> result;
     if (chain_domain_wall_identities.empty())
@@ -1354,12 +1478,7 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
     vbct::Stage9Result r9;
     try
     {
-        const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
-        const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
-        const vbct::Stage6Result r6 = vbct::run_stage6(r5);
-        const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
-        const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
-        r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+        r9 = runStages1to9(contours, x, threshold_mm, stage9_memo);
     }
     catch (const std::runtime_error&)
     {
@@ -1902,12 +2021,7 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             const auto [layer_nr, part_idx] = jobs[job_idx];
             try
             {
-                const vbct::VbctResult r14 = vbct::run_vbct(part_contours[layer_nr][part_idx], x);
-                const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
-                const vbct::Stage6Result r6 = vbct::run_stage6(r5);
-                const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
-                const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
-                part_stage9[layer_nr][part_idx] = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+                part_stage9[layer_nr][part_idx] = runStages1to9(part_contours[layer_nr][part_idx], x, threshold_mm, mesh.corrugation_stage9_memo.get());
             }
             catch (const std::runtime_error&)
             {
@@ -3210,7 +3324,8 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
     const bool chain_swap_left_right,
     const TransitionLayerRequest& transition_layer_request,
-    const std::vector<ChainDomainTrack>& chain_domain_tracks)
+    const std::vector<ChainDomainTrack>& chain_domain_tracks,
+    Stage9Memo* stage9_memo)
 {
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9) - see corrugate()'s own identical comment.
     std::vector<std::vector<Point2LL>> ignored_hole_loops;
@@ -3249,12 +3364,7 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     vbct::Stage9Result r9;
     try
     {
-        const vbct::VbctResult r14 = vbct::run_vbct(contours, x);
-        const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh, threshold_mm);
-        const vbct::Stage6Result r6 = vbct::run_stage6(r5);
-        const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
-        const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
-        r9 = vbct::run_stage9(r5, r6, r7, r8, threshold_mm);
+        r9 = runStages1to9(contours, x, threshold_mm, stage9_memo);
     }
     catch (const std::runtime_error& e)
     {

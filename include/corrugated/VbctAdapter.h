@@ -4,6 +4,7 @@
 #ifndef CORRUGATED_VBCT_ADAPTER_H
 #define CORRUGATED_VBCT_ADAPTER_H
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -76,6 +77,16 @@ Shape filterDeminimisHoles(const Shape& shape, const std::vector<DeminimisHoleId
  * itself, which only ever *applies* this request via a fresh, live re-match against its own
  * current Stage 9 domain composition (vbct::run_stage10's own transition_* parameters).
  */
+/*!
+ * Thread-safe cache of VBCT Stages 1-9 results for one mesh, keyed by the exact input contours (and VBS tolerance /
+ * prune threshold). The pre-pass (computeAnchorsForMesh) fills it; every live per-layer call that hands VBCT the same
+ * input (corrugateLinkedSkin, corrugate, findAllChainDomainWalls - including the unlinked fallback and the Transition
+ * harvest, which re-run a layer's identical input) reuses the stored result instead of re-running the pipeline. Owned
+ * by SliceMeshStorage::corrugation_stage9_memo; a null pointer anywhere below just means "no cache, run it".
+ */
+class Stage9Memo;
+std::shared_ptr<Stage9Memo> makeStage9Memo();
+
 struct TransitionLayerRequest
 {
     //! True when this layer's own Ring domain should get a Transition Layer. Meaningless (and has
@@ -215,7 +226,8 @@ std::optional<OpenLinesSet> corrugate(
     OpenLinesSet* transition_lines_out = nullptr,
     // Per-Chain-domain continuity from the pre-pass (CorrugationAnchor::chain_domain_tracks). When non-empty,
     // every Chain domain is matched to its own entry; the single chain_* overrides above then don't apply to Chains.
-    const std::vector<ChainDomainTrack>& chain_domain_tracks = {});
+    const std::vector<ChainDomainTrack>& chain_domain_tracks = {},
+    Stage9Memo* stage9_memo = nullptr);
 
 /*!
  * \brief Experimental (see the "Corrugated Raw Outline Mode" setting): a simple, fixed-width
@@ -375,7 +387,8 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
     const SliceLayerPart& part,
     const Settings& settings,
     const std::vector<ChainDomainWallIdentity>& chain_domain_wall_identities,
-    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities = {});
+    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities = {},
+    Stage9Memo* stage9_memo = nullptr);
 
 /*!
  * \brief Wall Strip (spec REV 2.6/5.7, Chain increment): moves \p corrugation_input's own matching
@@ -524,7 +537,8 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     bool chain_swap_left_right = false,
     const TransitionLayerRequest& transition_layer_request = {},
     // Per-Chain-domain continuity - see corrugate()'s parameter of the same name.
-    const std::vector<ChainDomainTrack>& chain_domain_tracks = {});
+    const std::vector<ChainDomainTrack>& chain_domain_tracks = {},
+    Stage9Memo* stage9_memo = nullptr);
 
 } // namespace VbctAdapter
 } // namespace cura

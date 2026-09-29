@@ -27,6 +27,11 @@
 namespace cura
 {
 
+namespace VbctAdapter
+{
+class Stage9Memo;
+} // namespace VbctAdapter
+
 class Mesh;
 class SierpinskiFillProvider;
 class LightningGenerator;
@@ -497,6 +502,9 @@ public:
     //! independently) rather than a single whole-print track. Empty for meshes that don't use
     //! corrugated infill. See CorrugationAnchor's own doc comment.
     std::vector<CorrugationAnchor> corrugation_anchors;
+    //! Cache of VBCT Stages 1-9 results shared by the pre-pass and the live per-layer corrugation calls - see
+    //! VbctAdapter::Stage9Memo. Created by FffGcodeWriter just before the pre-pass.
+    std::shared_ptr<VbctAdapter::Stage9Memo> corrugation_stage9_memo;
 
     /*!
      * \brief Creates a storage space for slice results of a mesh.
