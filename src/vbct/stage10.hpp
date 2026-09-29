@@ -324,7 +324,7 @@ struct DomainEvents {
                            // Chain domains do NOT require crosshatch_enabled (see
                            // build_domain_events' own doc comment for why a Chain's single family
                            // is already sufficient) - a Chain domain's own ok is false only when
-                           // prepare_domain_sampling's defensive n<2/degenerate-length checks fire.
+                           // its wall has zero length.
                            // Every other field is meaningless when this is false.
     bool is_ring{ false }; // true when ok is true and this came from a Ring domain; false when ok
                            // is true and this came from a Chain domain (see events' own resulting

@@ -2892,146 +2892,7 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
 namespace
 {
 
-// Offsets `wall` inboard by `distance_mm` (one line width, toward the annular gap's interior) by
-// moving each vertex individually along a locally-estimated inward normal - deliberately *not* a
-// whole-loop Clipper offset (Shape::offset(), the same primitive insetOutline uses for a similar
-// purpose). Three real, confirmed-via-direct-user-report bugs were traced to relying on a
-// Clipper-produced offset polygon's own output array here in earlier versions of this function:
-// Clipper doesn't promise where its output array starts (a whole-wall rotation relative to the
-// input - "anchor points jumping to the other side"), doesn't preserve arc-length parametrization
-// affinely under offset (uneven vertex density/miter joins - "stringers skipped near crossings"),
-// and neither of two different correction attempts (reversing the array when winding-direction
-// disagreed; then calibrating one single rotational alignment shift) fully closed the gap, still
-// producing "tangles... at every layer and every stringer" even on Z-invariant parts - i.e. a
-// purely within-one-layer geometric defect, not a cross-layer consistency one, meaning the
-// remaining drift was accumulating *around the ring* between the single calibration point and
-// wherever an event happened to sit, not something a single constant correction could fix.
-//
-// A per-vertex offset sidesteps the entire class of problem: the result has *exactly* the same
-// vertex count and order as `wall` itself (see the m==wall.size()-1 loop below), so
-// DomainEvent::outer_t_frac/inner_t_frac - arc-length fractions computed on the *original* wall -
-// remain valid, correctly-ordered, correctly-*located* (up to each edge's own small length change
-// under offset, a purely local effect that cannot accumulate around the ring the way the previous
-// approaches' errors did) positions on this result too, with no separate Clipper-produced array to
-// realign or reproject against at all. The trade-off, accepted deliberately given three
-// Clipper-based attempts already failed in practice: no self-intersection guard at a sharp concave
-// feature (Clipper's own offset algorithm exists specifically to handle that correctly, which a
-// naive per-vertex push does not) - acceptable for VBS-subdivided walls, which are usually fairly
-// smooth, not a general-purpose robust polygon offset.
-//
-// \param prefer_smaller "Inboard" points in *opposite* physical directions for the two walls of a
-// Ring: the outer (canonical) wall moves inboard by shrinking (toward the ring's own center, into
-// the annular gap), but the inner wall moves inboard by *growing* (away from the ring's center,
-// also into the gap - the gap is on the *outside* of the inner wall's own boundary, unlike the
-// outer wall's). true for the outer wall, false for the inner wall.
-std::optional<std::vector<vbct::Point2>> offsetWallInboard(const std::vector<vbct::Point2>& wall, const coord_t line_width, const bool prefer_smaller)
-{
-    // Chain domain support (spec REV 2.1) / REV 1.7's own no-offset fix: every real call site
-    // (corrugateLinkedSkin) always passes line_width=0 now - the offset itself was removed as
-    // redundant (see corrugateLinkedSkin's own doc comment), and this function is kept in the call
-    // chain purely for a minimal validity check. At distance 0 the result is `wall` unchanged
-    // regardless of prefer_smaller, so skip straight past the signed_area/push_with_sign machinery
-    // below entirely - it assumes a *closed* loop (wall.back() == wall.front(), the m==wall.size()-1
-    // convention), which holds for Ring's own canonicalized walls but not for a Chain's open wall
-    // pair, and signed_area's shoelace sum is not a meaningful "is this degenerate" test for an
-    // open path in the first place (it can land near zero for an ordinary straight or near-straight
-    // Chain wall with no actual defect, unlike a genuinely collapsed closed loop).
-    if (line_width == 0)
-    {
-        return (wall.size() < 2) ? std::nullopt : std::make_optional(wall);
-    }
-    if (wall.size() < 4) // need at least 3 distinct points plus the closing duplicate
-    {
-        return std::nullopt;
-    }
-    const double distance_mm = static_cast<double>(line_width) / kMicronsPerMm;
-    const double original_area = std::abs(vbct::signed_area(wall));
-    if (original_area <= 0.0)
-    {
-        return std::nullopt;
-    }
-
-    const size_t m = wall.size() - 1; // distinct vertex count (wall.back() duplicates wall.front())
-
-    auto push_with_sign = [&](const double push_sign)
-    {
-        std::vector<vbct::Point2> result(wall.size());
-        for (size_t i = 0; i < m; ++i)
-        {
-            const vbct::Point2& prev = wall[(i + m - 1) % m];
-            const vbct::Point2& curr = wall[i];
-            const vbct::Point2& next = wall[(i + 1) % m];
-
-            auto left_normal = [](const vbct::Point2& a, const vbct::Point2& b) -> vbct::Point2
-            {
-                const double dx = b.x - a.x;
-                const double dy = b.y - a.y;
-                const double len = std::hypot(dx, dy);
-                return (len > 0.0) ? vbct::Point2{ -dy / len, dx / len } : vbct::Point2{ 0.0, 0.0 };
-            };
-            const vbct::Point2 n1 = left_normal(prev, curr);
-            const vbct::Point2 n2 = left_normal(curr, next);
-            vbct::Point2 normal{ n1.x + n2.x, n1.y + n2.y };
-            const double normal_len = std::hypot(normal.x, normal.y);
-            if (normal_len > 1e-9)
-            {
-                normal.x /= normal_len;
-                normal.y /= normal_len;
-            }
-            else
-            {
-                normal = n1; // two adjacent edges folded back on each other - fall back to one side
-            }
-
-            result[i] = vbct::Point2{ curr.x + push_sign * distance_mm * normal.x, curr.y + push_sign * distance_mm * normal.y };
-        }
-        result[m] = result[0]; // restore this file's own closed-loop convention
-        return result;
-    };
-
-    // Which raw sign actually shrinks vs grows the wall is decided empirically, not assumed from
-    // winding direction - a first version derived it from signed_area's own sign (interior to the
-    // left of a CCW loop's own direction of travel, the standard convention), which is only
-    // correct if this codebase's coordinate system and VBCT's own wall-winding output agree with
-    // that convention consistently - confirmed, via direct user report and a targeted diagnostic
-    // (average vertex distance to the wall's own centroid, before vs. after), that it does *not*
-    // always: the outer wall was measurably pushed *outward* by exactly one line width instead of
-    // inward on a real part with wall_line_count=1, even though the identical logic had shrunk
-    // correctly on an earlier test part - i.e. not a fixed, safely-assumable convention at all.
-    // Sidesteps needing to get that convention right in the first place: build the offset with a
-    // first-guess sign, measure whether the *average* vertex distance to the wall's own centroid
-    // actually moved the intended direction, and rebuild with the opposite sign if not.
-    const vbct::Point2 centroid = vbct::polygon_centroid(wall);
-    auto avg_centroid_distance = [&](const std::vector<vbct::Point2>& points)
-    {
-        double sum = 0.0;
-        for (size_t i = 0; i < m; ++i)
-        {
-            sum += std::hypot(points[i].x - centroid.x, points[i].y - centroid.y);
-        }
-        return sum / static_cast<double>(m);
-    };
-    const double before_dist = avg_centroid_distance(wall);
-    std::vector<vbct::Point2> offset_wall = push_with_sign(1.0);
-    const double after_dist_positive = avg_centroid_distance(offset_wall);
-    const bool positive_shrank = after_dist_positive < before_dist;
-    if (positive_shrank != prefer_smaller)
-    {
-        offset_wall = push_with_sign(-1.0);
-    }
-
-    const double result_area = std::abs(vbct::signed_area(offset_wall));
-    // Generous sanity range covering both the shrink (outer wall) and grow (inner wall) cases -
-    // catches a genuinely collapsed/degenerate offset (an eccentric ring, or a gap narrower than
-    // roughly two line widths) without assuming which direction "collapsed" means here.
-    if (result_area <= 0.0 || result_area < 0.3 * original_area || result_area > 3.0 * original_area)
-    {
-        return std::nullopt; // collapsed too much - see this function's own doc comment
-    }
-    return offset_wall;
-}
-
-// The wall vertices (of `wall`, already offset/inboard, its own closed loop of total arc length
+// The wall vertices (of `wall`, its own closed loop of total arc length
 // `wall_len`) strictly between arc-length positions `from_pos` and `to_pos`, walking forward and
 // wrapping past `wall_len` back to 0 if needed, followed by `to_pt` (the exact reprojected point
 // at `to_pos` - passed in rather than re-sampled, so the path's own point is bit-identical to
@@ -3100,7 +2961,7 @@ std::vector<vbct::Point2> wallArcForward(
 // mergeStraightPassThroughChains has folded any straight pass-through pair together - gets one
 // path per domain instead of an all-or-nothing single path). Returns std::nullopt for any reason
 // this one domain isn't linkable yet - see corrugateLinkedSkin's own header doc for the full list
-// (a clipped stringer, a collapsed offset).
+// (a clipped stringer, a wall with fewer than two points).
 std::optional<std::vector<Point2LL>> buildLinkedSkinPathForDomain(const vbct::DomainEvents& chosen)
 {
     // v1 doesn't re-clip a shifted crossing segment against non-convex domain edges - see
@@ -3116,27 +2977,24 @@ std::optional<std::vector<Point2LL>> buildLinkedSkinPathForDomain(const vbct::Do
         }
     }
 
-    // No additional inboard offset here (line_width=0) - see corrugateLinkedSkin's own header doc
-    // for why: `chosen.outer_wall`/`inner_wall` already come from `part.infill_area`, which is
-    // already the region Cura's own wall generation leaves after the wall's own footprint. Still
-    // routed through offsetWallInboard (rather than using chosen.outer_wall/inner_wall directly)
-    // so its own degenerate/empty-wall checks still apply - at distance 0 it returns the wall
-    // unchanged, regardless of prefer_smaller.
-    const std::optional<std::vector<vbct::Point2>> outer_offset = offsetWallInboard(chosen.outer_wall, /*line_width=*/0, /*prefer_smaller=*/true);
-    const std::optional<std::vector<vbct::Point2>> inner_offset = offsetWallInboard(chosen.inner_wall, /*line_width=*/0, /*prefer_smaller=*/false);
-    if (! outer_offset.has_value() || ! inner_offset.has_value())
+    // The walls are used as they are - no inboard offset, since `chosen.outer_wall`/`inner_wall` already come from
+    // `part.infill_area`, the region Cura's own wall generation leaves after the wall's footprint (see
+    // corrugateLinkedSkin's own header doc).
+    if (chosen.outer_wall.size() < 2 || chosen.inner_wall.size() < 2)
     {
         return std::nullopt;
     }
-    const double outer_offset_len = vbct::wall_length(*outer_offset);
-    const double inner_offset_len = vbct::wall_length(*inner_offset);
-    if (outer_offset_len <= 0.0 || inner_offset_len <= 0.0)
+    const std::vector<vbct::Point2>& outer_wall = chosen.outer_wall;
+    const std::vector<vbct::Point2>& inner_wall = chosen.inner_wall;
+    const double outer_wall_len = vbct::wall_length(outer_wall);
+    const double inner_wall_len = vbct::wall_length(inner_wall);
+    if (outer_wall_len <= 0.0 || inner_wall_len <= 0.0)
     {
         return std::nullopt;
     }
 
-    // Reproject every event's raw attachment point onto the offset wall it belongs to, by sampling
-    // that offset wall at the exact same arc-length fraction (DomainEvent::outer_t_frac/
+    // Reproject every event's raw attachment point onto the wall it belongs to, by sampling
+    // that wall at the exact same arc-length fraction (DomainEvent::outer_t_frac/
     // inner_t_frac) - see corrugateLinkedSkin's own header doc for why this is valid directly, with
     // no reprojection search or alignment correction needed.
     struct Reprojected
@@ -3150,16 +3008,14 @@ std::optional<std::vector<Point2LL>> buildLinkedSkinPathForDomain(const vbct::Do
     reprojected.reserve(chosen.events.size());
     for (const vbct::DomainEvent& event : chosen.events)
     {
-        const vbct::Point2 outer_pt = pointAtFraction(*outer_offset, outer_offset_len, event.outer_t_frac);
-        const vbct::Point2 inner_pt = pointAtFraction(*inner_offset, inner_offset_len, event.inner_t_frac);
-        reprojected.push_back({ outer_pt, event.outer_t_frac * outer_offset_len, inner_pt, event.inner_t_frac * inner_offset_len });
+        const vbct::Point2 outer_pt = pointAtFraction(outer_wall, outer_wall_len, event.outer_t_frac);
+        const vbct::Point2 inner_pt = pointAtFraction(inner_wall, inner_wall_len, event.inner_t_frac);
+        reprojected.push_back({ outer_pt, event.outer_t_frac * outer_wall_len, inner_pt, event.inner_t_frac * inner_wall_len });
     }
     const size_t event_count = reprojected.size();
     const bool is_ring = chosen.is_ring;
-    if (event_count < 2 || (is_ring && event_count % 2 != 0))
+    if (event_count < 2) // a Ring always has an even count (build_domain_events emits both families per index)
     {
-        // Ring: build_domain_events already guarantees an even count. Chain: no such parity
-        // requirement - only the event_count < 2 defensive check applies.
         return std::nullopt;
     }
 
@@ -3191,8 +3047,8 @@ std::optional<std::vector<Point2LL>> buildLinkedSkinPathForDomain(const vbct::Do
     {
         const size_t next_k = is_ring ? (k + 1) % event_count : (k + 1);
         const bool on_outer = (k % 2 == 0);
-        const std::vector<vbct::Point2>& wall = on_outer ? *outer_offset : *inner_offset;
-        const double wall_len = on_outer ? outer_offset_len : inner_offset_len;
+        const std::vector<vbct::Point2>& wall = on_outer ? outer_wall : inner_wall;
+        const double wall_len = on_outer ? outer_wall_len : inner_wall_len;
         const double from_pos = on_outer ? reprojected[k].outer_pos : reprojected[k].inner_pos;
         const double to_pos = on_outer ? reprojected[next_k].outer_pos : reprojected[next_k].inner_pos;
         const vbct::Point2& to_pt = on_outer ? reprojected[next_k].outer_pt : reprojected[next_k].inner_pt;

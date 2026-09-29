@@ -848,8 +848,7 @@ DomainStringers domain_stringers(
 // Ring, forced-even count for Ring, whole-domain coincidence detection for Ring, and Chain's own
 // simpler open-path case, which needs none of the three). Returns DomainEvents{ok=false} for every
 // Ring case this feature doesn't support: crosshatch_enabled false (no CW family to alternate
-// against at all), or (defensively, should not happen given prepare_domain_sampling always returns
-// n>=2) a degenerate stringer count - Chain domains have no such requirement, see below.
+// against at all), or a zero-length wall - Chain domains have no crosshatch requirement, see below.
 DomainEvents build_domain_events_for_domain(
     const Domain& domain,
     double spacing,
@@ -875,7 +874,7 @@ DomainEvents build_domain_events_for_domain(
             domain, spacing, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, chain_anchor_point,
             chain_left_near_t_frac, chain_left_far_t_frac, chain_right_near_t_frac, chain_right_far_t_frac, extra_clip_loops,
             chain_swap_left_right);
-        if (s.n < 2 || s.left_len <= 0.0) return result;  // defensive
+        if (s.left_len <= 0.0) return result;
 
         // Chain-specific Crosshatch + Linked Corrugation Skin integration (spec REV 2.4/"fifth
         // round"): reuses the exact same wraparound construction domain_stringers' own unlinked
@@ -1007,7 +1006,7 @@ DomainEvents build_domain_events_for_domain(
 
     const DomainSampling s
         = prepare_domain_sampling(domain, spacing, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, extra_clip_loops);
-    if (s.n < 2 || s.left_len <= 0.0) return result;  // defensive - see this function's own doc comment
+    if (s.left_len <= 0.0) return result;
 
     // Forced even so alternating on every crossing closes into one consistent loop (a 2-coloring
     // of a cycle graph only works on an even cycle) - see build_domain_events' own doc comment in
@@ -1054,8 +1053,6 @@ DomainEvents build_domain_events_for_domain(
     // point). Same construction-order argument applies here: CCW family (i=0..n_even-1) built
     // before CW family, each independently monotonic in theta.
     std::stable_sort(events.begin(), events.end(), [](const DomainEvent& a, const DomainEvent& b) { return a.theta < b.theta; });
-
-    if (events.size() % 2 != 0) return result;  // defensive - see this function's own doc comment
 
     result.ok = true;
     result.is_ring = true;

@@ -426,14 +426,12 @@ bool expandChainContourRange(Shape& corrugation_input, const Shape& outline, con
  * once, why "two stringers, one from each family, overlapping" is a whole-domain phenomenon
  * detected once rather than per pair, and why the domain's own stringer count is rounded up to
  * even before building events). This function does everything build_domain_events itself can't
- * (it only has VBCT's own types to work with): routes each wall through \c offsetWallInboard with
- * zero distance (a per-vertex normal push, deliberately *not* a whole-loop Clipper offset - see its
- * own doc comment for the three real, confirmed-via-direct-user-report bugs traced to relying on a
- * Clipper-produced offset polygon's own output array) purely to reuse its degenerate/empty-wall
- * checks, not to actually offset anything: \p infill_area (via \c corrugation_input,
- * \c buildCorrugationInput) is *already* the region Cura's own wall generation leaves after the
- * wall's own footprint - the same boundary every other infill pattern fills directly, with no extra
- * buffer of its own. An earlier version of this function applied a *further* one-line-width inboard
+ * (it only has VBCT's own types to work with). It uses each wall as it is, with no inboard offset:
+ * \p infill_area (via \c corrugation_input, \c buildCorrugationInput) is *already* the region Cura's
+ * own wall generation leaves after the wall's own footprint - the same boundary every other infill
+ * pattern fills directly, with no extra buffer of its own. (Earlier Clipper-based offsets were
+ * removed after three user-reported bugs: Clipper doesn't preserve where its output array starts,
+ * or its arc-length parametrization.) An earlier version of this function applied a *further* one-line-width inboard
  * push here, on the theory that spec Section 3.1's "offset one line width inboard of the outer
  * Wall" meant offsetting inboard of \p infill_area's own boundary - confirmed wrong via direct user
  * report and a bounding-box diagnostic at \c wall_line_count=1: the two buffers stacked, pushing
@@ -442,9 +440,8 @@ bool expandChainContourRange(Shape& corrugation_input, const Shape& outline, con
  * offset from by Cura's own wall generation - not a second buffer this function needs to add.
  * Every event is then sampled from its corresponding wall at the exact same arc-length fraction the
  * raw attachment point was found at (\c DomainEvent::outer_t_frac/inner_t_frac) - valid directly,
- * without any reprojection search or alignment correction, specifically because
- * offsetWallInboard's per-vertex construction guarantees its output matches the input one-to-one -
- * then walks the sorted events, alternating which wall's own vertices are traced between
+ * without any reprojection search or alignment correction, since the wall is the same one the
+ * fractions were measured on - then walks the sorted events, alternating which wall's own vertices are traced between
  * consecutive events, with a straight 2-point jump for each stringer crossing.
  *
  * Requires crosshatch for Ring domains: this function always builds its events with VBCT's CW

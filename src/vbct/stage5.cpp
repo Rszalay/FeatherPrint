@@ -658,12 +658,8 @@ JunctionTerminalFlipResult flip_junction_terminal_pairs(const std::vector<Point2
                 if (sign_eps(signed_area2(vertices[t1[0]], vertices[t1[1]], vertices[t1[2]])) != ref_sign) std::swap(t1[1], t1[2]);
                 if (sign_eps(signed_area2(vertices[t2[0]], vertices[t2[1]], vertices[t2[2]])) != ref_sign) std::swap(t2[1], t2[2]);
 
-                // Defensive: confirm the flip actually clears the junction
-                // rather than just relocating it -- by construction (the
-                // terminal's own 2 boundary edges land one each in t1/t2)
-                // this always holds when the checks above pass, but this
-                // file's universal practice is to verify, not assume.
-                if (boundary_count(t1, boundary_edges) == 0 || boundary_count(t2, boundary_edges) == 0) continue;
+                // No need to re-check that the flip clears the junction: (u,v) is not a wall edge (checked
+                // above), so the terminal's two wall edges are (u,b) and (v,b), and t1/t2 get one each.
 
                 triangles[ji] = t1;
                 triangles[ti] = t2;
@@ -1711,7 +1707,7 @@ struct WedgeCollapseResult {
 };
 
 WedgeCollapseResult collapse_terminal_wedges(const std::vector<Point2>& vertices, std::vector<Triangle> triangles,
-                                              const std::vector<bool>& is_vbs_point, std::set<Edge> boundary_edges) {
+                                              std::set<Edge> boundary_edges) {
     constexpr double kEps = 0.01;         // mm; > flat-wall VBS noise (<=6um), < real curvature sagitta
     constexpr double kStraightDot = -0.9; // (x-v)*(y-v) normalised: near -1 = straight through a vertex
     constexpr double kStraightStep = 0.9995; // consecutive wall-segment unit dirs: >= this = same heading (~1.8 deg)
@@ -2233,7 +2229,7 @@ Stage5Result run_stage5(const Mesh& mesh, double prune_threshold) {
     // Correction 1b: collapse a flat dead-end wedge whose union is a valid
     // triangle but whose VBS wall points Correction 1's exact-2 rule can't
     // reach (see collapse_terminal_wedges' own rationale).
-    auto c1b = collapse_terminal_wedges(vertices, c1.triangles, is_vbs_point, c1.boundary_edges);
+    auto c1b = collapse_terminal_wedges(vertices, c1.triangles, c1.boundary_edges);
     auto c2 = correct_false_junctions(vertices, c1b.triangles, is_vbs_point, c1b.boundary_edges);
 
     // Correction 2b: flip any remaining junction/terminal triangle pair --
