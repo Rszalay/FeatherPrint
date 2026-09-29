@@ -3633,5 +3633,62 @@ TEST(VbctAdapterTest, ChainOverrideSwapAppliesOnBothPaths)
     EXPECT_TRUE(any_differs) << "the swap flag should change where an asymmetric override's stringers land";
 }
 
+/*!
+ * Aligned wall pairing (corrugated_wall_pairing = aligned) on an off-centre ring: arc-length pairing samples each wall
+ * at the same fraction of its own length, which skews rungs wherever the hole isn't centred; aligned pairing matches
+ * the walls to each other first. Every stringer must still run from the outer wall to the hole's wall, the stringer
+ * count must not change, and the rungs must come out shorter on average.
+ */
+TEST(VbctAdapterTest, AlignedPairingGivesShorterRungsOnOffCentreRing)
+{
+    Shape ring_shape;
+    ring_shape.push_back(makeCirclePolygon(0, 0, 30000, 96));
+    ring_shape.push_back(makeCirclePolygon(6000, 0, 12000, 72)); // hole shifted 6mm: the gap runs 12mm..24mm wide
+    const std::vector<vbct::Contour> contours = VbctAdapter::shapeToContours(ring_shape);
+    const vbct::VbctResult r14 = vbct::run_vbct(contours, 0.3);
+    const vbct::Stage5Result r5 = vbct::run_stage5(r14.mesh);
+    const vbct::Stage6Result r6 = vbct::run_stage6(r5);
+    const vbct::Stage7Result r7 = vbct::run_stage7(r5, r6);
+    const vbct::Stage8Result r8 = vbct::run_stage8(r5, r6, r7);
+    const vbct::Stage9Result r9 = vbct::run_stage9(r5, r6, r7, r8, 0.8);
+    ASSERT_EQ(r9.domains.size(), 1u);
+    ASSERT_EQ(r9.domains[0].kind, "ring");
+
+    auto run = [&](bool aligned)
+    {
+        return vbct::run_stage10(
+            r9, 4.0, 0.0, std::nullopt, std::nullopt, std::nullopt, /*crosshatch_enabled=*/false, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, {}, false, false, {}, 0.0, {}, aligned);
+    };
+    const vbct::Stage10Result arc = run(false);
+    const vbct::Stage10Result aligned = run(true);
+    ASSERT_EQ(aligned.domains.size(), 1u);
+    const std::vector<vbct::Stringer>& a = aligned.domains[0].stringers;
+    ASSERT_EQ(a.size(), arc.domains[0].stringers.size());
+
+    auto mean_length = [](const std::vector<vbct::Stringer>& stringers)
+    {
+        double total = 0.0;
+        for (const vbct::Stringer& st : stringers)
+        {
+            total += std::hypot(st.pieces.back().second.x - st.pieces.front().first.x, st.pieces.back().second.y - st.pieces.front().first.y);
+        }
+        return total / static_cast<double>(stringers.size());
+    };
+    for (const vbct::Stringer& st : a)
+    {
+        const vbct::Point2 p = st.pieces.front().first;
+        const vbct::Point2 q = st.pieces.back().second;
+        const double rp_outer = std::hypot(p.x, p.y), rq_outer = std::hypot(q.x, q.y);
+        const double rp_hole = std::hypot(p.x - 6.0, p.y), rq_hole = std::hypot(q.x - 6.0, q.y);
+        const bool p_outer_q_hole = std::abs(rp_outer - 30.0) < 0.1 && std::abs(rq_hole - 12.0) < 0.1;
+        const bool p_hole_q_outer = std::abs(rp_hole - 12.0) < 0.1 && std::abs(rq_outer - 30.0) < 0.1;
+        EXPECT_TRUE(p_outer_q_hole || p_hole_q_outer) << "stringer (" << p.x << "," << p.y << ")-(" << q.x << "," << q.y << ") doesn't span the two walls";
+    }
+    const double arc_mean = mean_length(arc.domains[0].stringers);
+    const double aligned_mean = mean_length(a);
+    EXPECT_LT(aligned_mean, arc_mean) << "aligned " << aligned_mean << " vs arc-length " << arc_mean;
+}
+
 } // namespace cura
 // NOLINTEND(*-magic-numbers)

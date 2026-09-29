@@ -3007,6 +3007,21 @@
                     "settable_per_mesh": true,
                     "settable_globally": true
                 },
+                "corrugated_wall_pairing":
+                {
+                    "label": "Corrugated Wall Pairing",
+                    "description": "How each stringer's two wall points are chosen. Arc Length samples each wall independently at the same fraction of its own length, and relies on cross-layer tracking to keep the walls' starting points and directions consistent. Aligned first matches the two walls point-to-point along the corridor (shortest total rung length) and places stringers along that matching, so rungs run roughly straight across the corridor and only one anchor per domain is tracked between layers. Experimental.",
+                    "type": "enum",
+                    "options":
+                    {
+                        "arc_length": "Arc Length",
+                        "aligned": "Aligned"
+                    },
+                    "default_value": "arc_length",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
                 "corrugated_skin_linked":
                 {
                     "label": "Corrugated Linked Skin",

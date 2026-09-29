@@ -257,7 +257,12 @@ Stage10Result run_stage10(
     // Per-Chain-domain continuity overrides (see ChainDomainOverride). When non-empty, every Chain domain gets its
     // own matched override and the single chain_anchor_point / chain_*_t_frac overrides above are ignored for Chain
     // domains; chain_swap_left_right then only enables each override's own swap flag.
-    const std::vector<ChainDomainOverride>& chain_domain_overrides = {});
+    const std::vector<ChainDomainOverride>& chain_domain_overrides = {},
+    // Aligned wall pairing (corrugated_wall_pairing = aligned): pair the two walls by a minimum-total-rung-length
+    // alignment instead of independent per-wall arc-length fractions. Ring: canonical wall oriented CCW, only the
+    // canonical wall's t0 anchor is used (other_wall_t0_frac/reverse_canonical_wall are ignored). Chain: runs cap to
+    // cap - the near/far fractions are ignored; chain_anchor_point still picks which end is the start.
+    bool aligned_pairing = false);
 
 // FeatherPrint Corrugated extension (not present in upstream VBCT): one crossing event - a single
 // place where the linked corrugation skin (VbctAdapter::corrugateLinkedSkin) switches from
@@ -455,6 +460,11 @@ std::vector<DomainEvents> build_domain_events(
     bool chain_swap_left_right = false,
     // Per-Chain-domain continuity overrides - see run_stage10's parameter of the same name. When non-empty, each
     // Chain domain uses its own matched override, including its own swap flag.
-    const std::vector<ChainDomainOverride>& chain_domain_overrides = {});
+    const std::vector<ChainDomainOverride>& chain_domain_overrides = {},
+    // Aligned wall pairing (corrugated_wall_pairing = aligned): pair the two walls by a minimum-total-rung-length
+    // alignment instead of independent per-wall arc-length fractions. Ring: canonical wall oriented CCW, only the
+    // canonical wall's t0 anchor is used (other_wall_t0_frac/reverse_canonical_wall are ignored). Chain: runs cap to
+    // cap - the near/far fractions are ignored; chain_anchor_point still picks which end is the start.
+    bool aligned_pairing = false);
 
 }  // namespace vbct

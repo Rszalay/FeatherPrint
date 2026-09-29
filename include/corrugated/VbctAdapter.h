@@ -227,7 +227,9 @@ std::optional<OpenLinesSet> corrugate(
     // Per-Chain-domain continuity from the pre-pass (CorrugationAnchor::chain_domain_tracks). When non-empty,
     // every Chain domain is matched to its own entry; the single chain_* overrides above then don't apply to Chains.
     const std::vector<ChainDomainTrack>& chain_domain_tracks = {},
-    Stage9Memo* stage9_memo = nullptr);
+    Stage9Memo* stage9_memo = nullptr,
+    // See vbct::run_stage10's aligned_pairing (setting corrugated_wall_pairing).
+    bool aligned_pairing = false);
 
 /*!
  * \brief Experimental (see the "Corrugated Raw Outline Mode" setting): a simple, fixed-width
@@ -535,7 +537,9 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     const TransitionLayerRequest& transition_layer_request = {},
     // Per-Chain-domain continuity - see corrugate()'s parameter of the same name.
     const std::vector<ChainDomainTrack>& chain_domain_tracks = {},
-    Stage9Memo* stage9_memo = nullptr);
+    Stage9Memo* stage9_memo = nullptr,
+    // See vbct::run_stage10's aligned_pairing (setting corrugated_wall_pairing).
+    bool aligned_pairing = false);
 
 } // namespace VbctAdapter
 } // namespace cura
