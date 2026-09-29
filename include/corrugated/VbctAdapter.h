@@ -275,23 +275,6 @@ Shape buildCorrugationInput(const SliceLayerPart& part, const Settings& settings
 Shape growCorrugationInput(const Shape& corrugation_input, const Settings& settings, bool chain_strip_active);
 
 /*!
- * \brief TEMPORARY debug instrumentation for the layer-395 area-collapse investigation
- * (2026-09-13): appends "<stage>,<z_mm>,<polygon_count>,<area_mm2>" to a fixed scratchpad CSV,
- * gated to a single hardcoded target Z so it doesn't fire on every layer of every print. Pure
- * geometry only (Shape::area()) - never throws, safe to call from any pipeline stage. Remove
- * this declaration and its definition/call sites once the investigation concludes.
- */
-void dumpAreaForInvestigation(const std::string& stage, const Shape& shape, double z_mm);
-
-/*!
- * \brief TEMPORARY debug instrumentation, same investigation/gating/safety as
- * dumpAreaForInvestigation above - dumps a Shape's own raw point coordinates (one JSON file per
- * call site) so the actual polygon shape can be inspected/plotted. Remove alongside
- * dumpAreaForInvestigation once the investigation concludes.
- */
-void dumpShapePointsForInvestigation(const std::string& stage, const Shape& shape, double z_mm);
-
-/*!
  * \brief Cross-layer anchor continuity pre-pass (spec REV 1.4 S:5.3): walks \p mesh's layers in Z
  * order, single-threaded, and for each one that has a corrugatable Ring domain (via
  * buildCorrugationInput on that layer's \c parts[0] and \p mesh's own \c corrugated_vbs_tolerance
