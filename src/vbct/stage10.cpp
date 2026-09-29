@@ -1,5 +1,7 @@
 #include "stage10.hpp"
 
+#include "harmonic.hpp"
+
 #include <utility>
 #include <tuple>
 #include <limits>
@@ -577,6 +579,50 @@ void build_alignment(DomainSampling& s) {
     s.aligned = true;
 }
 
+// Builds s.align_* from the harmonic pairing (harmonic.hpp) - same pairing map build_alignment produces, so every
+// sampling site uses it unchanged. Ring: both walls oriented counter-clockwise, starting at the canonical wall's t0
+// anchor. Chain: both walls already run from the same end.
+void build_harmonic(DomainSampling& s) {
+    constexpr int kSamples = 512;
+    if (s.left.size() < 2 || s.right.size() < 2 || s.left_len <= 0.0 || s.right_len <= 0.0) return;
+    double left_start = 0.0;
+    if (s.is_ring) {
+        left_start = s.left_t0_frac;
+        if (signed_area(s.left) < 0.0) {
+            std::reverse(s.left.begin(), s.left.end());
+            left_start = wrap01(1.0 - left_start);
+        }
+        if (signed_area(s.right) < 0.0) std::reverse(s.right.begin(), s.right.end());
+    }
+    const std::optional<HarmonicPairing> hp = harmonic_wall_pairing(s.left, s.left_len, s.right, s.right_len, s.is_ring, left_start, kSamples);
+    if (! hp) return;
+    std::vector<double> u, tl, tr;
+    double acc = 0.0;
+    Point2 prev_mid{};
+    for (size_t k = 0; k < hp->tl.size(); ++k) {
+        const double a = s.is_ring ? wrap01(hp->tl[k]) : std::clamp(hp->tl[k], 0.0, 1.0);
+        const double b = s.is_ring ? wrap01(hp->tr[k]) : std::clamp(hp->tr[k], 0.0, 1.0);
+        const Point2 pl = sample_at_t(s.left, s.left_len, a);
+        const Point2 pr = sample_at_t(s.right, s.right_len, b);
+        const Point2 mid{ (pl.x + pr.x) / 2.0, (pl.y + pr.y) / 2.0 };
+        if (k > 0) {
+            const double step = point_dist(prev_mid, mid);
+            if (step <= 1e-12) continue;
+            acc += step;
+        }
+        prev_mid = mid;
+        u.push_back(acc);
+        tl.push_back(hp->tl[k]);
+        tr.push_back(hp->tr[k]);
+    }
+    if (u.size() < 2 || acc <= 0.0) return;
+    for (double& x : u) x /= acc;
+    s.align_u = std::move(u);
+    s.align_tl = std::move(tl);
+    s.align_tr = std::move(tr);
+    s.aligned = true;
+}
+
 DomainSampling prepare_domain_sampling(
     const Domain& domain,
     double spacing,
@@ -591,7 +637,7 @@ DomainSampling prepare_domain_sampling(
     std::optional<double> chain_right_far_t_frac = std::nullopt,
     const std::vector<std::vector<Point2>>& extra_clip_loops = {},
     bool chain_swap_left_right = false,
-    bool aligned_pairing = false) {
+    WallPairing wall_pairing = WallPairing::ArcLength) {
     std::vector<Point2> left = domain.left->points;
     std::vector<Point2> right = domain.right->points;
 
@@ -761,8 +807,10 @@ DomainSampling prepare_domain_sampling(
         std::move(left), std::move(right), left_len, right_len, left_t0_frac, right_t0_frac,
         left_t1_frac, right_t1_frac, n, is_ring, effective_phase_offset, std::move(edges), std::move(hole_edges)
     };
-    if (aligned_pairing) {
+    if (wall_pairing == WallPairing::Aligned) {
         build_alignment(sampling);
+    } else if (wall_pairing == WallPairing::Harmonic) {
+        build_harmonic(sampling);
     }
     return sampling;
 }
@@ -782,11 +830,11 @@ DomainStringers domain_stringers(
     std::optional<double> chain_right_far_t_frac = std::nullopt,
     const std::vector<std::vector<Point2>>& extra_clip_loops = {},
     bool chain_swap_left_right = false,
-    bool aligned_pairing = false) {
+    WallPairing wall_pairing = WallPairing::ArcLength) {
     const DomainSampling s = prepare_domain_sampling(
         domain, spacing, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, chain_anchor_point,
         chain_left_near_t_frac, chain_left_far_t_frac, chain_right_near_t_frac, chain_right_far_t_frac, extra_clip_loops,
-        chain_swap_left_right, aligned_pairing);
+        chain_swap_left_right, wall_pairing);
     const std::vector<Point2>& left = s.left;
     const std::vector<Point2>& right = s.right;
     const double left_len = s.left_len;
@@ -1054,7 +1102,7 @@ DomainEvents build_domain_events_for_domain(
     std::optional<double> chain_right_far_t_frac = std::nullopt,
     const std::vector<std::vector<Point2>>& extra_clip_loops = {},
     bool chain_swap_left_right = false,
-    bool aligned_pairing = false) {
+    WallPairing wall_pairing = WallPairing::ArcLength) {
     DomainEvents result;
     if (domain.kind == "chain") {
         // Chain domain support (spec REV 2.1): no forced-even count - see this function's own
@@ -1063,7 +1111,7 @@ DomainEvents build_domain_events_for_domain(
         const DomainSampling s = prepare_domain_sampling(
             domain, spacing, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, chain_anchor_point,
             chain_left_near_t_frac, chain_left_far_t_frac, chain_right_near_t_frac, chain_right_far_t_frac, extra_clip_loops,
-            chain_swap_left_right, aligned_pairing);
+            chain_swap_left_right, wall_pairing);
         if (s.left_len <= 0.0) return result;
 
         // Chain-specific Crosshatch + Linked Corrugation Skin integration (spec REV 2.4/"fifth
@@ -1199,7 +1247,7 @@ DomainEvents build_domain_events_for_domain(
     if (domain.kind != "ring" || !crosshatch_enabled) return result;  // ok stays false
 
     const DomainSampling s
-        = prepare_domain_sampling(domain, spacing, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, extra_clip_loops, false, aligned_pairing);
+        = prepare_domain_sampling(domain, spacing, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, extra_clip_loops, false, wall_pairing);
     if (s.left_len <= 0.0) return result;
 
     // Forced even so alternating on every crossing closes into one consistent loop (a 2-coloring
@@ -1278,7 +1326,7 @@ Stage10Result run_stage10(
     const std::vector<Point2>& transition_chain_domain_identities,
     double transition_solid_fill_spacing,
     const std::vector<ChainDomainOverride>& chain_domain_overrides,
-    bool aligned_pairing) {
+    WallPairing wall_pairing) {
     Stage10Result result;
     bool anchor_applied = false;
     bool chain_anchor_applied = false;
@@ -1355,7 +1403,7 @@ Stage10Result run_stage10(
             // Per-domain: the domain's own tracked swap, as build_domain_events applies it. Its near/far fractions
             // were measured against the swapped walls, so applying them without the swap puts them on the wrong walls.
             per_domain_chain ? (co != nullptr && co->swap_left_right) : (apply_chain_anchor_here ? chain_swap_left_right : false),
-            aligned_pairing));
+            wall_pairing));
         result.domains.back().is_transition_layer = is_transition;
     }
     return result;
@@ -1408,7 +1456,7 @@ std::vector<DomainEvents> build_domain_events(
     const std::vector<std::vector<Point2>>& extra_clip_loops,
     bool chain_swap_left_right,
     const std::vector<ChainDomainOverride>& chain_domain_overrides,
-    bool aligned_pairing) {
+    WallPairing wall_pairing) {
     std::vector<DomainEvents> result;
     bool anchor_applied = false;
     bool chain_anchor_applied = false;
@@ -1439,7 +1487,7 @@ std::vector<DomainEvents> build_domain_events(
             per_domain_chain ? (co ? co->right_far_t_frac : std::nullopt) : (apply_chain_anchor_here ? chain_right_far_t_frac : std::nullopt),
             extra_clip_loops,
             per_domain_chain ? (co != nullptr && co->swap_left_right) : (apply_chain_anchor_here ? chain_swap_left_right : false),
-            aligned_pairing));
+            wall_pairing));
     }
     return result;
 }

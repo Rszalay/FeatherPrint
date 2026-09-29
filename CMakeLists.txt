@@ -206,6 +206,7 @@ set(engine_SRCS # Except main.cpp.
         src/geometry/conversions/Point2D_Point2LL.cpp
 
         src/vbct/contour.cpp
+        src/vbct/harmonic.cpp
         src/vbct/mesh.cpp
         src/vbct/pipeline.cpp
         src/vbct/stage10.cpp

@@ -24,6 +24,11 @@ struct Stringer {
 // VbctAdapter::computeAnchorsForMesh for EVERY Chain domain on the layer, not just one. Matched to this call's own
 // freshly-derived domain by identity (nearest whole-domain mean point, within a few mm): a layer can have several
 // Chain domains, and neither their count nor their order in Stage 9's output says which is which. mm space.
+// How a domain's two walls are paired point-to-point (setting corrugated_wall_pairing): each wall sampled
+// independently at the same fraction of its own length (ArcLength), a minimum-total-rung-length alignment (Aligned),
+// or the gradient lines of a harmonic field between the walls (Harmonic, see harmonic.hpp).
+enum class WallPairing { ArcLength, Aligned, Harmonic };
+
 struct ChainDomainOverride {
     Point2 identity;      // mean of the domain's own left+right wall points, for matching
     Point2 anchor_point;  // the tracked "same real end" - both walls are oriented toward it
@@ -258,11 +263,10 @@ Stage10Result run_stage10(
     // own matched override and the single chain_anchor_point / chain_*_t_frac overrides above are ignored for Chain
     // domains; chain_swap_left_right then only enables each override's own swap flag.
     const std::vector<ChainDomainOverride>& chain_domain_overrides = {},
-    // Aligned wall pairing (corrugated_wall_pairing = aligned): pair the two walls by a minimum-total-rung-length
-    // alignment instead of independent per-wall arc-length fractions. Ring: canonical wall oriented CCW, only the
-    // canonical wall's t0 anchor is used (other_wall_t0_frac/reverse_canonical_wall are ignored). Chain: runs cap to
-    // cap - the near/far fractions are ignored; chain_anchor_point still picks which end is the start.
-    bool aligned_pairing = false);
+    // Wall pairing (corrugated_wall_pairing). Aligned/Harmonic: Ring - canonical wall oriented CCW and only the canonical
+    // wall's t0 anchor is used (other_wall_t0_frac/reverse_canonical_wall are ignored); Chain - runs cap to cap, the
+    // near/far fractions are ignored and chain_anchor_point still picks which end is the start.
+    WallPairing wall_pairing = WallPairing::ArcLength);
 
 // FeatherPrint Corrugated extension (not present in upstream VBCT): one crossing event - a single
 // place where the linked corrugation skin (VbctAdapter::corrugateLinkedSkin) switches from
@@ -461,10 +465,9 @@ std::vector<DomainEvents> build_domain_events(
     // Per-Chain-domain continuity overrides - see run_stage10's parameter of the same name. When non-empty, each
     // Chain domain uses its own matched override, including its own swap flag.
     const std::vector<ChainDomainOverride>& chain_domain_overrides = {},
-    // Aligned wall pairing (corrugated_wall_pairing = aligned): pair the two walls by a minimum-total-rung-length
-    // alignment instead of independent per-wall arc-length fractions. Ring: canonical wall oriented CCW, only the
-    // canonical wall's t0 anchor is used (other_wall_t0_frac/reverse_canonical_wall are ignored). Chain: runs cap to
-    // cap - the near/far fractions are ignored; chain_anchor_point still picks which end is the start.
-    bool aligned_pairing = false);
+    // Wall pairing (corrugated_wall_pairing). Aligned/Harmonic: Ring - canonical wall oriented CCW and only the canonical
+    // wall's t0 anchor is used (other_wall_t0_frac/reverse_canonical_wall are ignored); Chain - runs cap to cap, the
+    // near/far fractions are ignored and chain_anchor_point still picks which end is the start.
+    WallPairing wall_pairing = WallPairing::ArcLength);
 
 }  // namespace vbct

@@ -349,7 +349,7 @@ std::optional<OpenLinesSet> corrugate(
     OpenLinesSet* transition_lines_out,
     const std::vector<ChainDomainTrack>& chain_domain_tracks,
     Stage9Memo* stage9_memo,
-    const bool aligned_pairing)
+    const vbct::WallPairing wall_pairing)
 {
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): applies this layer's own already-decided
     // suppression set (VbctAdapter::computeAnchorsForMesh's own pre-pass) before VBCT ever sees
@@ -463,7 +463,7 @@ std::optional<OpenLinesSet> corrugate(
             transition_chain_domain_identities_mm,
             transition_solid_fill_spacing_mm,
             toChainDomainOverrides(chain_domain_tracks),
-            aligned_pairing);
+            wall_pairing);
     }
     catch (const std::runtime_error& e)
     {
@@ -3184,7 +3184,7 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     const TransitionLayerRequest& transition_layer_request,
     const std::vector<ChainDomainTrack>& chain_domain_tracks,
     Stage9Memo* stage9_memo,
-    const bool aligned_pairing)
+    const vbct::WallPairing wall_pairing)
 {
     // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9) - see corrugate()'s own identical comment.
     std::vector<std::vector<Point2LL>> ignored_hole_loops;
@@ -3308,7 +3308,7 @@ std::optional<OpenLinesSet> corrugateLinkedSkin(
     const std::vector<vbct::DomainEvents> domain_events = vbct::build_domain_events(
         r9, spacing_mm, phase_offset, anchor_t0_frac, other_wall_t0_frac, reverse_canonical_wall, /*crosshatch_enabled=*/true, chain_anchor_point_mm,
         chain_crosshatch_enabled, chain_left_near_t_frac, chain_left_far_t_frac, chain_right_near_t_frac, chain_right_far_t_frac, extra_clip_loops_mm,
-        chain_swap_left_right, toChainDomainOverrides(chain_domain_tracks), aligned_pairing);
+        chain_swap_left_right, toChainDomainOverrides(chain_domain_tracks), wall_pairing);
 
     // Chain junction (Hub) support (spec REV 2.1): generalized from "exactly one linkable domain"
     // to "every domain independently" - a multi-domain Chain layer (e.g. a Tee's crossbar-plus-stem

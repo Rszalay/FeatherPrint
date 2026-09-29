@@ -3644,12 +3644,12 @@ TEST(VbctAdapterTest, ChainOverrideSwapAppliesOnBothPaths)
 }
 
 /*!
- * Aligned wall pairing (corrugated_wall_pairing = aligned) on an off-centre ring: arc-length pairing samples each wall
+ * Aligned and harmonic wall pairing (corrugated_wall_pairing = aligned / harmonic) on an off-centre ring: arc-length pairing samples each wall
  * at the same fraction of its own length, which skews rungs wherever the hole isn't centred; aligned pairing matches
- * the walls to each other first. Every stringer must still run from the outer wall to the hole's wall, the stringer
+ * the walls to each other first (harmonic falls back to arc-length if its solve fails, which this would catch). Every stringer must still run from the outer wall to the hole's wall, the stringer
  * count must not change, and the rungs must come out shorter on average.
  */
-TEST(VbctAdapterTest, AlignedPairingGivesShorterRungsOnOffCentreRing)
+TEST(VbctAdapterTest, AlignedAndHarmonicPairingGiveShorterRungsOnOffCentreRing)
 {
     Shape ring_shape;
     ring_shape.push_back(makeCirclePolygon(0, 0, 30000, 96));
@@ -3664,14 +3664,17 @@ TEST(VbctAdapterTest, AlignedPairingGivesShorterRungsOnOffCentreRing)
     ASSERT_EQ(r9.domains.size(), 1u);
     ASSERT_EQ(r9.domains[0].kind, "ring");
 
-    auto run = [&](bool aligned)
+    auto run = [&](vbct::WallPairing pairing)
     {
         return vbct::run_stage10(
             r9, 4.0, 0.0, std::nullopt, std::nullopt, std::nullopt, /*crosshatch_enabled=*/false, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, {}, false, false, {}, 0.0, {}, aligned);
+            std::nullopt, std::nullopt, {}, false, false, {}, 0.0, {}, pairing);
     };
-    const vbct::Stage10Result arc = run(false);
-    const vbct::Stage10Result aligned = run(true);
+    const vbct::Stage10Result arc = run(vbct::WallPairing::ArcLength);
+    for (const vbct::WallPairing pairing : { vbct::WallPairing::Aligned, vbct::WallPairing::Harmonic })
+    {
+    const char* name = pairing == vbct::WallPairing::Aligned ? "aligned" : "harmonic";
+    const vbct::Stage10Result aligned = run(pairing);
     ASSERT_EQ(aligned.domains.size(), 1u);
     const std::vector<vbct::Stringer>& a = aligned.domains[0].stringers;
     ASSERT_EQ(a.size(), arc.domains[0].stringers.size());
@@ -3693,11 +3696,12 @@ TEST(VbctAdapterTest, AlignedPairingGivesShorterRungsOnOffCentreRing)
         const double rp_hole = std::hypot(p.x - 6.0, p.y), rq_hole = std::hypot(q.x - 6.0, q.y);
         const bool p_outer_q_hole = std::abs(rp_outer - 30.0) < 0.1 && std::abs(rq_hole - 12.0) < 0.1;
         const bool p_hole_q_outer = std::abs(rp_hole - 12.0) < 0.1 && std::abs(rq_outer - 30.0) < 0.1;
-        EXPECT_TRUE(p_outer_q_hole || p_hole_q_outer) << "stringer (" << p.x << "," << p.y << ")-(" << q.x << "," << q.y << ") doesn't span the two walls";
+        EXPECT_TRUE(p_outer_q_hole || p_hole_q_outer) << name << " stringer (" << p.x << "," << p.y << ")-(" << q.x << "," << q.y << ") doesn't span the two walls";
     }
     const double arc_mean = mean_length(arc.domains[0].stringers);
     const double aligned_mean = mean_length(a);
-    EXPECT_LT(aligned_mean, arc_mean) << "aligned " << aligned_mean << " vs arc-length " << arc_mean;
+    EXPECT_LT(aligned_mean, arc_mean) << name << " " << aligned_mean << " vs arc-length " << arc_mean;
+    }
 }
 
 } // namespace cura

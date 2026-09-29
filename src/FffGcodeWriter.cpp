@@ -2767,8 +2767,11 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // notes for the aliasing failure mode a too-fast sweep can still produce, independent of this
     // setting's own name/units.
     const double vbct_crossover_pitch_mm = mesh.settings.get<double>("corrugated_crossover_pitch_mm");
-    // Wall pairing (corrugated_wall_pairing): see vbct::run_stage10's aligned_pairing.
-    const bool vbct_aligned_pairing = mesh.settings.get<std::string>("corrugated_wall_pairing") == "aligned";
+    // Wall pairing (corrugated_wall_pairing): see vbct::run_stage10's wall_pairing.
+    const std::string vbct_wall_pairing_name = mesh.settings.get<std::string>("corrugated_wall_pairing");
+    const vbct::WallPairing vbct_wall_pairing = vbct_wall_pairing_name == "aligned" ? vbct::WallPairing::Aligned
+                                              : vbct_wall_pairing_name == "harmonic" ? vbct::WallPairing::Harmonic
+                                                                                      : vbct::WallPairing::ArcLength;
     // Second ("CW") stringer family (spec Section 3.1's "two counter-rotating helix families
     // (CCW/CW)") - see VbctAdapter::corrugate's own doc comment for what this actually changes.
     const bool vbct_crosshatch_enabled = mesh.settings.get<bool>("corrugated_crosshatch_enabled");
@@ -2886,7 +2889,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
             transition_layer_request,
             mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
             mesh.corrugation_stage9_memo.get(),
-            vbct_aligned_pairing);
+            vbct_wall_pairing);
         stringer_lines_are_linked_skin = stringer_lines.has_value();
     }
     if (! stringer_lines.has_value())
@@ -2912,7 +2915,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
             &transition_lines,
             mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
             mesh.corrugation_stage9_memo.get(),
-            vbct_aligned_pairing);
+            vbct_wall_pairing);
     }
     // Wall Strip fallback (multi-domain Chain increment): VBCT itself is the only reliable judge of
     // whether expandChainContourRange's own per-domain boundary displacement (above) produced valid
@@ -2952,7 +2955,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
                 transition_layer_request,
             mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
             mesh.corrugation_stage9_memo.get(),
-            vbct_aligned_pairing);
+            vbct_wall_pairing);
             stringer_lines_are_linked_skin = stringer_lines.has_value();
         }
         if (! stringer_lines.has_value())
@@ -2979,7 +2982,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
                 &transition_lines,
             mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
             mesh.corrugation_stage9_memo.get(),
-            vbct_aligned_pairing);
+            vbct_wall_pairing);
         }
     }
     if (! stringer_lines.has_value())
@@ -3023,7 +3026,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
             &transition_lines,
             mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_tracks,
             mesh.corrugation_stage9_memo.get(),
-            vbct_aligned_pairing);
+            vbct_wall_pairing);
     }
 
     // Chain end-linking connector (spec REV 2.6 design, implemented here): when exactly one of a
