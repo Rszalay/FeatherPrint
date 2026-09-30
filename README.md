@@ -20,7 +20,7 @@ Only one generator runs per mesh, dispatched from the same engine build — pick
 
 ## Installation
 
-1. Download **FeatherPrint-1.0.2-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
+1. Download **FeatherPrint-1.1.0-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
 2. Run the installer as Administrator
 3. The installer will detect your Cura 5.13.x installation, back up the original engine files, deploy FeatherPrint, and install validated **"FeatherPrint"** and **"FeatherPrint Corrugated"** print profiles (Print Settings → Profiles)
 
@@ -85,7 +85,8 @@ A genuinely zero-depth hole (see Interior Opening Carry-Through, above) is corre
 
 ### Corrugated generator
 
-- **Wall correspondence discovery** — per-slice, via a vendored VBCT/CDT pipeline (Constrained Delaunay Triangulation), classifying regions as Ring (nested annulus), Chain (opposing wall pair), or Glob (no usable decomposition)
+- **Wall correspondence discovery** — per-slice, classifying regions as Ring (nested annulus) or Chain (opposing wall pair). Since v1.1.0 the default is **Medial Axis** decomposition (the exact medial axis of the slice from a segment Voronoi diagram, pruned by corridor width), which is far more stable layer to layer than the original **Triangulation** (VBCT/CDT) pipeline; both are selectable via *Corrugated Decomposition*
+- **Wall pairing** — how each stringer's two wall points are chosen (*Corrugated Wall Pairing*): **Harmonic** (default since v1.1.0; rungs follow the gradient of a smooth field between the walls, so they never cross), **Aligned** (shortest-rung alignment) or **Arc Length** (the original per-wall fraction)
 - **Corrugation Field** — the corrugated stringer geometry spanning the discovered inner/outer wall pair, for both Ring and Chain domains
 - **Crosshatch** — a second, crossing stringer family for added stiffness (opt-in)
 - **Linked corrugation skin** — continuity across Ring domains
