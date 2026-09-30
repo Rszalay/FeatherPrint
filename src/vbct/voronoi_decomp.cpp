@@ -152,6 +152,7 @@ struct GEdge {
     std::vector<P> pts;
     double length;
     bool alive{ true };
+    double ratio{ 0.0 };
 };
 
 }  // namespace
@@ -210,15 +211,46 @@ Stage9Result decompose_voronoi(const std::vector<Contour>& contours_in, double t
             ratio = r > 1e-6 ? std::abs(B.delta(fl.contour, sl, sr)) / r : 0.0;
         }
         const bool keep = ratio > kCornerRatio;
-        if (debug) {
-            VoronoiDebugEdge de;
-            for (const P& p : pts) de.points.push_back(to_mm(p));
-            de.status = keep ? 0 : 1;
-            de.ratio = std::min(ratio, 99.0);
-            debug->edges.push_back(std::move(de));
-        }
         GEdge g{ &e, vertex_id(e.vertex0()), vertex_id(e.vertex1()), pts, polyline_len(pts) / SCALE };
+        g.ratio = std::min(ratio, 99.0);
         (keep ? edges : corner_edges).push_back(std::move(g));
+    }
+
+    // Corner branches are leaves: they run out to the outline. Strip failed-ratio edges only from the leaf ends; one
+    // that still connects kept axis afterwards (the middle of a solid star, where the ratio test also fails) is put back,
+    // so the axis never falls apart into disconnected pieces.
+    {
+        std::vector<int> deg(vpos.size(), 0);
+        for (const GEdge& g : edges) {
+            ++deg[g.a];
+            ++deg[g.b];
+        }
+        for (const GEdge& g : corner_edges) {
+            ++deg[g.a];
+            ++deg[g.b];
+        }
+        std::vector<char> gone(corner_edges.size(), 0);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t i = 0; i < corner_edges.size(); ++i) {
+                if (gone[i]) continue;
+                const GEdge& g = corner_edges[i];
+                if (deg[g.a] == 1 || deg[g.b] == 1) {
+                    gone[i] = 1;
+                    --deg[g.a];
+                    --deg[g.b];
+                    changed = true;
+                }
+            }
+        }
+        if (! edges.empty()) {
+            std::vector<GEdge> stripped;
+            for (size_t i = 0; i < corner_edges.size(); ++i) {
+                if (gone[i]) stripped.push_back(corner_edges[i]);
+                else edges.push_back(corner_edges[i]);
+            }
+            corner_edges = std::move(stripped);
+        }
     }
 
     // A region with no corridor at all (a solid square or disc): every edge is a corner branch and nothing survives.
@@ -312,13 +344,15 @@ Stage9Result decompose_voronoi(const std::vector<Contour>& contours_in, double t
         }
     }
     if (debug) {
-        for (const GEdge& g : edges) {
-            if (g.alive) continue;
+        auto emit = [&](const GEdge& g, int status) {
             VoronoiDebugEdge de;
             for (const P& p : g.pts) de.points.push_back(to_mm(p));
-            de.status = 2;
+            de.status = status;
+            de.ratio = g.ratio;
             debug->edges.push_back(std::move(de));
-        }
+        };
+        for (const GEdge& g : corner_edges) emit(g, 1);
+        for (const GEdge& g : edges) emit(g, g.alive ? 0 : 2);
     }
 
     // Walk into chains (between vertices of degree != 2) and pure cycles.
