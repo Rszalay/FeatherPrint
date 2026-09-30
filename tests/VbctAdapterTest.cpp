@@ -3708,7 +3708,8 @@ TEST(VbctAdapterTest, AlignedAndHarmonicPairingGiveShorterRungsOnOffCentreRing)
 /*!
  * Medial-axis decomposition (corrugated_decomposition = voronoi): a plain bar is one Chain whose walls run corner to
  * corner along the long sides with the caps at the end faces' midpoints; a bar with one rounded end caps that end at
- * its tip; a concentric annulus is one Ring whose walls are the two whole contours.
+ * its tip; a concentric annulus is one Ring whose walls are the two whole contours; a solid square falls back to one
+ * diagonal Chain.
  */
 TEST(VbctAdapterTest, VoronoiDecompositionBarRoundedEndAndRing)
 {
@@ -3761,6 +3762,19 @@ TEST(VbctAdapterTest, VoronoiDecompositionBarRoundedEndAndRing)
         const double la = vbct::wall_length(r.domains[0].left->points), lb = vbct::wall_length(r.domains[0].right->points);
         EXPECT_NEAR(std::max(la, lb), 2 * std::numbers::pi * 30.0, 1.0);
         EXPECT_NEAR(std::min(la, lb), 2 * std::numbers::pi * 15.0, 1.0);
+    }
+    {
+        // A solid square has no corridor: every medial-axis edge is a corner bisector. The fallback is one Chain along
+        // a full diagonal, corner to opposite corner, each wall taking two sides.
+        Shape square;
+        square.push_back(makeRectPolygon(0, 0, 40000, 40000));
+        const vbct::Stage9Result r = vbct::decompose_voronoi(contours_of(square), 0.8);
+        ASSERT_EQ(r.domains.size(), 1u);
+        const vbct::Domain& d = r.domains[0];
+        ASSERT_TRUE(d.cap_start && d.cap_end && d.left && d.right);
+        EXPECT_NEAR(std::hypot(d.cap_start->x - d.cap_end->x, d.cap_start->y - d.cap_end->y), 40.0 * std::sqrt(2.0), 0.1) << "caps at opposite corners";
+        EXPECT_NEAR(vbct::wall_length(d.left->points), 80.0, 0.1);
+        EXPECT_NEAR(vbct::wall_length(d.right->points), 80.0, 0.1);
     }
 }
 

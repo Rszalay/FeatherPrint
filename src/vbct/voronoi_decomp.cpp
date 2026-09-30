@@ -189,6 +189,7 @@ Stage9Result decompose_voronoi(const std::vector<Contour>& contours_in, double t
         return it->second;
     };
     std::vector<GEdge> edges;
+    std::vector<GEdge> corner_edges;
     std::set<const VD::edge_type*> seen;
     for (const auto& e : vd.edges()) {
         if (! e.is_primary() || ! e.is_finite() || seen.count(&e)) continue;
@@ -216,9 +217,60 @@ Stage9Result decompose_voronoi(const std::vector<Contour>& contours_in, double t
             de.ratio = std::min(ratio, 99.0);
             debug->edges.push_back(std::move(de));
         }
-        if (! keep) continue;
         GEdge g{ &e, vertex_id(e.vertex0()), vertex_id(e.vertex1()), pts, polyline_len(pts) / SCALE };
-        edges.push_back(std::move(g));
+        (keep ? edges : corner_edges).push_back(std::move(g));
+    }
+
+    // A region with no corridor at all (a solid square or disc): every edge is a corner branch and nothing survives.
+    // Fall back to the longest path through the whole medial axis as one Chain - the square's diagonal, a disc's
+    // diameter - so the region still gets a domain rather than no infill.
+    if (edges.empty() && ! corner_edges.empty()) {
+        const int n = static_cast<int>(vpos.size());
+        std::vector<std::vector<int>> cadj(n);
+        for (int i = 0; i < static_cast<int>(corner_edges.size()); ++i) {
+            cadj[corner_edges[i].a].push_back(i);
+            cadj[corner_edges[i].b].push_back(i);
+        }
+        // Longest path between two leaves; ties (a square's four equal half-diagonals, a disc's spokes) broken toward
+        // end points far apart in a straight line, so a square gets a true diagonal and a disc a true diameter.
+        std::vector<int> leaves;
+        for (int v = 0; v < n; ++v)
+            if (cadj[v].size() == 1) leaves.push_back(v);
+        double best_score = -1.0;
+        int best_a = -1, best_b = -1;
+        std::vector<int> via, best_via;
+        for (int la : leaves) {
+            std::vector<double> dist(n, -1.0);
+            via.assign(n, -1);
+            dist[la] = 0.0;
+            std::vector<int> stack{ la };
+            while (! stack.empty()) {
+                const int v = stack.back();
+                stack.pop_back();
+                for (int ei : cadj[v]) {
+                    const int w = corner_edges[ei].a == v ? corner_edges[ei].b : corner_edges[ei].a;
+                    if (dist[w] >= 0.0) continue;
+                    dist[w] = dist[v] + corner_edges[ei].length;
+                    via[w] = ei;
+                    stack.push_back(w);
+                }
+            }
+            for (int lb : leaves) {
+                if (lb == la || dist[lb] < 0.0) continue;
+                const double score = dist[lb] + 1e-3 * len(vpos[lb] - vpos[la]) / SCALE;
+                if (score > best_score) {
+                    best_score = score;
+                    best_a = la;
+                    best_b = lb;
+                    best_via = via;
+                }
+            }
+        }
+        for (int v = best_b; best_a >= 0 && v != best_a && best_via[v] >= 0;) {
+            const GEdge& g = corner_edges[best_via[v]];
+            edges.push_back(g);
+            v = g.a == v ? g.b : g.a;
+        }
     }
 
     // Adjacency and spur pruning.
