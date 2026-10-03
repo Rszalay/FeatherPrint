@@ -1112,13 +1112,14 @@ std::vector<Point2LL> fpSampleShorterArc(const Polygon& poly, const std::vector<
 }
 
 // Builds one side (below OR above) of a hole's contour-matching data: the largest closed
-// polygon on `layer`, p0/p1 projected onto it, and n points sampled along the shorter
-// connecting arc. Returns an empty vector if `layer` has no usable closed outline (e.g. the
+// polygon on `layer`'s toolpath OML (FeatherPrintGenerator::toolpathOml - the same centreline
+// the walls either side of the hole trace, since these points are printed as-is), p0/p1
+// projected onto it, and n points sampled along the shorter connecting arc. Returns an empty vector if `layer` has no usable closed outline (e.g. the
 // hole reaches the very top/bottom of the mesh) — callers must treat that as "no contour data,
 // fall back to a straight chord."
-std::vector<Point2LL> fpSampleHoleBoundaryContour(const SliceLayer& layer, const Point2LL& p0, const Point2LL& p1, int n)
+std::vector<Point2LL> fpSampleHoleBoundaryContour(const SliceLayer& layer, const Point2LL& p0, const Point2LL& p1, int n, coord_t w)
 {
-    const Shape outline = layer.getOutlines(true);
+    const Shape outline = FeatherPrintGenerator::toolpathOml(layer.getOutlines(true), w);
     const Polygon* poly = fpLargestPoly(outline);
     if (poly == nullptr || poly->size() < 3)
         return {};
@@ -1965,7 +1966,8 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                         mesh.layers[layer_below],
                         layer_gaps[bottom_member.first].starts[bottom_member.second],
                         layer_gaps[bottom_member.first].ends[bottom_member.second],
-                        n_samples);
+                        n_samples,
+                        mesh.settings.get<coord_t>("featherprint_line_width"));
                     z_below = mesh.layers[layer_below].printZ;
                 }
                 if (static_cast<size_t>(layer_above) < mesh_layer_count)
@@ -1974,7 +1976,8 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                         mesh.layers[layer_above],
                         layer_gaps[top_member.first].starts[top_member.second],
                         layer_gaps[top_member.first].ends[top_member.second],
-                        n_samples);
+                        n_samples,
+                        mesh.settings.get<coord_t>("featherprint_line_width"));
                     z_above = mesh.layers[layer_above].printZ;
                 }
                 if (contour_below.size() != contour_above.size())
