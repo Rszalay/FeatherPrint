@@ -846,8 +846,9 @@ Shape rawSliceOutline(const SliceLayer& layer)
 }
 
 // Same as rawSliceOutline, but morphologically opened (offset in, then back out) by half a Wall
-// width -- the identical filter WallsComputation.cpp applies (see its own gen_outline) before
-// generating any Wall at all. On a non-manifold/non-watertight input mesh, the slicer's own
+// width -- the material the printed outer Wall actually covers: WallsComputation.cpp traces its
+// centreline on the w/2 inset (FeatherPrintGenerator::toolpathOml), and a w-wide line along it
+// sweeps back out to exactly this. On a non-manifold/non-watertight input mesh, the slicer's own
 // contour-stitching pass can leave thin spurious slivers in a Layer's raw outline that don't
 // correspond to any real geometry the mesh models; WallsComputation silently drops these before
 // ever laying down a Wall, so no printed surface (and therefore no top skin) ever appears there.
@@ -1268,8 +1269,8 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
         // generateOpen build for an open-manifold layer. Shared by the R_avg pre-pass below and
         // the existing phase/origin loop that follows it — both need the identical ring.
         //
-        // Closed-polygon case is put through the SAME morphological open (offset in by w/2,
-        // then out by w/2) WallsComputation applies before ever calling generate() — this is
+        // Closed-polygon case is put through the SAME toolpath-OML inset (FeatherPrintGenerator::
+        // toolpathOml) WallsComputation applies before ever calling generate() — this is
         // NOT optional cosmetic parity: curvature is far more sensitive to small-scale mesh-
         // slicing facet noise than plain perimeter length is (which is all this ring was used
         // for before REV 2.6). Measuring curvature against the RAW, un-smoothed slice polygon
@@ -1300,7 +1301,7 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                 Polygon raw_poly;
                 for (const Point2LL& p : ring_pts)
                     raw_poly.push_back(p);
-                Shape smoothed = Shape(raw_poly).offset(-fp_w_smooth / 2).offset(fp_w_smooth / 2);
+                Shape smoothed = FeatherPrintGenerator::toolpathOml(Shape(raw_poly), fp_w_smooth);
                 const Polygon* largest = nullptr;
                 double la = 0.0;
                 for (const Polygon& p : smoothed)
@@ -1357,6 +1358,13 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                     std::reverse_copy(poly.begin(), poly.end(), ref.pts.begin());
                 else
                     std::copy(poly.begin(), poly.end(), ref.pts.begin());
+                // Toolpath OML, as WallsComputation's own Step 2 applies to each oriented arc.
+                {
+                    OpenPolyline oriented;
+                    oriented.getPoints() = ref.pts;
+                    const OpenPolyline oml = FeatherPrintGenerator::toolpathOmlOpen(oriented, fp_w_smooth);
+                    ref.pts.assign(oml.begin(), oml.end());
+                }
                 double dx = ref.pts[0].X - cx.X, dy = ref.pts[0].Y - cx.Y;
                 ref.angle = std::atan2(dy, dx);
                 refs.push_back(std::move(ref));
@@ -1728,7 +1736,7 @@ void FffPolygonGenerator::processBasicWallsSkinInfill(
                     const double phase = (li < mesh.fp_helix_phase.size()) ? mesh.fp_helix_phase[li] : 0.0;
                     const Point2LL origin = (li < mesh.fp_phase_origin.size()) ? mesh.fp_phase_origin[li] : Point2LL(0, 0);
 
-                    Shape outline_li = filteredSliceOutline(mesh.layers[li], former_w);
+                    Shape outline_li = FeatherPrintGenerator::toolpathOml(rawSliceOutline(mesh.layers[li]), former_w);
                     if (! outline_li.empty())
                     {
                         if (FeatherPrintGenerator::countLacingCollisions(outline_li, mesh.settings, phase, origin, mesh.fp_r_ref) >= 1)

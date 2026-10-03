@@ -893,6 +893,20 @@ int FeatherPrintGenerator::flangePrintInsetIdx(int wi, int n_walls)
     return wi + 1;                       // buried middle Walls: earliest, order among themselves doesn't matter
 }
 
+Shape FeatherPrintGenerator::toolpathOml(const Shape& outline, coord_t w)
+{
+    Shape oml = outline.offset(-w / 2);
+    return oml.empty() ? outline : oml;
+}
+
+OpenPolyline FeatherPrintGenerator::toolpathOmlOpen(const OpenPolyline& poly, coord_t w)
+{
+    if (poly.size() < 2)
+        return poly;
+    const ArcParam arc = buildArcParamOpen(poly);
+    return normalOffsetOpen(arc, Point2LL(0, 0), w / 2, w);
+}
+
 OpenPolyline FeatherPrintGenerator::normalOffsetOpen(const ArcParam& arc, const Point2LL& centroid, coord_t offset, coord_t w)
 {
     OpenPolyline result;
@@ -3043,6 +3057,7 @@ int FeatherPrintGenerator::countLacingCollisionsOpen(const OpenLinesSet& open_po
         {
             oa.poly.getPoints().assign(poly.begin(), poly.end());
         }
+        oa.poly = toolpathOmlOpen(oa.poly, w);
         double dx = static_cast<double>(oa.poly[0].X - centroid.X);
         double dy = static_cast<double>(oa.poly[0].Y - centroid.Y);
         oa.start_angle = std::atan2(dy, dx);

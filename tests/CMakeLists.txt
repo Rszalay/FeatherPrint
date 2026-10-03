@@ -8,6 +8,7 @@ set(TESTS_SRC_BASE
         AntiOozeAmountsTest
         ClipperTest
         ExtruderPlanTest
+        FeatherPrintGeneratorTest
         FffGcodeWriterTest
         GCodeExportTest
         InfillTest

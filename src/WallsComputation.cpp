@@ -80,10 +80,9 @@ void WallsComputation::generateWalls(SliceLayerPart* part, SectionType section_t
             const coord_t z_coord = print_z;
             const coord_t w = settings_.get<coord_t>("featherprint_line_width");
 
-            // Morphological open: removes any feature narrower than the line width.
-            Shape gen_outline = Shape(part->outline).offset(-w / 2).offset(w / 2);
-            if (gen_outline.empty())
-                gen_outline = Shape(part->outline);
+            // Toolpath OML, half a line inside the model surface so the outer face prints on it
+            // (also drops any feature narrower than the line width) - see toolpathOml().
+            Shape gen_outline = FeatherPrintGenerator::toolpathOml(Shape(part->outline), w);
 
             FeatherPrintGenerator fp;
             const bool is_flange_layer = (fp_flange_start_layer_ >= 0
@@ -323,6 +322,8 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             {
                 oa.poly.getPoints().assign(poly.begin(), poly.end());
             }
+            // Toolpath OML, as for a closed Layer (see FeatherPrintGenerator::toolpathOml()).
+            oa.poly = FeatherPrintGenerator::toolpathOmlOpen(oa.poly, settings_.get<coord_t>("featherprint_line_width"));
             double dx = static_cast<double>(oa.poly[0].X - centroid.X);
             double dy = static_cast<double>(oa.poly[0].Y - centroid.Y);
             oa.start_angle = std::atan2(dy, dx);

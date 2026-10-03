@@ -122,6 +122,25 @@ public:
      */
     static int countLacingCollisionsOpen(const OpenLinesSet& open_polylines, const Settings& settings, double helix_phase, Point2LL phase_origin);
 
+    /*!
+     * Toolpath OML: the polygon the outer Wall's own centreline traces, half a line width inside
+     * the sliced model surface, so the outer Wall's outer face lands on that surface - the stock
+     * Cura convention (Arachne's wall 0 centreline sits wall_0_inset + width/2 inside the
+     * outline), so a FeatherPrint part prints to the same size as one sliced any other way and
+     * mates with it. Every generator and pre-pass that places or measures toolpath geometry takes
+     * its outline through this. Also drops features narrower than w (eroding by w/2 equals the
+     * morphological open by w/2 it replaces, followed by the same erosion). Falls back to the raw
+     * outline when the inset vanishes (a part thinner than one line).
+     */
+    static Shape toolpathOml(const Shape& outline, coord_t w);
+
+    /*!
+     * Open-arc counterpart of toolpathOml(): `poly` must already be oriented CCW (interior on the
+     * left, WallsComputation's Step 2). Each point moves w/2 along the inward normal, so the arc's
+     * own ends stay at the same position along the boundary.
+     */
+    static OpenPolyline toolpathOmlOpen(const OpenPolyline& poly, coord_t w);
+
     // Parameters shared across all open-polyline arcs on the same layer.
     // Computed once from the full virtual ring (all arcs + gap chords) so that
     // every arc uses a consistent perimeter length, reference angle, and centroid.
