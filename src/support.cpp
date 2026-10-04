@@ -3,6 +3,7 @@
 
 #include "support.h"
 
+#include <algorithm>
 #include <cmath> // sqrt, round
 #include <deque>
 #include <fstream> // ifstream.good()
@@ -1177,6 +1178,13 @@ void AreaSupport::generateSupportAreasForMesh(
             AreaSupport::handleWallStruts(infill_settings, layer_this);
             // handle towers
             AreaSupport::handleTowers(infill_settings, xy_disallowed_per_layer[layer_idx], layer_this, tower_roofs, mesh.overhang_points, layer_idx, layer_count);
+            // Retired roofs are cleared in place; drop them so the list only holds live ones.
+            std::erase_if(
+                tower_roofs,
+                [](const Shape& roof)
+                {
+                    return roof.empty();
+                });
         }
 
         if (layer_idx + 1 < layer_count)
@@ -1210,7 +1218,27 @@ void AreaSupport::generateSupportAreasForMesh(
                 {
                     Shape tiny_tower_here;
                     tiny_tower_here.push_back(polygon_part);
-                    tower_roofs.emplace_back(tiny_tower_here);
+                    // FeatherPrint fix: a tiny support area that persists down many Layers is re-added here on
+                    // every one of them. Normally each copy grows to tower size within a few Layers and is
+                    // retired, but where the model hems it in (support beside a narrow feature) a roof can never
+                    // reach tower size or vanish, so every copy stays in tower_roofs and handleTowers re-processes
+                    // the whole, ever-growing list each Layer - quadratic in Layer count (a 1534-Layer wing spent
+                    // ~16 minutes here, which looks like a hang). Skip a copy that an existing live roof already
+                    // covers: roof growth is monotone in the roof, so the copy traces a subset of what the
+                    // covering roof adds for as long as that roof lives. The one output change seen is that a
+                    // covered copy no longer outlives its covering roof and drifts, re-grown away from the model
+                    // Layer after Layer, into a free-standing tower that supports nothing.
+                    const bool covered = std::any_of(
+                        tower_roofs.begin(),
+                        tower_roofs.end(),
+                        [&tiny_tower_here](const Shape& roof)
+                        {
+                            return ! roof.empty() && tiny_tower_here.difference(roof).empty();
+                        });
+                    if (! covered)
+                    {
+                        tower_roofs.emplace_back(tiny_tower_here);
+                    }
                 }
             }
         }
