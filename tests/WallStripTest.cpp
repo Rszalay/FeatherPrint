@@ -3,6 +3,8 @@
 
 #include "corrugated/WallStrip.h" // Unit under test.
 
+#include <cmath>
+
 #include <gtest/gtest.h>
 
 #include "geometry/Point2LL.h"
@@ -277,6 +279,77 @@ TEST(WallStripTest, StripWallArcLengthRangeRemovesOnlyTheCoveredSideOfASharedLoo
  * own walk actually crossing back through that seam (`collectArc`'s own wraparound indexing),
  * unlike the first test above where the kept arc's own start/end never comes near it.
  */
+/*!
+ * A thin loop folds back close to itself (the inside and outside skin of a hollow section near a
+ * thin trailing edge). The domain's wall runs along the top edge, but its last point sits nearer
+ * the bottom edge and projects onto it. Only the top edge may be cut: the old "everything but the
+ * largest gap" rule also cut the right end and the start of the bottom edge (A50 wing root, Strip
+ * Wall B removing the outside skin).
+ */
+TEST(WallStripTest, StripWallArcLengthRangeIgnoresAPointThatProjectsOntoTheFarSideOfAThinLoop)
+{
+    constexpr coord_t kHalfWidth = 20000, kHalfHeight = 500;
+    std::vector<VariableWidthLines> wall_toolpaths;
+    wall_toolpaths.push_back({ makeRectangleLoop(0, kHalfWidth, kHalfHeight, 8) });
+
+    std::vector<Point2LL> domain_wall_points;
+    for (coord_t x = -15000; x <= 15000; x += 2500)
+    {
+        domain_wall_points.emplace_back(x, kHalfHeight - 100);
+    }
+    domain_wall_points.emplace_back(16000, -kHalfHeight + 100); // nearer the bottom edge than the top
+
+    ASSERT_TRUE(stripWallArcLengthRanges(wall_toolpaths, { domain_wall_points }));
+    ASSERT_EQ(wall_toolpaths[0].size(), 1u);
+    const ExtrusionLine& kept = wall_toolpaths[0].front();
+    EXPECT_TRUE(lineHasPointNearX(kept, kHalfWidth, 100)) << "the right end must survive";
+    EXPECT_TRUE(lineHasPointNear(kept, Point2LL(kHalfWidth, -kHalfHeight), 100)) << "the bottom-right corner, past the stray point, must survive";
+    for (const ExtrusionJunction& j : kept)
+    {
+        if (j.p_.Y == kHalfHeight)
+        {
+            EXPECT_TRUE(std::abs(j.p_.X) >= 14900) << "a surviving point sits inside the covered top edge: (" << j.p_.X << ", " << j.p_.Y << ")";
+        }
+    }
+}
+
+TEST(WallStripTest, CoveredArcRangesTracesTheWallAndSkipsJumps)
+{
+    // A 100-long loop; the wall runs from 10 to 30, with one point jumping to 70 in the middle.
+    const std::vector<Point2LL> points = { Point2LL(10, 0), Point2LL(15, 0), Point2LL(20, 0), Point2LL(21, 0), Point2LL(25, 0), Point2LL(30, 0) };
+    const std::vector<double> positions = { 10.0, 15.0, 20.0, 70.0, 25.0, 30.0 };
+    const std::vector<double> distances(points.size(), 0.0);
+    const auto ranges = coveredArcRanges(points, positions, distances, 100.0);
+    ASSERT_EQ(ranges.size(), 2u);
+    EXPECT_DOUBLE_EQ(ranges[0].first, 10.0);
+    EXPECT_DOUBLE_EQ(ranges[0].second, 20.0);
+    EXPECT_DOUBLE_EQ(ranges[1].first, 25.0);
+    EXPECT_DOUBLE_EQ(ranges[1].second, 30.0);
+}
+
+TEST(WallStripTest, CoveredArcRangesWrapsTheSeamAndReportsFullCoverage)
+{
+    std::vector<Point2LL> points;
+    std::vector<double> positions;
+    for (int i = 0; i <= 10; ++i)
+    {
+        points.emplace_back(i * 10, 0);
+        positions.push_back(std::fmod(90.0 + i * 10.0, 100.0)); // 90, 0, 10, ... 90: the whole loop, across the seam
+    }
+    const std::vector<double> distances(points.size(), 0.0);
+    const auto full = coveredArcRanges(points, positions, distances, 100.0);
+    ASSERT_EQ(full.size(), 2u); // full coverage: two half-loop ranges
+    EXPECT_DOUBLE_EQ(full[0].first, 0.0);
+    EXPECT_DOUBLE_EQ(full[1].second, 0.0);
+
+    const std::vector<Point2LL> part(points.begin(), points.begin() + 4);
+    const std::vector<double> part_pos(positions.begin(), positions.begin() + 4); // 90 -> 20, across the seam
+    const auto wrapped = coveredArcRanges(part, part_pos, std::vector<double>(4, 0.0), 100.0);
+    ASSERT_EQ(wrapped.size(), 1u);
+    EXPECT_DOUBLE_EQ(wrapped[0].first, 90.0);
+    EXPECT_DOUBLE_EQ(wrapped[0].second, 20.0);
+}
+
 TEST(WallStripTest, StripWallArcLengthRangeHandlesTheCoveredRangeWrappingThePolylineSeam)
 {
     constexpr coord_t kHalfWidth = 10000, kHalfHeight = 2000;

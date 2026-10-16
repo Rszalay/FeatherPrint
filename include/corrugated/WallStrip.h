@@ -5,6 +5,7 @@
 #define CORRUGATED_WALL_STRIP_H
 
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "utils/Coord_t.h"
@@ -121,6 +122,33 @@ bool stripRingWalls(std::vector<VariableWidthLines>& wall_toolpaths, bool strip_
  * \return Whether anything was actually stripped.
  */
 bool stripWallArcLengthRanges(std::vector<VariableWidthLines>& wall_toolpaths, const std::vector<std::vector<Point2LL>>& domain_wall_point_sets);
+
+/*!
+ * \brief The arc-length ranges of a closed contour that a domain wall actually runs along - shared by
+ * `stripWallArcLengthRanges` (the printed wall) and `VbctAdapter::expandChainContourRange` (the
+ * corrugation's own boundary), so both always cut the same stretch.
+ *
+ * The wall is traced in its own point order: each consecutive pair of wall points covers the stretch of
+ * the contour between their two projected positions, provided that stretch is about as long as the two
+ * points are apart. A point that projects onto a *different* stretch of the same loop - where the loop
+ * folds back close to itself, e.g. the inside and outside skin of a hollow section meeting near a thin
+ * trailing edge - shows up as a step whose arc length is many times the points' own spacing, and is
+ * skipped. (The previous rule took "everything but the largest gap between the projected positions", so
+ * one such stray point moved the gap and cut the far side of the loop: Strip Wall B removed a wing
+ * root's outside skin on every layer where a slot opened its cavity.)
+ *
+ * \param wall_points The domain wall, in order.
+ * \param positions Each wall point's nearest arc-length position on the contour (same order).
+ * \param distances Each wall point's distance to that position.
+ * \param total_length The contour's length.
+ * \return Forward-walked [from, to) ranges (`to` < `from` wraps), disjoint and sorted by `from`; empty if
+ * no step qualifies. Full coverage comes back as two half-loop ranges.
+ */
+std::vector<std::pair<double, double>> coveredArcRanges(
+    const std::vector<Point2LL>& wall_points,
+    const std::vector<double>& positions,
+    const std::vector<double>& distances,
+    double total_length);
 
 /*!
  * \brief Chain end-linking connector (spec REV 2.6 design, implemented here): finds the open wall

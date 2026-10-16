@@ -34,6 +34,7 @@
 #include "stage9.hpp" // 10's final stringers.
 #include "voronoi_decomp.hpp" // vbct::decompose_voronoi (corrugated_decomposition = voronoi)
 #include "wall_ab_assignment.hpp" // vbct::assign_wall_ab - Chain Wall A/B canonical assignment
+#include "corrugated/WallStrip.h" // coveredArcRanges, shared with Wall Strip
 
 namespace cura
 {
@@ -972,12 +973,11 @@ Point2LL polygonInwardPointAt(const PolygonGeometry& g, double pos, const Shape&
 // Wall Strip (spec REV 2.6/5.7, Chain increment): the sub-range analogue of
 // expandCorrugationInputForStrippedWalls above, for a Chain domain whose own wall is often only
 // part of a larger shared contour rather than a whole one on its own. Finds the domain's own
-// covered arc-length range on the matching contour in `corrugation_input` (== part.infill_area by
-// the time this runs) the same way stripWallArcLengthRange finds it on the real wall
-// (WallStrip.cpp - largest gap between the domain's own projected sample positions is the *kept*
-// arc; everything else is the domain's own covered range), then moves each of *infill's own*
-// vertices within that range outward to its own nearest point on `outline`, leaving the rest of
-// that same contour (any un-stripped sibling domain's own segment) completely untouched.
+// covered arc-length ranges on the matching contour in `corrugation_input` (== part.infill_area by
+// the time this runs) with the same rule stripWallArcLengthRanges applies to the real wall
+// (WallStrip.h coveredArcRanges), then moves each of *infill's own* vertices within those ranges
+// outward to its own nearest point on `outline`, leaving the rest of that same contour (any
+// un-stripped sibling domain's own segment) completely untouched.
 //
 // Unlike Ring's own outer/hole pair, a Chain domain's own two walls are, in the common (no-hole)
 // case, just two different arcs of the *same single* contour - not genuinely separate contours -
@@ -1049,75 +1049,63 @@ bool expandChainContourRange(Shape& corrugation_input, const Shape& outline, con
         return false;
     }
 
+    // The stretches of this contour the domain wall actually runs along - the same rule Wall Strip uses
+    // on the printed wall (WallStrip.h coveredArcRanges), so the boundary moves out exactly where the
+    // wall was removed.
     std::vector<double> positions;
+    std::vector<double> distances;
     positions.reserve(domain_wall_points.size());
+    distances.reserve(domain_wall_points.size());
     for (const Point2LL& p : domain_wall_points)
     {
-        positions.push_back(nearestPolygonPositionAndDistSq(infill_geom, p).first);
+        const auto [pos, dist_sq] = nearestPolygonPositionAndDistSq(infill_geom, p);
+        positions.push_back(pos);
+        distances.push_back(std::sqrt(dist_sq));
     }
-    std::sort(positions.begin(), positions.end());
-    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
-    if (positions.size() < 2)
+    const std::vector<std::pair<double, double>> covered = coveredArcRanges(domain_wall_points, positions, distances, infill_geom.total_length);
+    if (covered.empty())
     {
         return false;
     }
 
-    const size_t n = positions.size();
-    double best_gap = (positions.front() + infill_geom.total_length) - positions.back();
-    size_t best_gap_start_idx = n - 1;
-    for (size_t i = 0; i + 1 < n; ++i)
+    // Rebuild the contour range by range: each covered range's own vertices, in infill's own original
+    // order/density, moved to their nearest point on outline (nothing about vertex count or connectivity
+    // changes, only individual positions), then the untouched stretch up to the next covered range.
+    // Each piece's last point duplicates the next piece's first (the same position, before displacement),
+    // and the last piece's last point duplicates the first piece's first, where a Polygon's implicit
+    // closure reconnects - so every piece drops its last point, rather than leave zero-length edges
+    // (this function exists to feed VBCT nothing less than clean, simple geometry - see its history above).
+    std::vector<Point2LL> rebuilt;
+    for (size_t k = 0; k < covered.size(); ++k)
     {
-        const double gap = positions[i + 1] - positions[i];
-        if (gap > best_gap)
+        const auto [from, to] = covered[k];
+        const double next_from = covered[(k + 1) % covered.size()].first;
+        std::vector<Point2LL> covered_arc = collectPolygonArc(infill_geom, from, to);
+        if (covered_arc.size() < 2)
         {
-            best_gap = gap;
-            best_gap_start_idx = i;
+            return false;
+        }
+        for (Point2LL& p : covered_arc)
+        {
+            const double outline_pos = nearestPolygonPositionAndDistSq(outline_geom, p).first;
+            p = polygonInwardPointAt(outline_geom, outline_pos, outline, half_line_width);
+        }
+        covered_arc.pop_back();
+        rebuilt.insert(rebuilt.end(), covered_arc.begin(), covered_arc.end());
+        if (std::abs(next_from - to) > 1e-6)
+        {
+            std::vector<Point2LL> kept_arc = collectPolygonArc(infill_geom, to, next_from);
+            kept_arc.pop_back();
+            rebuilt.insert(rebuilt.end(), kept_arc.begin(), kept_arc.end());
         }
     }
-    // The domain's own covered range is the complement of the largest gap (the largest gap is the
-    // untouched rest of the shared contour) - same convention as WallStrip.cpp's own
-    // findKeptArcFromLargestGap, inverted here since this function needs the covered range, not
-    // the kept one.
-    const double covered_from = positions[(best_gap_start_idx + 1) % n];
-    const double covered_to = positions[best_gap_start_idx];
-
-    // The covered range's own vertices, in infill's own original order/density - each one gets
-    // moved to its own nearest point on outline below; nothing about vertex count or connectivity
-    // changes, only individual positions.
-    std::vector<Point2LL> covered_arc = collectPolygonArc(infill_geom, covered_from, covered_to);
-    if (covered_arc.size() < 2)
+    if (rebuilt.size() < 3)
     {
         return false;
     }
-    for (Point2LL& p : covered_arc)
-    {
-        const double outline_pos = nearestPolygonPositionAndDistSq(outline_geom, p).first;
-        p = polygonInwardPointAt(outline_geom, outline_pos, outline, half_line_width);
-    }
-
-    // Splice: infill's own contour, from covered_to (the range's own end) forward around to
-    // covered_from (its own start) - i.e. everything *outside* the covered range, completely
-    // unmodified - followed by covered_arc (now displaced outward) grafted back in where it was.
-    std::vector<Point2LL> kept_infill_arc = collectPolygonArc(infill_geom, covered_to, covered_from);
-    if (kept_infill_arc.size() < 2)
-    {
-        return false;
-    }
-    // Drop one end from each open arc before joining them into a single closed Polygon: kept_infill_arc's
-    // own last point (interpolated at covered_from) duplicates covered_arc's own first point (the
-    // same position, before displacement) - and covered_arc's own last point (interpolated at
-    // covered_to) duplicates kept_infill_arc's own first point, which is where a Polygon's own
-    // *implicit* closure (last vertex connects back to the first, no explicit repeat needed) already
-    // reconnects to. Keeping both would leave a real, if usually harmless, zero-length duplicate
-    // edge right at the closing seam - trimmed here rather than left in, since this whole function
-    // exists specifically to avoid feeding VBCT anything less than clean, simple geometry (see this
-    // function's own history above).
-    kept_infill_arc.pop_back();
-    covered_arc.pop_back();
-    kept_infill_arc.insert(kept_infill_arc.end(), covered_arc.begin(), covered_arc.end());
 
     Polygon spliced;
-    for (const Point2LL& p : kept_infill_arc)
+    for (const Point2LL& p : rebuilt)
     {
         spliced.push_back(p);
     }

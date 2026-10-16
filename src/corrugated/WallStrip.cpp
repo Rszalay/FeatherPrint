@@ -244,33 +244,6 @@ ExtrusionLine collectArc(const ExtrusionLine& line, const ClosedLineGeometry& g,
     return result;
 }
 
-// Given the arc-length positions (on the same candidate line) that a domain's own sampled wall
-// points projected onto, finds the domain's own covered range by locating the single largest gap
-// between consecutive (sorted, wraparound-aware) positions - everything *outside* that gap is
-// where the domain's samples actually cluster, so it's the covered range; the gap itself is "the
-// rest of the shared wall," left untouched. Returns the *kept* (untouched) arc's own
-// [from_pos, to_pos), to be walked forward via collectArc - deliberately returning the kept range
-// directly rather than the removed one, since collectArc's own "walk forward" semantics already
-// produce the survivor without needing a separate complement step.
-std::pair<double, double> findKeptArcFromLargestGap(std::vector<double> positions, double total_length)
-{
-    std::sort(positions.begin(), positions.end());
-    const size_t n = positions.size();
-    double best_gap = (positions.front() + total_length) - positions.back(); // the wrap gap, checked first
-    size_t best_gap_start_idx = n - 1; // gap starts right after positions[n-1] (wraps to positions[0])
-    for (size_t i = 0; i + 1 < n; ++i)
-    {
-        const double gap = positions[i + 1] - positions[i];
-        if (gap > best_gap)
-        {
-            best_gap = gap;
-            best_gap_start_idx = i;
-        }
-    }
-    // The largest gap IS the kept (untouched) arc: [positions[best_gap_start_idx], positions[(best_gap_start_idx+1) % n]).
-    return { positions[best_gap_start_idx], positions[(best_gap_start_idx + 1) % n] };
-}
-
 double wrapPos(double pos, double total_length)
 {
     pos = std::fmod(pos, total_length);
@@ -398,6 +371,79 @@ std::vector<ExtrusionLine> splitByRemovedRanges(const ExtrusionLine& original, c
 
 } // namespace
 
+std::vector<std::pair<double, double>> coveredArcRanges(
+    const std::vector<Point2LL>& wall_points,
+    const std::vector<double>& positions,
+    const std::vector<double>& distances,
+    const double total_length)
+{
+    if (total_length <= 0.0 || wall_points.size() < 2 || positions.size() != wall_points.size() || distances.size() != wall_points.size())
+    {
+        return {};
+    }
+
+    // Each qualifying step, as (start, length) walking forward.
+    std::vector<std::pair<double, double>> steps;
+    for (size_t i = 0; i + 1 < wall_points.size(); ++i)
+    {
+        double delta = positions[i + 1] - positions[i];
+        if (delta > total_length / 2.0)
+        {
+            delta -= total_length;
+        }
+        else if (delta < -total_length / 2.0)
+        {
+            delta += total_length;
+        }
+        // Two points within d1, d2 of the contour and s apart project at most about s + d1 + d2 apart
+        // along it (a little more round a corner); doubled for margin. A jump to another stretch of the
+        // loop is many times this.
+        const double allowed = 2.0 * edgeLength(wall_points[i], wall_points[i + 1]) + 2.0 * (distances[i] + distances[i + 1]) + 10.0;
+        if (delta == 0.0 || std::abs(delta) > allowed)
+        {
+            continue;
+        }
+        steps.emplace_back(wrapPos(delta > 0.0 ? positions[i] : positions[i + 1], total_length), std::abs(delta));
+    }
+    if (steps.empty())
+    {
+        return {};
+    }
+
+    std::sort(steps.begin(), steps.end());
+    std::vector<std::pair<double, double>> merged; // (from, to), to possibly past total_length
+    for (const auto& [start, length] : steps)
+    {
+        if (! merged.empty() && start <= merged.back().second)
+        {
+            merged.back().second = std::max(merged.back().second, start + length);
+        }
+        else
+        {
+            merged.emplace_back(start, start + length);
+        }
+    }
+    // The last range may run past the end of the loop into the first ones.
+    while (merged.size() > 1 && merged.back().second - total_length >= merged.front().first)
+    {
+        merged.back().second = std::max(merged.back().second, merged.front().second + total_length);
+        merged.erase(merged.begin());
+    }
+    if (merged.back().second - merged.back().first >= total_length)
+    {
+        return { { 0.0, total_length / 2.0 }, { total_length / 2.0, 0.0 } };
+    }
+
+    std::vector<std::pair<double, double>> ranges;
+    ranges.reserve(merged.size());
+    for (const auto& [from, to] : merged)
+    {
+        ranges.emplace_back(wrapPos(from, total_length), wrapPos(to, total_length));
+    }
+    std::sort(ranges.begin(), ranges.end());
+    return ranges;
+}
+
 bool stripWallArcLengthRanges(std::vector<VariableWidthLines>& wall_toolpaths, const std::vector<std::vector<Point2LL>>& domain_wall_point_sets)
 {
     std::vector<const std::vector<Point2LL>*> valid_sets;
@@ -440,6 +486,7 @@ bool stripWallArcLengthRanges(std::vector<VariableWidthLines>& wall_toolpaths, c
             std::optional<size_t> best_line_idx;
             ClosedLineGeometry best_geometry;
             std::vector<double> best_positions;
+            std::vector<double> best_distances;
             double best_avg_dist_sq = std::numeric_limits<double>::max();
 
             for (size_t li = 0; li < inset.size(); ++li)
@@ -454,12 +501,15 @@ bool stripWallArcLengthRanges(std::vector<VariableWidthLines>& wall_toolpaths, c
                     continue;
                 }
                 std::vector<double> positions;
+                std::vector<double> distances;
                 positions.reserve(domain_wall_points.size());
+                distances.reserve(domain_wall_points.size());
                 double sum_dist_sq = 0.0;
                 for (const Point2LL& target : domain_wall_points)
                 {
                     const auto [pos, dist_sq] = nearestPositionAndDistSq(g, target);
                     positions.push_back(pos);
+                    distances.push_back(std::sqrt(dist_sq));
                     sum_dist_sq += dist_sq;
                 }
                 const double avg_dist_sq = sum_dist_sq / static_cast<double>(domain_wall_points.size());
@@ -469,6 +519,7 @@ bool stripWallArcLengthRanges(std::vector<VariableWidthLines>& wall_toolpaths, c
                     best_line_idx = li;
                     best_geometry = g;
                     best_positions = std::move(positions);
+                    best_distances = std::move(distances);
                 }
             }
             if (! best_line_idx.has_value())
@@ -476,15 +527,11 @@ bool stripWallArcLengthRanges(std::vector<VariableWidthLines>& wall_toolpaths, c
                 return false; // no closed contour at this depth at all - fail safe
             }
 
-            std::sort(best_positions.begin(), best_positions.end());
-            best_positions.erase(std::unique(best_positions.begin(), best_positions.end()), best_positions.end());
-            if (best_positions.size() < 2)
+            const std::vector<std::pair<double, double>> covered = coveredArcRanges(domain_wall_points, best_positions, best_distances, best_geometry.total_length);
+            if (covered.empty())
             {
-                return false; // domain wall projected to a single point on the candidate - degenerate, fail safe
+                return false; // the wall never runs along the candidate (or projects to a single point) - degenerate, fail safe
             }
-            const auto [kept_from, kept_to] = findKeptArcFromLargestGap(best_positions, best_geometry.total_length);
-            // The covered (to be removed) range is the complement of the kept one.
-            const std::pair<double, double> removed_range{ kept_to, kept_from };
 
             // Find (or start) this depth's own group for the matched contour - sets matching the
             // same line_idx join the same group, so their own ranges get cut together.
@@ -502,7 +549,7 @@ bool stripWallArcLengthRanges(std::vector<VariableWidthLines>& wall_toolpaths, c
                 groups.push_back(PlannedGroup{ *best_line_idx, best_geometry, {} });
                 group = &groups.back();
             }
-            group->removed_ranges.push_back(removed_range);
+            group->removed_ranges.insert(group->removed_ranges.end(), covered.begin(), covered.end());
         }
     }
 
