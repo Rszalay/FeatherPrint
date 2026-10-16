@@ -1778,8 +1778,8 @@ static void trackChainDomains(
         out.anchor_point = fromVbctMm(anchor);
         out.swap_left_right = vbct::assign_wall_ab(dom.left->points, dom.right->points, contours, centroid).left_label != vbct::WallLabel::A;
 
-        const std::vector<vbct::Point2> oriented_left = vbct::orient_toward(dom.left->points, anchor);
-        const std::vector<vbct::Point2> oriented_right = vbct::orient_toward(dom.right->points, anchor);
+        const std::vector<vbct::Point2> oriented_left = vbct::orient_chain_wall(dom, dom.left->points, anchor);
+        const std::vector<vbct::Point2> oriented_right = vbct::orient_chain_wall(dom, dom.right->points, anchor);
         const double left_len = vbct::wall_length(oriented_left);
         const double right_len = vbct::wall_length(oriented_right);
         if (left_len > 0.0 && right_len > 0.0)
@@ -2459,8 +2459,8 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
                 // physical walls never actually swap identity. A whole-wall mean averages out that
                 // per-vertex cusp noise the same way it already does for Wall Strip's own identity
                 // tracking, leaving a far more stable signal to decide the swap from.
-                const std::vector<vbct::Point2> oriented_left = vbct::orient_toward(chain_domain->left->points, chosen_anchor);
-                const std::vector<vbct::Point2> oriented_right = vbct::orient_toward(chain_domain->right->points, chosen_anchor);
+                const std::vector<vbct::Point2> oriented_left = vbct::orient_chain_wall(*chain_domain, chain_domain->left->points, chosen_anchor);
+                const std::vector<vbct::Point2> oriented_right = vbct::orient_chain_wall(*chain_domain, chain_domain->right->points, chosen_anchor);
                 const double oriented_left_len = vbct::wall_length(oriented_left);
                 const double oriented_right_len = vbct::wall_length(oriented_right);
                 if (oriented_left_len > 0.0 && oriented_right_len > 0.0)

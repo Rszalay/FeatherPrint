@@ -3481,6 +3481,36 @@ TEST(VbctAdapterTest, OrientTowardGivesClosedLoopWallsOneWinding)
 }
 
 /*!
+ * A self-loop Chain's wall need not close exactly: a hollow section whose medial axis keeps a branch
+ * into a solid trailing edge gives a Chain from that junction round and back, whose outside wall stops
+ * short on either side of the branch. Its two ends are a near-tie for "nearer the target", so the
+ * nearest-end rule picked a direction by noise; against the closed cavity wall's winding that paired
+ * every stringer with the far side of the cavity (A50 Printables Wing Root, Medial Axis, layers below
+ * and above the slot). Every wall of a self-loop Chain must come out counter-clockwise.
+ */
+TEST(VbctAdapterTest, OrientChainWallGivesSelfLoopChainWallsOneWinding)
+{
+    vbct::Domain loop;
+    loop.kind = "chain";
+    loop.cap_start = vbct::Point2{ 5, 10 };
+    loop.cap_end = vbct::Point2{ 5, 10 };
+    // Outside wall, clockwise, open: from just right of the junction round to just left of it. Its start is
+    // marginally nearer the cap, so the nearest-end rule kept it clockwise.
+    const std::vector<vbct::Point2> open_cw = { { 5.4, 10 }, { 10, 10 }, { 10, 0 }, { 0, 0 }, { 0, 10 }, { 4.5, 10 } };
+    ASSERT_LT(vbct::signed_area(open_cw), 0.0);
+    const std::vector<vbct::Point2> oriented = vbct::orient_chain_wall(loop, open_cw, *loop.cap_start);
+    EXPECT_GT(vbct::signed_area(oriented), 0.0);
+
+    // An ordinary Chain still orients by its near end.
+    vbct::Domain bar;
+    bar.kind = "chain";
+    bar.cap_start = vbct::Point2{ 0, 0 };
+    bar.cap_end = vbct::Point2{ 10, 0 };
+    const std::vector<vbct::Point2> wall = { { 0, 1 }, { 5, 1 }, { 10, 1 } };
+    EXPECT_EQ(vbct::orient_chain_wall(bar, wall, { 10, 0 }).front().x, 10.0);
+}
+
+/*!
  * The corrugation input's overlap growth and stripped-side revert are shared by the live per-layer call and
  * computeAnchorsForMesh's pre-pass (both must hand VBCT identical geometry, or the pre-pass's anchors mirror the
  * stringers on Ring layers). A pre-pass copy of this once skipped the growth whenever either strip setting was on,

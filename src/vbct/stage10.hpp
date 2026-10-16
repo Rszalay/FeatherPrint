@@ -77,6 +77,12 @@ std::vector<Point2> match_winding(const std::vector<Point2>& left, const std::ve
 // toward the same target this file's own prepare_domain_sampling uses, before searching along
 // them - see this function's own doc comment in stage10.cpp for the full rationale.
 std::vector<Point2> orient_toward(const std::vector<Point2>& points, const Point2& target);
+// Orients one wall of a Chain `domain` for sampling: toward `target` (orient_toward), except on a
+// self-loop Chain - one whose start and end caps are the same junction, e.g. a hollow section whose
+// medial axis keeps a branch into a solid trailing edge - where no wall has a near or far end and every
+// wall is put counter-clockwise instead. Every caller (prepare_domain_sampling and the adapter's
+// cross-layer trackers) must orient through this so they all agree.
+std::vector<Point2> orient_chain_wall(const Domain& domain, const std::vector<Point2>& points, const Point2& target);
 
 // \param phase_offset Crossover Pitch (2026-09-15 redesign): the *raw*, undivided crossover-phase
 // argument z_mm / (2 * pitch_mm) - not itself a fraction of a wrap, and not pre-divided by any

@@ -57,6 +57,21 @@ std::vector<Point2> orient_toward(const std::vector<Point2>& points, const Point
     return std::vector<Point2>(points.rbegin(), points.rend());
 }
 
+std::vector<Point2> orient_chain_wall(const Domain& domain, const std::vector<Point2>& points, const Point2& target) {
+    // A self-loop Chain runs from a junction all the way round and back to it, so each wall's two ends both sit
+    // beside that junction. A wall that closes exactly is handled by orient_toward's own closed-loop rule, but one
+    // that stops short on either side of the junction (the outside skin of a hollow section, interrupted by a
+    // solid trailing-edge branch) is not: its two ends are a near-tie for "nearer the target", decided by noise.
+    // Getting it against the other wall's winding paired each stringer with the far side of the cavity.
+    const bool self_loop = domain.cap_start && domain.cap_end
+                        && std::hypot(domain.cap_start->x - domain.cap_end->x, domain.cap_start->y - domain.cap_end->y) < 1e-6;
+    if (self_loop && points.size() > 2) {
+        if (signed_area(points) < 0.0) return std::vector<Point2>(points.rbegin(), points.rend());
+        return points;
+    }
+    return orient_toward(points, target);
+}
+
 // signed_area and match_winding, like wall_length above, are not anonymous-namespace: exposed via
 // stage10.hpp so VbctAdapter::computeAnchorsForMesh can apply the *same* match_winding decision
 // to the "other" wall before computing/tracking its own t0_frac, instead of computing that
@@ -720,8 +735,8 @@ DomainSampling prepare_domain_sampling(
         // why domain.cap_start alone can't be trusted to mean "the same physical end" across
         // layers: far_cap()'s assignment, stage9.cpp, has no cross-layer memory of its own).
         const Point2& target = chain_anchor_point.has_value() ? *chain_anchor_point : *domain.cap_start;
-        left = orient_toward(left, target);
-        right = orient_toward(right, target);
+        left = orient_chain_wall(domain, left, target);
+        right = orient_chain_wall(domain, right, target);
     } else {
         right = match_winding(left, right);
         const Point2 shared_centroid = polygon_centroid(left);
