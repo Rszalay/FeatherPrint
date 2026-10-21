@@ -49,6 +49,14 @@ struct ExtrusionLine
     bool is_closed_;
 
     /*!
+     * FeatherPrint: an open path that must be printed from its first junction to its last, never
+     * reversed to start from whichever end is nearer. Set on the open-manifold ring's segments (skin
+     * arcs, Punchout, Shelf), which are generated in one direction round the ring - see
+     * WallsComputation's open-manifold branch and FffGcodeWriter::addMeshLayerToGCode.
+     */
+    bool fp_fixed_direction_{ false };
+
+    /*!
      * The list of vertices along which this path runs.
      *
      * Each junction has a width, making this path a variable-width path.
@@ -93,6 +101,7 @@ struct ExtrusionLine
         : inset_idx_(other.inset_idx_)
         , is_odd_(other.is_odd_)
         , is_closed_(other.is_closed_)
+        , fp_fixed_direction_(other.fp_fixed_direction_)
         , junctions_(other.junctions_)
     {
     }
@@ -103,6 +112,7 @@ struct ExtrusionLine
         inset_idx_ = other.inset_idx_;
         is_odd_ = other.is_odd_;
         is_closed_ = other.is_closed_;
+        fp_fixed_direction_ = other.fp_fixed_direction_;
         return *this;
     }
 
@@ -112,6 +122,7 @@ struct ExtrusionLine
         inset_idx_ = other.inset_idx_;
         is_odd_ = other.is_odd_;
         is_closed_ = other.is_closed_;
+        fp_fixed_direction_ = other.fp_fixed_direction_;
         return *this;
     }
 

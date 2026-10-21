@@ -64,6 +64,13 @@ public:
     AABB boundaryBox; //!< The boundaryBox is an axis-aligned boundary box which is used to quickly check for possible
                       //!< collision between different parts on different layers. It's an optimization used during
                       //!< skin calculations.
+    //! FeatherPrint open-manifold ring: this synthetic part's place in the print order, or -1. The ring is printed
+    //! in passes, one per wall depth (deepest first, the outer wall and the Punchouts/Shelves last, the same order
+    //! the walls of one arc already printed in); within a pass, by position round the ring (skin arc i = 3i, the
+    //! Punchout spanning the gap after it = 3i+1, that gap's Shelf = 3i+2). fp_ring_order = pass *
+    //! fp_ring_pass_stride + position. See FffGcodeWriter::addMeshLayerToGCode.
+    int fp_ring_order = -1;
+    static constexpr int fp_ring_pass_stride = 100000;
     bool fp_force_retract_before = false; //!< FeatherPrint synthetic open-manifold parts (Whip/Former/Collar arcs,
                       //!< Punchout gaps, Shelf) set this so the travel move into this part always retracts+z-hops,
                       //!< regardless of distance -- see FffGcodeWriter::addMeshLayerToGCode.

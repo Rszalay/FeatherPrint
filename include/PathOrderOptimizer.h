@@ -163,10 +163,11 @@ public:
      * Add a new polyline to be optimized.
      * \param polyline The polyline to optimize.
      */
-    void addPolyline(const Path& polyline)
+    void addPolyline(const Path& polyline, const bool fixed_direction = false)
     {
         constexpr bool is_closed = false;
         paths_.emplace_back(polyline, is_closed);
+        paths_.back().fixed_direction_ = fixed_direction;
     }
 
     /*!
@@ -599,6 +600,10 @@ protected:
         for (auto& path : pathsOrderPaths | ranges::views::reverse)
         {
             reversed.push_back(path);
+            if (reversed.back().fixed_direction_ && ! reversed.back().is_closed_)
+            {
+                continue; // keeps its own direction: start_vertex_ 0, not backwards
+            }
             reversed.back().backwards_ = ! reversed.back().backwards_;
             if (! reversed.back().is_closed_)
             {
@@ -752,6 +757,10 @@ protected:
     {
         if (! path.is_closed_)
         {
+            if (path.fixed_direction_)
+            {
+                return 0;
+            }
             // For polylines, the seam settings are not applicable. Simply choose the position closest to target_pos then.
             const coord_t back_distance
                 = (combing_boundary_ == nullptr) ? getDirectDistance(path.converted_->back(), target_pos) : getCombingDistance(path.converted_->back(), target_pos);

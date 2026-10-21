@@ -7,6 +7,8 @@
 #include <iostream>
 
 #include <fmt/format.h>
+#include <map>
+
 #include <spdlog/spdlog.h>
 #include <range/v3/to_container.hpp>
 #include <range/v3/view/c_str.hpp>
@@ -401,6 +403,47 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             }
         }
 
+        // Every ring segment (skin arc, Punchout, Shelf) is generated in one direction round the ring - arcs
+        // oriented CCW in Step 2, a Punchout from the end of the arc before its gap to the start of the arc
+        // after it, a Shelf along the same chord. Pin each open wall to that direction so the wall ordering
+        // can't flip individual segments to start from whichever end happens to be nearer.
+        //
+        // A segment with several walls (Flange/Former/Collar arcs) is split into one part per wall depth, so the
+        // ring can be printed one depth at a time - every arc's deepest walls round the ring, then the next depth,
+        // the outer walls (with the Punchouts and Shelves) last. Each segment then starts next to where the last
+        // one ended, without a run back to the arc's start between its walls, and every outer wall still prints
+        // after the walls behind it (Flange/Collar's own wall print order).
+        auto pushRingPart = [&layer](SliceLayerPart&& ring_part, const int position)
+        {
+            std::map<size_t, VariableWidthLines> by_depth;
+            for (VariableWidthLines& inset : ring_part.wall_toolpaths)
+            {
+                for (ExtrusionLine& line : inset)
+                {
+                    if (! line.is_closed_)
+                    {
+                        line.fp_fixed_direction_ = true;
+                    }
+                    by_depth[line.inset_idx_].push_back(std::move(line));
+                }
+            }
+            for (auto& [depth, lines] : by_depth)
+            {
+                SliceLayerPart depth_part;
+                depth_part.outline = ring_part.outline;
+                depth_part.print_outline = ring_part.print_outline;
+                depth_part.inner_area = ring_part.inner_area;
+                depth_part.boundaryBox = ring_part.boundaryBox;
+                depth_part.fp_force_retract_before = ring_part.fp_force_retract_before;
+                // FeatherPrint prints walls inside-out (deepest inset_idx first, the outer wall last).
+                constexpr int kMaxDepth = 999;
+                const int pass = kMaxDepth - static_cast<int>(std::min<size_t>(depth, kMaxDepth));
+                depth_part.fp_ring_order = pass * SliceLayerPart::fp_ring_pass_stride + position;
+                depth_part.wall_toolpaths = { std::move(lines) };
+                layer->parts.push_back(std::move(depth_part));
+            }
+        };
+
         // ---- Step 6: generate toolpaths for each arc ----
         FeatherPrintGenerator fp;
         for (size_t ai = 0; ai < arcs.size(); ai++)
@@ -471,7 +514,7 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
             // SliceLayerPart-creation site already follows (see layerPart.cpp).
             synthetic.boundaryBox.calculate(synthetic.outline);
             synthetic.fp_force_retract_before = true;
-            layer->parts.push_back(std::move(synthetic));
+            pushRingPart(std::move(synthetic), static_cast<int>(3 * ai));
         }
 
         // ---- Step 7: Punchout (Spec REV 3.3) — one per ring GAP, not per arc ----
@@ -575,7 +618,7 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
                 // See the identical fix/comment on the ordinary arc-loop synthetic part above.
                 synthetic.boundaryBox.calculate(synthetic.outline);
                 synthetic.fp_force_retract_before = true;
-                layer->parts.push_back(std::move(synthetic));
+                pushRingPart(std::move(synthetic), static_cast<int>(3 * gi + 1));
 
                 // Shelf (Spec REV 4.2): mandatory support for the upper Collar's own
                 // peak-thickness Wall stack, which sits directly above this hole's own local
@@ -602,7 +645,7 @@ void WallsComputation::generateWalls(SliceLayer* layer, SectionType section)
                             shelf_part.wall_toolpaths = { std::move(shelf_wl) };
                             shelf_part.boundaryBox.calculate(shelf_part.outline);
                             shelf_part.fp_force_retract_before = true;
-                            layer->parts.push_back(std::move(shelf_part));
+                            pushRingPart(std::move(shelf_part), static_cast<int>(3 * gi + 2));
                         }
                     }
                 }

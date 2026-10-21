@@ -138,7 +138,7 @@ void InsetOrderOptimizer::optimize()
         }
         else
         {
-            path_optimizer_->addPolyline(&line);
+            path_optimizer_->addPolyline(&line, line.fp_fixed_direction_);
         }
     }
 
@@ -191,7 +191,7 @@ bool InsetOrderOptimizer::addToLayer(const RetractBeforeOuterWall retract_before
 
         const bool revert_inset = alternate_walls && (path.vertices_->inset_idx_ % 2 != 0);
         const bool revert_layer = alternate_walls && (layer_nr_ % 2 != 0);
-        const bool backwards = path.backwards_ != (revert_inset != revert_layer);
+        const bool backwards = path.vertices_->fp_fixed_direction_ ? path.backwards_ : path.backwards_ != (revert_inset != revert_layer);
         const size_t start_index = (backwards != path.backwards_) ? path.vertices_->size() - (path.start_vertex_ + 1) : path.start_vertex_;
         const bool linked_path = ! path.is_closed_;
 

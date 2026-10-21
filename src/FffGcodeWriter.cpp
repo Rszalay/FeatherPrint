@@ -1859,10 +1859,16 @@ void FffGcodeWriter::addMeshLayerToGCode(
             mesh.settings.get<coord_t>("wall_line_width_0") * 2);
     }
     PathOrderOptimizer<SliceLayerPart*> part_order_optimizer(gcode_layer.getLastPlannedPositionOrStartingPosition(), z_seam_config);
+    std::vector<SliceLayerPart*> ring_parts; // FeatherPrint open-manifold ring segments, printed separately below
     for (SliceLayerPart& part : layer.parts)
     {
         if (part.outline.empty())
         {
+            continue;
+        }
+        if (part.fp_ring_order >= 0)
+        {
+            ring_parts.push_back(&part);
             continue;
         }
         part_order_optimizer.addPolygon(&part);
@@ -1870,9 +1876,81 @@ void FffGcodeWriter::addMeshLayerToGCode(
 
     part_order_optimizer.optimize(false);
 
+    std::vector<SliceLayerPart*> part_sequence;
     for (const PathOrdering<SliceLayerPart*>& path : part_order_optimizer.paths_)
     {
-        SliceLayerPart& part = *path.vertices_;
+        part_sequence.push_back(path.vertices_);
+    }
+    // FeatherPrint open-manifold ring: the segments (skin arcs, Punchouts, Shelves) are synthetic parts whose
+    // outlines are only bounding boxes, so the part ordering above would visit them in no particular order
+    // round the ring. Print them in ring order instead (SliceLayerPart::fp_ring_order: one pass per wall depth,
+    // each pass round the ring), every segment in the direction it was generated (see
+    // ExtrusionLine::fp_fixed_direction_). Each pass starts from the segment whose start is nearest where the
+    // nozzle is, so every segment begins next to where the previous one ended.
+    if (! ring_parts.empty())
+    {
+        std::sort(ring_parts.begin(), ring_parts.end(), [](const SliceLayerPart* a, const SliceLayerPart* b) { return a->fp_ring_order < b->fp_ring_order; });
+        auto firstPoint = [](const SliceLayerPart& rp) -> std::optional<Point2LL>
+        {
+            if (rp.wall_toolpaths.empty() || rp.wall_toolpaths.front().empty() || rp.wall_toolpaths.front().front().junctions_.empty())
+            {
+                return std::nullopt;
+            }
+            return rp.wall_toolpaths.front().front().junctions_.front().p_;
+        };
+        auto lastPoint = [](const SliceLayerPart& rp) -> std::optional<Point2LL>
+        {
+            if (rp.wall_toolpaths.empty() || rp.wall_toolpaths.front().empty() || rp.wall_toolpaths.front().back().junctions_.empty())
+            {
+                return std::nullopt;
+            }
+            return rp.wall_toolpaths.front().back().junctions_.back().p_;
+        };
+        Point2LL from = gcode_layer.getLastPlannedPositionOrStartingPosition();
+        if (! part_sequence.empty() && ! part_sequence.back()->outline.empty() && ! part_sequence.back()->outline.front().empty())
+        {
+            from = part_sequence.back()->outline.front().front();
+        }
+        size_t pass_begin = 0;
+        while (pass_begin < ring_parts.size())
+        {
+            const int pass = ring_parts[pass_begin]->fp_ring_order / SliceLayerPart::fp_ring_pass_stride;
+            size_t pass_end = pass_begin;
+            while (pass_end < ring_parts.size() && ring_parts[pass_end]->fp_ring_order / SliceLayerPart::fp_ring_pass_stride == pass)
+            {
+                ++pass_end;
+            }
+            const size_t n = pass_end - pass_begin;
+            size_t first = 0;
+            coord_t best = std::numeric_limits<coord_t>::max();
+            for (size_t i = 0; i < n; ++i)
+            {
+                if (const std::optional<Point2LL> start = firstPoint(*ring_parts[pass_begin + i]))
+                {
+                    const coord_t d = vSize2(*start - from);
+                    if (d < best)
+                    {
+                        best = d;
+                        first = i;
+                    }
+                }
+            }
+            for (size_t k = 0; k < n; ++k)
+            {
+                SliceLayerPart* rp = ring_parts[pass_begin + (first + k) % n];
+                part_sequence.push_back(rp);
+                if (const std::optional<Point2LL> end = lastPoint(*rp))
+                {
+                    from = *end;
+                }
+            }
+            pass_begin = pass_end;
+        }
+    }
+
+    for (SliceLayerPart* part_ptr : part_sequence)
+    {
+        SliceLayerPart& part = *part_ptr;
         // FeatherPrint synthetic open-manifold parts (Whip/Former/Collar arcs, Punchout gaps,
         // Shelf) mark themselves so the travel move into them always retracts+z-hops, even
         // when short -- otherwise a short travel between adjacent segments can drag the

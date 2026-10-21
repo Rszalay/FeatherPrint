@@ -118,6 +118,7 @@ ExtrusionLine Simplify::createEmpty(const ExtrusionLine& original)
 {
     ExtrusionLine result(original.inset_idx_, original.is_odd_);
     result.is_closed_ = original.is_closed_;
+    result.fp_fixed_direction_ = original.fp_fixed_direction_;
     return result;
 }
 

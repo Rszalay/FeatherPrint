@@ -77,6 +77,12 @@ struct PathOrdering
     bool backwards_;
 
     /*!
+     * An open path that must start at vertex 0 and never be reversed (see
+     * ExtrusionLine::fp_fixed_direction_).
+     */
+    bool fixed_direction_{ false };
+
+    /*!
      * Force the start point of the path to be at a specific location.
      * Will only happen if not empty, and this point is actually on the path.
      */
