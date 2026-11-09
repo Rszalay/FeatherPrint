@@ -106,7 +106,7 @@ text{font-family:var(--sans);fill:var(--ink);font-size:12px}
 <text x="568" y="234" class="pt">How each layer is read</text>
 <text x="568" y="254" class="pl">Ring · outer + inner wall</text>
 <text x="568" y="270" class="pl">Chain · open corridor, C or Tee</text>
-<text x="568" y="286" class="pl">Glob · nothing printed yet</text>
+<text x="568" y="286" class="pl">Glob · Triangulation only</text>
 <text x="568" y="302" class="s">Not required: star-convex,</text>
 <text x="568" y="318" class="s">single region</text>
 <text x="392" y="331" class="yn">Yes</text>
@@ -157,7 +157,7 @@ text{font-family:var(--sans);fill:var(--ink);font-size:12px}
 <rect x="556" y="694" width="216" height="118" rx="4" class="panel"/>
 <text x="568" y="714" class="pt">Defaults</text>
 <text x="568" y="734" class="pl">Subdivision 0.3 (warns < 0.334)</text>
-<text x="568" y="750" class="pl">Prune 0.8 mm</text>
+<text x="568" y="750" class="pl">Prune 11 mm</text>
 <text x="568" y="766" class="pl">Junction merge 30°</text>
 <text x="568" y="782" class="pl">Small hole 1.0 mm²</text>
 <text x="568" y="798" class="pl">Transition layer on</text>
@@ -168,7 +168,7 @@ text{font-family:var(--sans);fill:var(--ink);font-size:12px}
 <text x="246" y="897" class="m">meshfix_remove_diagonal_artifacts</text>
 <line x1="530" y1="873" x2="556" y2="873" class="tie"/>
 <rect x="556" y="838" width="216" height="70" rx="4" class="panel"/>
-<text x="568" y="858" class="pt">Both off by default</text>
+<text x="568" y="858" class="pt">Raw outline on, fix off</text>
 <text x="568" y="878" class="s">Raw outline may overlap skin</text>
 <text x="568" y="894" class="s">Diagonal fix: thin trailing edges</text>
 <text x="0" y="926" class="lab">3 · SLICE</text>
@@ -204,7 +204,7 @@ text{font-family:var(--sans);fill:var(--ink);font-size:12px}
 <text x="568" y="1160" class="pl">Crossovers line up in Z</text>
 <text x="568" y="1176" class="pl">Solid fill where a domain</text>
 <text x="568" y="1192" class="s">appears, then resumes</text>
-<text x="568" y="1208" class="pl">Empty patches are Glob</text>
+<text x="568" y="1208" class="pl">Disc-like regions may flip</text>
 <text x="568" y="1224" class="pl">Y-junction arms stay unlinked</text>
 <text x="392" y="1228" class="yn">Yes</text>
 <text x="0" y="1262" class="lab">5 · PRINT</text>
@@ -217,5 +217,5 @@ text{font-family:var(--sans);fill:var(--ink);font-size:12px}
     <figcaption>Two model checks gate the part, five groups of settings configure the slice (only the first two are needed), and one layer-view check decides whether to print or loop back. Side panels are reference, not steps.</figcaption>
   </figure>
 
-  <p class="foot">Draft for the FeatherPrint manual, from the Corrugated specification REV 3.8 (18 September 2026) and the Corrugated settings file. Corrugated is a separate infill pattern from FeatherPrint: a mesh uses one or the other. Defaults are first-pass values not yet validated across a wide range of parts. Glob regions currently print no corrugation, and a Y-junction with no straight pass-through still corrugates each arm independently.</p>
+  <p class="foot">Draft for the FeatherPrint manual, from the Corrugated specification REV 3.8 (18 September 2026) and the Corrugated settings file. Corrugated is a separate infill pattern from FeatherPrint: a mesh uses one or the other. Defaults are first-pass values not yet validated across a wide range of parts. Medial Axis decomposition (the default since v1.1.0) forms no Globs; with Triangulation, Glob regions print no corrugation. A Y-junction with no straight pass-through still corrugates each arm independently.</p>
 </div>

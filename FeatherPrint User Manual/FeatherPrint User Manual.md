@@ -1,10 +1,10 @@
 # FeatherPrint User Manual
 
-*Manual version 0.2 draft, for FeatherPrint v1.0.0 (spec REV 4.12), 19 September 2026.*
+*Manual version 0.3 draft, for FeatherPrint v1.1.1 (spec REV 4.14), 7 October 2026.*
 
 ## About this manual
 
-This manual shows you how to slice lightweight, hollow prints with FeatherPrint v1.0.0, a modified CuraEngine for UltiMaker Cura 5.13.x on Windows. It is written for makers and designers who model in CAD, export an STL and slice in Cura, so it explains what to do and what to expect rather than how the algorithms work.
+This manual shows you how to slice lightweight, hollow prints with FeatherPrint v1.1.1, a modified CuraEngine for UltiMaker Cura 5.13.x on Windows. It is written for makers and designers who model in CAD, export an STL and slice in Cura, so it explains what to do and what to expect rather than how the algorithms work.
 
 FeatherPrint adds two infill generators, chosen with Cura's Infill Pattern setting. **FeatherPrint** builds a single-line-width skin braced by a helical net of tube-like stringers, for ultralight aerodynamic parts such as drones, model aircraft, wind turbines and hydrodynamic surfaces. **Corrugated** fills the gap between the inner and outer walls of an ordinary shelled part with corrugated support, in place of conventional infill.
 
@@ -29,7 +29,7 @@ If you are unsure, check whether the part has wall thickness you designed in. If
 
 FeatherPrint installs over an existing Cura with one Windows installer, and you can remove it later to restore Cura's original engine. It needs Windows 10 or later and UltiMaker Cura 5.13.x already installed.
 
-1. Download `FeatherPrint-1.0.0-Windows-x64-Setup.exe` from the [v1.0.0 release page](https://github.com/Rszalay/FeatherPrint/releases/tag/v1.0.0).
+1. Download `FeatherPrint-1.1.1-Windows-x64-Setup.exe` from the [v1.1.1 release page](https://github.com/Rszalay/FeatherPrint/releases/tag/v1.1.1).
 2. Right-click the file and choose Run as administrator.
 3. Follow the installer. It finds your Cura 5.13.x installation, backs up the original engine files, deploys FeatherPrint, and installs the bundled "FeatherPrint" and "FeatherPrint Corrugated" print profiles.
 4. Start Cura and open the Infill Pattern setting. You should now see FeatherPrint and Corrugated in the list.
@@ -37,6 +37,13 @@ FeatherPrint installs over an existing Cura with one Windows installer, and you 
 ![Cura print settings with the three-bar menu open and All selected, which reveals the FeatherPrint and Corrugated categories](images/featherprint-manual-01.png)
 
 To uninstall, run Uninstall FeatherPrint from Windows Add or Remove Programs. Your original Cura engine files are restored automatically.
+
+### Upgrading from an earlier version
+
+Run the new installer over the old one. It refreshes the bundled profiles, so reselect them in Cura afterwards. Two changes may affect parts you have already designed or tuned:
+
+- **v1.1.1: FeatherPrint parts print one line width smaller across.** Earlier versions centred the outer wall on the model surface, so half of it hung outside and every part came out one line width oversize. The outer face of the wall now sits on the model surface, the same as Cura's other patterns, so FeatherPrint and Corrugated parts of the same model now match. If you scaled models up or down to compensate, remove that scaling.
+- **v1.1.0: Corrugated uses a new default layout (Medial Axis and Harmonic).** Stringers jump around much less from layer to layer, Glob regions (which print no corrugation) no longer occur, and slicing is about four times faster. To get the old behaviour back, set Corrugated Decomposition to Triangulation and Corrugated Wall Pairing to Arc Length.
 
 ### Where the settings live
 
@@ -51,7 +58,7 @@ A FeatherPrint print takes five steps: check the model, select the pattern and t
 ![FeatherPrint workflow chart: model, configure, slice, inspect and print, with loops back to the settings or the model](diagrams/featherprint-workflow.png)
 
 1. **Model.** Confirm the mesh is watertight, or open only where you meant it to be. Note any open top or slots, because they decide which end features you will get. See Preparing your model.
-2. **Configure.** Set Infill Pattern to FeatherPrint. Cura then applies the rest of the required setup for you: Wall Line Count 1, Top Layers 0, Bottom Layers 0 and Z Seam Alignment set to Sharpest Corner. Top and Bottom Layers of 0 suit an open shell, but you can raise them if you want solid caps. Use a 0.2 mm layer height and LW-PLA or PETG, then adjust the FeatherPrint settings if you need to. See the settings reference.
+2. **Configure.** Either select the bundled "FeatherPrint" profile under Print Settings, then Profiles, or set Infill Pattern to FeatherPrint on your own profile. Choosing the pattern sets Wall Line Count 1, Top Layers 0 and Bottom Layers 0 for you, and FeatherPrint always prints walls from the inside out. Top and Bottom Layers of 0 suit an open shell, but you can raise them if you want solid caps. Use a 0.2 mm layer height and LW-PLA or PETG, then adjust the FeatherPrint settings if you need to. See the settings reference.
 3. **Slice.** Slice as usual. FeatherPrint works out the stringer helices, the end features and every place two features meet.
 4. **Inspect.** Step through the layer view before you print. See Reading the layer view.
 5. **Print.** If the preview matches your intent, print. If not, change the settings or the model and slice again.
@@ -96,7 +103,7 @@ Why: features are placed by distance along the outline rather than by measuring 
 
 ## FeatherPrint: settings reference
 
-FeatherPrint has a set of tuning settings of its own, and four Cura settings it sets for you when you choose the pattern. In most prints you only change the helix angle or stringer count; the later rows switch optional features on or off and tune them.
+FeatherPrint has a set of tuning settings of its own, and a few Cura settings it sets for you when you choose the pattern. In most prints you only change the helix angle or stringer count; the later rows switch optional features on or off and tune them.
 
 ### FeatherPrint settings
 
@@ -118,18 +125,22 @@ FeatherPrint has a set of tuning settings of its own, and four Cura settings it 
 | `featherprint_feature_depth` | 2.5 | line widths | How far stringers, lacings and flares reach inward from the skin. One setting drives all of them, so they stay in step. |
 | `featherprint_stringer_width` | 1.5 | line widths | Width of a stringer trace. |
 | `featherprint_lacing_width` | 3.0 | line widths | Width of a lacing, where two stringers meet. |
-| `featherprint_force_zhop_height` | 2.0 | mm | Z-hop height used when the nozzle travels between FeatherPrint's small separate features, such as end loops and collars, so it does not drag the wall it just printed. Not yet validated on printed parts. |
+| `featherprint_force_zhop_height` | 2.0 | mm | Z-hop height used when the nozzle travels between FeatherPrint's small separate features, such as end loops and collars, so it does not drag the wall it just printed. Only applies when Cura's Z Hop When Retracted is on. Not yet validated on printed parts. |
+
+`featherprint_curvature_k_ref` also appears in the list but has no effect; it belongs to a feature that was withdrawn.
+
+**Keep these settings in proportion.** Feature Depth should be at least Stringer Width + 0.5, and Lacing Width at least Feature Depth + 1. Cura does not check either. If Lacing Width is too small, each lacing doubles back on itself slightly. The defaults (Lacing Width 3.0, Feature Depth 2.5) are just below that limit, so use 3.5 or more, or start from the bundled profile.
 
 ### Set for you
 
-| Setting | Value |
-| --- | --- |
-| Wall Line Count | 1 |
-| Top Layers | 0 |
-| Bottom Layers | 0 |
-| Z Seam Alignment | Sharpest Corner |
+| Setting | Value | Can you change it? |
+| --- | --- | --- |
+| Wall Line Count | 1 | Leave it at 1. FeatherPrint draws its own walls, and at 0 none are printed |
+| Top Layers | 0 | Yes, raise it for solid caps |
+| Bottom Layers | 0 | Yes, raise it for solid bases |
+| Wall printing order | Inside to outside, outer wall last | No, FeatherPrint always forces this |
 
-Recommended alongside these: a 0.2 mm layer height, and LW-PLA or PETG.
+The bundled FeatherPrint profile also sets Z Seam Alignment to Sharpest Corner. Recommended alongside these: a 0.2 mm layer height, and LW-PLA or PETG.
 
 **Why:** with no top or bottom layers, a FeatherPrint part simply stops at its last skin layer. That is why an open top gets a Flange, which supplies the flat surface a cap or mating part can glue to.
 
@@ -141,7 +152,7 @@ A FeatherPrint part is built from several print features, plus collision feature
 
 | Feature | Where it appears | What it is |
 | --- | --- | --- |
-| Skin | The whole surface | A stack of single-line-width extrusions tracing the outer perimeter |
+| Skin | The whole surface | A stack of single-line-width extrusions whose outer face lies on the model surface |
 | Stringer | Spiralling up the surface | A tube made of stacked loops that reach inward toward the centre. Two counter-rotating helices form a diamond net |
 | Former | Where stringer helices cross | A local thickening of the skin, stepped out half a line width per layer, that acts as a transverse brace. |
 | Whip | Along a slot or hole in the side wall | The skin ends in a small closed loop on every layer, so the opening has no loose filament end |
@@ -202,11 +213,11 @@ On every layer, Corrugated sorts the space between walls into three kinds of reg
 | --- | --- | --- |
 | Ring | A tube or airfoil cross-section: one outer contour with one inner contour nested inside | Corrugation all the way around the gap |
 | Chain | An open corridor between two walls, such as a C-shape, a rib, or a Tee where one corridor meets another | Corrugation along the corridor, from one end to the other |
-| Glob | A region the slicer cannot reduce to a Ring or a Chain | Nothing yet; the corrugation is left out of it |
+| Glob | A region the slicer cannot reduce to a Ring or a Chain (Triangulation decomposition only) | Nothing yet; the corrugation is left out of it |
 
 Your model does not need to have one region per layer. Where corridors meet in a Tee, the straight-through pair is merged into one continuous corridor. A junction with no straight-through pair still works, but each arm is corrugated separately.
 
-For most parts, Globs are not expected to form. They mainly result from complex junctions that cannot be resolved, or from applying corrugation to shapes with a low aspect ratio, which is not what Corrugated is for.
+With the default Medial Axis decomposition, Globs do not form: a region with no clear corridor, such as a disc or a square, becomes one Chain along its longest axis. That axis can change direction from layer to layer on such shapes, so they remain the weakest case. With the older Triangulation decomposition, Globs mainly come from complex junctions or low-aspect-ratio shapes, which is not what Corrugated is for.
 
 ### Small holes
 
@@ -220,7 +231,7 @@ The shape of a corridor matters more than the exact gap width. Wall gaps of 5 to
 
 ## Corrugated: settings reference
 
-Corrugated adds twelve settings in their own Corrugated category, all active only when Infill Pattern is Corrugated. Start from the bundled profile; the two settings that most change the result are stringer pitch and crossover pitch.
+Corrugated adds fourteen settings in their own Corrugated category, all active only when Infill Pattern is Corrugated. Start from the bundled profile; the two settings that most change the result are stringer pitch and crossover pitch.
 
 ### Density and twist
 
@@ -244,7 +255,9 @@ Stripping a wall does not work together with Raw Outline Mode; turn that off to 
 
 | Setting | Default | Units | What it controls |
 | --- | --- | --- | --- |
-| `corrugated_vbs_tolerance` | 0.3 | fraction | How finely long contour edges are split. Values below about 0.334 can make irregular shapes over-subdivide, and Cura warns below that. |
+| `corrugated_decomposition` | Medial Axis | | How each layer is split into regions. Medial Axis follows the centre line between the walls and has no Globs; Triangulation is the older method. |
+| `corrugated_wall_pairing` | Harmonic | | How stringer ends are matched between the two walls of a region. Harmonic is the default; Arc Length (the original method) and Aligned are alternatives. |
+| `corrugated_vbs_tolerance` | 0.3 | fraction | Triangulation decomposition only. How finely long contour edges are split. Values below about 0.334 can make irregular shapes over-subdivide, and Cura warns below that. |
 | `corrugated_prune_threshold` | 11 | mm | Short side-arms shorter than this are folded into a neighbouring wall. Too large a value can absorb real short features. |
 | `corrugated_chain_junction_merge_angle` | 30 | ° | How far from a straight 180° two corridors may bend at a junction and still be merged into one continuous corridor. |
 | `corrugated_deminimis_hole_area` | 1.0 | mm² | Holes smaller than this are ignored when deciding a region's shape. Experimental. |
@@ -280,7 +293,8 @@ What a good Corrugated slice shows: normal walls, stringers spanning the gap bet
 
 | You see | Likely cause | What to do |
 | --- | --- | --- |
-| An empty patch with no corrugation | A Glob region, which is not yet filled. Usually a complex junction or a low-aspect-ratio shape | Expected. Reshape the part, or accept the gap |
+| An empty patch with no corrugation | A Glob region (Triangulation decomposition only), which is not yet filled | Switch Corrugated Decomposition back to Medial Axis, or reshape the part |
+| Stringers changing direction between layers in a disc- or square-shaped region | The region has no clear corridor, so its single Chain follows whichever axis is longest on each layer | Expected in this release. Lengthen the region in one direction if you can |
 | A full-density layer partway up | A transition layer where the number of regions changed | Expected. Turn off `corrugated_transition_layer_enabled` only if you accept the risk |
 | A stringer pattern that looks static or jittery | Crossover pitch too close to the layer height | Raise `corrugated_crossover_pitch_mm` well above half a layer height |
 | Strip Wall A or B has no effect | Raw Outline Mode is on | Turn off `corrugated_raw_outline_mode` |
@@ -292,7 +306,7 @@ What a good Corrugated slice shows: normal walls, stringers spanning the gap bet
 
 ## Known limitations in this release
 
-These are the gaps to plan around in v1.0.0; each is a known, deliberate scope boundary rather than a fault in your model.
+These are the gaps to plan around in v1.1.1. Most are deliberate scope boundaries; a few are known faults scheduled for a fix. None is a fault in your model.
 
 ### All modes
 
@@ -303,12 +317,16 @@ These are the gaps to plan around in v1.0.0; each is a known, deliberate scope b
 
 - **A Collar can overhang a hole unsupported.** If Punchout is off but a Collar peaks above a hole, nothing supports the peak; turn Punchout on for such parts. This is scheduled to be corrected.
 - **No cut-back of the skin before an end loop.** A parametric cut-back is reserved for a future release.
-- **Untested**** Z-hop height****.** The hop used between FeatherPrint's small separate features (featherprint_force_zhop_height) has not yet been validated on printed parts.
+- **Untested Z-hop height.** The hop used between FeatherPrint's small separate features (featherprint_force_zhop_height) has not yet been validated on printed parts.
+- **Default lacing proportions.** With the default Lacing Width and Feature Depth, each lacing doubles back slightly. Set Lacing Width to at least Feature Depth + 1, or use the bundled profile.
+- **Layers with several separate islands.** The helix is laid out from the largest island on each layer, so stringers on the smaller islands do not hold the set helix angle.
+- **Holes with no depth.** A hole in a flat top or bottom is left open, but no wall is printed around its edge.
+- **Occasional stray toolpaths.** On rare layers a lacing or flare that lands exactly where the slicer starts its outline can be dropped, doubled, or print an extra lap of the outline. Check the layer view; a fix is scheduled.
 
 ### Corrugated
 
 - **Closed meshes only.** Open meshes are permanently out of scope for this mode; use FeatherPrint.
-- **Glob regions print no corrugation.** They are left empty.
+- **Glob regions print no corrugation** (Triangulation decomposition only). With the default Medial Axis decomposition, regions with no clear corridor (discs, squares) get one Chain whose direction can change between layers.
 - **Three-way junctions without a straight-through pair** are corrugated arm by arm, not as one connected path.
 - **One ring region per layer** is tracked for continuity and linked skin. Several separate corridors per layer are handled.
 - **Stringers are straight.** The planned shaped cross-section, with rising and falling walls between troughs and peaks, is not built yet.
@@ -328,13 +346,14 @@ These are the gaps to plan around in v1.0.0; each is a known, deliberate scope b
 | Crossover | A place where two stringer families cross, or where a Stringer loop closes on itself and lifts to the next layer |
 | Flange | FeatherPrint's thickened, inward-building top layers on a part with an open top |
 | Former | A local thickening of the skin where stringer helices cross, acting as a transverse brace |
-| Glob | In Corrugated, a region that is not a Ring or a Chain. Rare in normal parts, and not yet filled |
+| Glob | In Corrugated with Triangulation decomposition, a region that is not a Ring or a Chain. Not yet filled |
+| Medial axis | The centre line running between a region's walls. Corrugated's default decomposition builds its Rings and Chains from it |
 | Helix angle | The angle between a stringer tube and the skin surface |
 | Layer | One pass of the print head at a fixed height |
 | Line width (w) | The width of one extrusion. FeatherPrint dimensions are multiples of it |
 | Linked skin | In Corrugated, a single continuous path that alternates between the outer and inner wall |
 | Manifold | A closed, watertight mesh in which every edge is shared by exactly two faces |
-| OML | Outer mould line: the outer surface of the model, which FeatherPrint never alters |
+| OML | Outer mould line: the outer surface of the model. FeatherPrint never changes it, and since v1.1.1 the outer face of its wall lies exactly on it |
 | Placket | Where a Collar meets a Whip: the Collar tapers into the open span |
 | Punchout | Optional support printed into a hole so a flat-topped closure can bridge from it |
 | Ring | In Corrugated, one outer contour with one inner contour nested inside it |
@@ -354,3 +373,4 @@ These are the gaps to plan around in v1.0.0; each is a known, deliberate scope b
 | --- | --- | --- | --- |
 | 18 Sep 2026 | 0.1 draft | FeatherPrint v1.0.0 | First draft. Both workflow charts and all screenshots included |
 | 19 Sep 2026 | 0.2 draft | FeatherPrint v1.0.0; spec REV 4.12 | Brought up to date with REV 4.12: star-convex rule removed, Collar, Punchout, Shore, Splay, Placket and new settings added |
+| 7 Oct 2026 | 0.3 draft | FeatherPrint v1.1.1; spec REV 4.14 | Upgrade notes (parts one line width smaller; new Corrugated defaults); bundled FeatherPrint profile; corrected "set for you" list; setting-proportion guidance; Corrugated Decomposition and Wall Pairing settings; Glob behaviour under Medial Axis; new known limitations |
