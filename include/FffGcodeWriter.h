@@ -4,7 +4,6 @@
 #ifndef GCODE_WRITER_H
 #define GCODE_WRITER_H
 
-#include <fstream>
 #include <optional>
 
 #include "ExtruderUse.h"
@@ -13,7 +12,8 @@
 #include "LayerPlan.h"
 #include "LayerPlanBuffer.h"
 #include "LinesOrderingMethod.h"
-#include "gcodeExport.h"
+#include "PrintInformation.h"
+#include "gcode_export/gcodeExport.h"
 #include "utils/LayerVector.h"
 #include "utils/NoCopy.h"
 #include "utils/gettime.h"
@@ -61,11 +61,6 @@ private:
      */
     GCodeExport gcode;
 
-    /*!
-     * The gcode file to write to when using CuraEngine as command line tool.
-     */
-    std::ofstream output_file;
-
     //!< For each layer, the extruders to be used in that layer in the order in which they are going to be used
     LayerVector<std::vector<ExtruderUse>> extruder_order_per_layer;
 
@@ -86,6 +81,8 @@ private:
 
     std::string slice_uuid; //!< The UUID of the current slice.
 
+    PrintInformation print_info_; //!< Global print information calculated along slicing
+
 public:
     /*
      * \brief Construct a g-code writer.
@@ -94,49 +91,6 @@ public:
      * it's ready for writing.
      */
     FffGcodeWriter();
-
-    /*!
-     * Set the target to write gcode to: to a file.
-     *
-     * Used when CuraEngine is used as command line tool.
-     *
-     * \param filename The filename of the file to which to write the gcode.
-     */
-    bool setTargetFile(const char* filename);
-
-    /*!
-     * Set the target to write gcode to: an output stream.
-     *
-     * Used when CuraEngine is NOT used as command line tool.
-     *
-     * \param stream The stream to write gcode to.
-     */
-    void setTargetStream(std::ostream* stream);
-
-    /*!
-     * Wether or not the extruder is actually used in the print, regardless of enablement.
-     *
-     * \param extruder_nr The extruder number for which to get the useage
-     * \return actual use y/n boolean
-     */
-    bool getExtruderActualUse(int extruder_nr);
-
-    /*!
-     * Get the total extruded volume for a specific extruder in mm^3
-     *
-     * Retractions and unretractions don't contribute to this.
-     *
-     * \param extruder_nr The extruder number for which to get the total netto extruded volume
-     * \return total filament printed in mm^3
-     */
-    double getTotalFilamentUsed(int extruder_nr);
-
-    /*!
-     * Get the total estimated print time in seconds for each feature
-     *
-     * \return total print time in seconds for each feature
-     */
-    std::vector<Duration> getTotalPrintTimePerFeature();
 
     /*!
      * Write all the gcode for the current meshgroup.
@@ -151,14 +105,14 @@ private:
     struct ProcessLayerResult
     {
         LayerPlan* layer_plan;
-        double total_elapsed_time;
-        TimeKeeper::RegisteredTimes stages_times;
+        TimeKeeper time_keeper;
     };
 
     struct RoofingFlooringSettingsNames
     {
         std::string extruder_nr;
-        std::string pattern;
+        std::string pattern_0; // Infill pattern on layer 0
+        std::string pattern_x; // Infill pattern on layers others than 0
         std::string monotonic;
     };
 
@@ -167,11 +121,11 @@ private:
     {
         std::shared_ptr<InsetOrderOptimizer> walls_optimizer{}; // Contains the ready-to-add optimized insets
         bool spiralize{ false }; // Indicates whether this layer is a regular or a spiral layer
-        std::vector<LayerPlan::OverhangMask> overhang_masks{}; // Overhang speed masks to be applied only while drawing the walls
     };
 
     static const RoofingFlooringSettingsNames roofing_settings_names;
     static const RoofingFlooringSettingsNames flooring_settings_names;
+    static const RoofingFlooringSettingsNames skin_settings_names;
 
     /*!
      * \brief Set the FffGcodeWriter::fan_speed_layer_time_settings by
@@ -268,12 +222,22 @@ private:
      * calling it for multiple layers results in the skirt/brim being printed on multiple layers.
      *
      * \param storage where the slice data is stored.
-     * \param gcodeLayer The initial planning of the g-code of the layer.
+     * \param gcode_layer The initial planning of the g-code of the layer.
      * \param extruder_nr The extruder train for which to process the skirt or
      * brim.
      * \param layer_nr The index of the layer to write the gcode of.
      */
-    void processSkirtBrim(const SliceDataStorage& storage, LayerPlan& gcodeLayer, unsigned int extruder_nr, LayerIndex layer_nr) const;
+    void processSkirtBrim(const SliceDataStorage& storage, LayerPlan& gcode_layer, const unsigned int extruder_nr, const LayerIndex layer_nr) const;
+
+    /*!
+     * Add the support brim to the layer plan
+     *
+     * \param storage where the slice data is stored.
+     * \param gcode_layer The initial planning of the g-code of the layer.
+     * \param extruder_nr The extruder train for which to process the brim.
+     * \param layer_nr The index of the layer to write the gcode of.
+     */
+    static void processSupportBrim(const SliceDataStorage& storage, LayerPlan& gcode_layer, const unsigned int extruder_nr, const LayerIndex layer_nr);
 
     /*!
      * Adds the ooze shield to the layer plan \p gcodeLayer.
@@ -499,7 +463,7 @@ private:
      * \param end_infill_close_to_seam Indicates whether the infill will end close to the seam, in which case we can slightly adjust the insets ordering
      * \return The content to be later inserted
      */
-    InsetsPreprocessResult preProcessInsets(
+    std::optional<InsetsPreprocessResult> preProcessInsets(
         const SliceDataStorage& storage,
         LayerPlan& gcodeLayer,
         const SliceMeshStorage& mesh,
@@ -507,6 +471,9 @@ private:
         const MeshPathConfigs& mesh_config,
         SliceLayerPart& part,
         const bool end_infill_close_to_seam) const;
+
+    OverrideAreas
+        makeLayerMasks(const SliceDataStorage& storage, LayerPlan& gcode_layer, const SliceMeshStorage& mesh, const MeshPathConfigs& mesh_config, SliceLayerPart& part) const;
 
     /*!
      * Inserts the previously processed insets
@@ -522,6 +489,7 @@ private:
      */
     bool endProcessInsets(
         InsetsPreprocessResult& preprocess_result,
+        const OverrideAreas overhang_areas,
         const SliceDataStorage& storage,
         LayerPlan& gcode_layer,
         const SliceMeshStorage& mesh,
@@ -591,28 +559,6 @@ private:
         const SkinPart& skin_part) const;
 
     /*!
-     * Add the roofing/flooring which is the area inside the innermost skin inset which has air 'directly' above or below
-     *
-     * \param[in] storage where the slice data is stored.
-     * \param gcode_layer The initial planning of the gcode of the layer.
-     * \param mesh The mesh for which to add to the layer plan \p gcode_layer.
-     * \param extruder_nr The extruder for which to print all features of the mesh which should be printed with this extruder
-     * \param mesh_config the line config with which to print a print feature
-     * \param skin_part The skin part for which to create gcode
-     * \param[out] added_something Whether this function added anything to the layer plan
-     */
-    void processRoofingFlooring(
-        const SliceDataStorage& storage,
-        LayerPlan& gcode_layer,
-        const SliceMeshStorage& mesh,
-        const size_t extruder_nr,
-        const RoofingFlooringSettingsNames& settings_names,
-        const Shape& fill,
-        const GCodePathConfig& config,
-        const std::vector<AngleDegrees>& angles,
-        bool& added_something) const;
-
-    /*!
      * Add the normal skinfill which is the area inside the innermost skin inset
      * which doesn't have air directly above it if we're printing roofing
      *
@@ -621,7 +567,7 @@ private:
      * \param mesh The mesh for which to add to the layer plan \p gcode_layer.
      * \param extruder_nr The extruder for which to print all features of the mesh which should be printed with this extruder
      * \param mesh_config the line config with which to print a print feature
-     * \param skin_part The skin part for which to create gcode
+     * \param skin_fill The shape of the skin for which to create gcode
      * \param[out] added_something Whether this function added anything to the layer plan
      */
     void processTopBottom(
@@ -629,8 +575,12 @@ private:
         LayerPlan& gcode_layer,
         const SliceMeshStorage& mesh,
         const size_t extruder_nr,
+        const RoofingFlooringSettingsNames& settings_names,
         const MeshPathConfigs& mesh_config,
-        const SkinPart& skin_part,
+        const GCodePathConfig& default_config,
+        const std::vector<AngleDegrees>& angles,
+        const Shape& skin_fill,
+        const bool is_roofing_flooring,
         bool& added_something) const;
 
     /*!
@@ -652,6 +602,7 @@ private:
      * \param[out] added_something Whether this function added anything to the layer plan
      * \param fan_speed fan speed override for this skin area
      * \param forced_small_area_width A specific value to be used for small_area_width when generating the infill, or nullopt to use the normal value
+     * \param print_attributes Print attributes to be set for this segment, e.g. overhanging or bridging
      */
     void processSkinPrintFeature(
         const SliceDataStorage& storage,
@@ -660,6 +611,7 @@ private:
         const size_t extruder_nr,
         const Shape& area,
         const GCodePathConfig& config,
+        const GCodePathConfig* bridge_config,
         EFillMethod pattern,
         const AngleDegrees skin_angle,
         const coord_t skin_overlap,
@@ -668,7 +620,8 @@ private:
         const bool is_roofing_flooring,
         bool& added_something,
         double fan_speed = GCodePathConfig::FAN_SPEED_DEFAULT,
-        std::optional<coord_t> forced_small_area_width = std::nullopt) const;
+        std::optional<coord_t> forced_small_area_width = std::nullopt,
+        const OverrideAreas& override_areas = {}) const;
 
     /*!
      *  see if we can avoid printing a lines or zig zag style skin part in multiple segments by moving to
@@ -819,6 +772,16 @@ private:
     void computeCorrugationAnchors(SliceDataStorage& storage) const;
 
     /*!
+     * Retrieve all skin relevant to skin support from the indicated layer w.r.t. the indicated part (on an adjacent layer).
+     *
+     * \param skin_combined [out] Return parameter.
+     * \param mesh [in] Relevant mesh.
+     * \param part [in] The part that we're currently checking.
+     * \param skin_layer_nr [in] A layer that is adjacent to the part (so either above or below the layer of the part).
+     */
+    static void getCombinedSkinForSkinSupport(Shape& skin_combined, const SliceMeshStorage& mesh, const SliceLayerPart& part, int skin_layer_nr);
+
+    /*!
      * Partition the Infill regions by the skin at N layers above.
      *
      * When skin edge support layers is set this function will check N layers above the infill layer to see if there is
@@ -828,6 +791,7 @@ private:
      *
      * \param infill_below_skin [out] Polygons with infill below the skin
      * \param infill_not_below_skin [out] Polygons with infill outside of skin regions above
+     * \param infill_sandwiched [out] Polygons with infill that both has regions of skin both above _and_ below
      * \param gcode_layer The initial planning of the gcode of the layer
      * \param mesh the mesh containing the layer of interest
      * \param part \param part The part for which to create gcode
@@ -836,6 +800,7 @@ private:
     static void partitionInfillBySkinAbove(
         Shape& infill_below_skin,
         Shape& infill_not_below_skin,
+        Shape& infill_sandwiched,
         const LayerPlan& gcode_layer,
         const SliceMeshStorage& mesh,
         const SliceLayerPart& part,

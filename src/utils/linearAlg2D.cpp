@@ -248,7 +248,7 @@ coord_t LinearAlg2D::getDistFromLine(const Point2LL& p, const Point2LL& a, const
     // return px_size
     const Point2LL vab = b - a;
     const Point2LL vap = p - a;
-    const double ab_size = vSize(vab);
+    const coord_t ab_size = vSize(vab);
     if (ab_size == 0) // Line of 0 length. Assume it's a line perpendicular to the direction to p.
     {
         return vSize(vap);
@@ -358,6 +358,17 @@ std::optional<coord_t> LinearAlg2D::segmentHorizontalLineIntersection(const Poin
     }
 
     return lineHorizontalLineIntersection(p1, p2, line_y);
+}
+
+coord_t LinearAlg2D::getSlopedWidth(const coord_t base_width, const coord_t base_height, const double slope_magnitude, const coord_t actual_height)
+{
+    if (base_width == 0 || base_height == 0)
+    {
+        return 0;
+    }
+
+    const double factor = std::pow((1.0 - static_cast<double>(actual_height) / static_cast<double>(base_height)), slope_magnitude);
+    return std::llrint(static_cast<double>(base_width) * factor);
 }
 
 } // namespace cura

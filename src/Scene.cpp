@@ -3,6 +3,7 @@
 
 #include "Scene.h"
 
+#include <fmt/chrono.h>
 #include <spdlog/spdlog.h>
 
 #include "Application.h"
@@ -72,7 +73,7 @@ void Scene::processMeshGroup(MeshGroup& mesh_group)
     bool empty = true;
     for (Mesh& mesh : mesh_group.meshes)
     {
-        if (! mesh.settings_.get<bool>("infill_mesh") && ! mesh.settings_.get<bool>("anti_overhang_mesh"))
+        if (mesh.isModelMesh())
         {
             empty = false;
             break;
@@ -81,7 +82,7 @@ void Scene::processMeshGroup(MeshGroup& mesh_group)
     if (empty)
     {
         Progress::messageProgress(Progress::Stage::FINISH, 1, 1); // 100% on this meshgroup
-        spdlog::info("Total time elapsed {:03.3f}s", time_keeper_total.restart());
+        spdlog::info("Total time elapsed {}", std::chrono::duration<double>(time_keeper_total.restart()));
         return;
     }
 
@@ -95,9 +96,8 @@ void Scene::processMeshGroup(MeshGroup& mesh_group)
     fff_processor->gcode_writer.writeGCode(storage, fff_processor->time_keeper);
 
     Progress::messageProgress(Progress::Stage::FINISH, 1, 1); // 100% on this meshgroup
-    Application::getInstance().communication_->flushGCode();
     Application::getInstance().communication_->sendOptimizedLayerData();
-    spdlog::info("Total time elapsed {:03.3f}s\n", time_keeper_total.restart());
+    spdlog::info("Total time elapsed {}\n", std::chrono::duration<double>(time_keeper_total.restart()));
 }
 
 } // namespace cura

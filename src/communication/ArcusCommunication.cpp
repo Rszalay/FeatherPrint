@@ -56,9 +56,9 @@ class ArcusCommunication::PathCompiler
     //! Reference to the private data of the CommandSocket used to send the data to the front end.
     ArcusCommunication::Private& _cs_private_data;
     //! Keeps track of the current layer number being processed. If layer number is set to a different value, the current data is flushed to CommandSocket.
-    LayerIndex _layer_nr;
-    size_t extruder;
-    PointType data_point_type;
+    LayerIndex _layer_nr{ 0 };
+    size_t extruder{ 0 };
+    PointType data_point_type{ cura::proto::PathSegment::Point3D };
 
     std::vector<PrintFeatureType> line_types; //!< Line types for the line segments stored, the size of this vector is N.
     std::vector<float> line_widths; //!< Line widths for the line segments stored, the size of this vector is N.
@@ -66,6 +66,7 @@ class ArcusCommunication::PathCompiler
     std::vector<float> line_velocities; //!< Line feedrates for the line segments stored, the size of this vector is N.
     std::vector<float> points; //!< The points used to define the line segments, the size of this vector is D*(N+1) as each line segment is defined from one point to the next. D is
                                //!< the dimensionality of the point.
+    std::vector<uint32_t> line_attributes; //! Indicates if the line is processed with specific settings, e.g. overhanging or bridging, the size of this vector is N.
 
     Point3LL last_point;
 
@@ -78,14 +79,6 @@ public:
      */
     PathCompiler(ArcusCommunication::Private& cs_private_data)
         : _cs_private_data(cs_private_data)
-        , _layer_nr(0)
-        , extruder(0)
-        , data_point_type(cura::proto::PathSegment::Point3D)
-        , line_types()
-        , line_widths()
-        , line_thicknesses()
-        , line_velocities()
-        , points()
     {
     }
 
@@ -150,7 +143,7 @@ public:
         }
         else if (initial_point != last_point)
         {
-            addLineSegment(PrintFeatureType::NoneType, initial_point, 1, 0, 0.0);
+            addLineSegment(PrintFeatureType::NoneType, initial_point, 1, 0, 0.0, {});
         }
     }
 
@@ -195,6 +188,12 @@ public:
         line_velocity_data.append(reinterpret_cast<const char*>(line_velocities.data()), line_velocities.size() * sizeof(float));
         line_velocities.clear();
         path_segment->set_line_feedrate(line_velocity_data);
+
+        for (const uint32_t line_attribute : line_attributes)
+        {
+            path_segment->add_attributes(line_attribute);
+        }
+        line_attributes.clear();
     }
 
     /*!
@@ -215,14 +214,21 @@ public:
      * \param line_width The width of the line.
      * \param line_thickness The thickness (in the Z direction) of the line.
      * \param velocity The velocity of printing this polygon.
+     * \param print_attributes Print attributes to be set for this segment, e.g. overhanging or bridging
      */
-    void sendLineTo(const PrintFeatureType& print_feature_type, const Point3LL& to, const coord_t& width, const coord_t& thickness, const Velocity& feedrate)
+    void sendLineTo(
+        const PrintFeatureType& print_feature_type,
+        const Point3LL& to,
+        const coord_t& width,
+        const coord_t& thickness,
+        const Velocity& feedrate,
+        const PrintSegmentAttributes& print_attributes)
     {
         assert(! points.empty() && "A point must already be in the buffer for sendLineTo(.) to function properly.");
 
         if (to != last_point)
         {
-            addLineSegment(print_feature_type, to, width, thickness, feedrate);
+            addLineSegment(print_feature_type, to, width, thickness, feedrate, print_attributes);
         }
     }
 
@@ -252,14 +258,22 @@ private:
      * \param width The width of the lines of the polygon.
      * \param thickness The layer thickness of the polygon.
      * \param velocity How fast the polygon is printed.
+     * \param print_attributes Print attributes to be set for this segment, e.g. overhanging or bridging
      */
-    void addLineSegment(const PrintFeatureType& print_feature_type, const Point3LL& point, const coord_t& width, const coord_t& thickness, const Velocity& velocity)
+    void addLineSegment(
+        const PrintFeatureType& print_feature_type,
+        const Point3LL& point,
+        const coord_t& width,
+        const coord_t& thickness,
+        const Velocity& velocity,
+        const PrintSegmentAttributes& print_attributes)
     {
         addPoint3D(point);
         line_types.push_back(print_feature_type);
         line_widths.push_back(INT2MM(width));
         line_thicknesses.push_back(INT2MM(thickness));
         line_velocities.push_back(velocity);
+        line_attributes.push_back(static_cast<uint32_t>(print_attributes.value()));
     }
 };
 
@@ -288,7 +302,6 @@ void ArcusCommunication::connect(const std::string& ip, const uint16_t port)
     private_data->socket->registerMessageType(&cura::proto::GCodeLayer::default_instance());
     private_data->socket->registerMessageType(&cura::proto::PrintTimeMaterialEstimates::default_instance());
     private_data->socket->registerMessageType(&cura::proto::SettingList::default_instance());
-    private_data->socket->registerMessageType(&cura::proto::GCodePrefix::default_instance());
     private_data->socket->registerMessageType(&cura::proto::SlicingFinished::default_instance());
     private_data->socket->registerMessageType(&cura::proto::SettingExtruder::default_instance());
 
@@ -312,31 +325,17 @@ void ArcusCommunication::setSocketMock(Arcus::Socket* socket)
     private_data->socket = socket;
 }
 
-void ArcusCommunication::beginGCode()
+void ArcusCommunication::sendGCodePart(const std::string& gcode_part)
 {
-    FffProcessor::getInstance()->setTargetStream(&private_data->gcode_output_stream);
-}
-
-void ArcusCommunication::flushGCode()
-{
-    std::string gcode_output_stream = private_data->gcode_output_stream.str();
-    auto message_str = slots::instance().modify<plugins::v0::SlotID::POSTPROCESS_MODIFY>(gcode_output_stream);
-    if (message_str.size() == 0)
+    const std::string message_str = slots::instance().modify<plugins::v0::SlotID::POSTPROCESS_MODIFY>(gcode_part);
+    if (message_str.empty())
     {
         return;
     }
+
     std::shared_ptr<proto::GCodeLayer> message = std::make_shared<proto::GCodeLayer>();
     message->set_data(message_str);
-
-    // Send the g-code to the front-end! Yay!
     private_data->socket->sendMessage(message);
-
-    private_data->gcode_output_stream.str("");
-}
-
-bool ArcusCommunication::isSequential() const
-{
-    return false; // We don't necessarily need to send the start g-code before the rest. We can send it afterwards when we have more accurate print statistics.
 }
 
 bool ArcusCommunication::hasSlice() const
@@ -348,14 +347,6 @@ bool ArcusCommunication::hasSlice() const
 void ArcusCommunication::sendCurrentPosition(const Point3LL& position)
 {
     path_compiler->setCurrentPosition(position);
-}
-
-void ArcusCommunication::sendGCodePrefix(const std::string& prefix) const
-{
-    std::shared_ptr<proto::GCodePrefix> message = std::make_shared<proto::GCodePrefix>();
-    std::string message_str = prefix;
-    message->set_data(slots::instance().modify<plugins::v0::SlotID::POSTPROCESS_MODIFY>(message_str));
-    private_data->socket->sendMessage(message);
 }
 
 void ArcusCommunication::sendSliceUUID(const std::string& slice_uuid) const
@@ -379,9 +370,15 @@ void ArcusCommunication::sendLayerComplete(const LayerIndex::value_type& layer_n
     layer->set_thickness(thickness);
 }
 
-void ArcusCommunication::sendLineTo(const PrintFeatureType& type, const Point3LL& to, const coord_t& line_width, const coord_t& line_thickness, const Velocity& velocity)
+void ArcusCommunication::sendLineTo(
+    const PrintFeatureType& type,
+    const Point3LL& to,
+    const coord_t& line_width,
+    const coord_t& line_thickness,
+    const Velocity& velocity,
+    const PrintSegmentAttributes& print_attributes)
 {
-    path_compiler->sendLineTo(type, to, line_width, line_thickness, velocity);
+    path_compiler->sendLineTo(type, to, line_width, line_thickness, velocity, print_attributes);
 }
 
 void ArcusCommunication::sendOptimizedLayerData()
@@ -408,12 +405,12 @@ void ArcusCommunication::sendOptimizedLayerData()
     data.slice_data.clear();
 }
 
-void ArcusCommunication::sendPrintTimeMaterialEstimates() const
+void ArcusCommunication::sendPrintInformation(const std::vector<cura::Duration>& time_estimates, const PrintInformation& print_information) const
 {
-    spdlog::debug("Sending print time and material estimates.");
+    spdlog::debug("Sending print information.");
+
     std::shared_ptr<proto::PrintTimeMaterialEstimates> message = std::make_shared<proto::PrintTimeMaterialEstimates>();
 
-    std::vector<Duration> time_estimates = FffProcessor::getInstance()->getTotalPrintTimePerFeature();
     message->set_time_infill(time_estimates[static_cast<unsigned char>(PrintFeatureType::Infill)]);
     message->set_time_inset_0(time_estimates[static_cast<unsigned char>(PrintFeatureType::OuterWall)]);
     message->set_time_inset_x(time_estimates[static_cast<unsigned char>(PrintFeatureType::InnerWall)]);
@@ -433,16 +430,36 @@ void ArcusCommunication::sendPrintTimeMaterialEstimates() const
     {
         proto::MaterialEstimates* material_message = message->add_materialestimates();
         material_message->set_id(extruder_nr);
-        auto fff_proc = FffProcessor::getInstance();
-        material_message->set_material_amount(
-            fff_proc->getExtruderActualUse(extruder_nr) ? fff_proc->getTotalFilamentUsed(extruder_nr) : std::numeric_limits<float>::signaling_NaN());
-        // NOTE: Set to signalling-NaN to specify that no calculations should be done on the result, and if attempted, should fail fast instead of propagate.
-        //       Instead, it's meant to repressent the state of a completely unused extruder or tool, since a value of 0.0 could be a rounding error.
-        //       (Also future-proof: '0.0' might conceivably signal a state in which a tool is used that doesn't extrude material, 'NaN' still means unused.)
+
+        const std::optional<ExtruderPrintInformation>& extruder_info = print_information.extruders_info[extruder_nr];
+        if (extruder_info.has_value())
+        {
+            material_message->set_material_amount(extruder_info->filament_amount);
+            material_message->set_material_length(extruder_info->filament_length);
+            material_message->set_material_weight(extruder_info->filament_weight);
+            material_message->set_material_cost(extruder_info->filament_cost);
+            material_message->set_material_name(extruder_info->material_name);
+        }
+        else
+        {
+            material_message->set_material_amount(std::numeric_limits<float>::signaling_NaN());
+            // NOTE: Set to signalling-NaN to specify that no calculations should be done on the result, and if attempted, should fail fast instead of propagate.
+            //       Instead, it's meant to repressent the state of a completely unused extruder or tool, since a value of 0.0 could be a rounding error.
+            //       (Also future-proof: '0.0' might conceivably signal a state in which a tool is used that doesn't extrude material, 'NaN' still means unused.)
+            material_message->set_material_length(0.0);
+            material_message->set_material_weight(0.0);
+            material_message->set_material_cost(0.0);
+            material_message->set_material_name("");
+        }
     }
 
     private_data->socket->sendMessage(message);
-    spdlog::debug("Done sending print time and material estimates.");
+
+    auto initial_extruder_message = std::make_shared<proto::InitialExtruder>();
+    initial_extruder_message->set_extruder_nr(print_information.initial_extruder_nr.value_or(0));
+    private_data->socket->sendMessage(initial_extruder_message);
+
+    spdlog::debug("Done sending print information.");
 }
 
 void ArcusCommunication::sendProgress(double progress) const
@@ -545,9 +562,6 @@ void ArcusCommunication::sliceNext()
     if (! slice->scene.mesh_groups.empty())
     {
         slice->compute();
-        FffProcessor::getInstance()->finalize();
-        flushGCode();
-        sendPrintTimeMaterialEstimates();
         sendFinishedSlicing();
         slice.reset();
         private_data->slice_count++;

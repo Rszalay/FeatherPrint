@@ -43,8 +43,11 @@ struct AreaIncreaseSettings
     bool operator==(const AreaIncreaseSettings& other) const = default;
 };
 
-struct TreeSupportElement
+class TreeSupportElement : public std::enable_shared_from_this<TreeSupportElement>
 {
+public:
+    using Ptr = std::shared_ptr<TreeSupportElement>;
+
     TreeSupportElement(
         coord_t distance_to_top,
         size_t target_height,
@@ -60,51 +63,20 @@ struct TreeSupportElement
         bool influence_area_limit_active,
         coord_t influence_area_limit_range);
 
-    TreeSupportElement(const TreeSupportElement& elem, Shape* newArea = nullptr);
-
-    /*!
-     * \brief Create a new Element for one layer below the element of the pointer supplied.
-     */
-    TreeSupportElement(TreeSupportElement* element_above);
-
-    // ONLY to be called in merge as it assumes a few assurances made by it.
-    TreeSupportElement(
-        const TreeSupportElement& first,
-        const TreeSupportElement& second,
-        size_t next_height,
-        Point2LL next_position,
-        coord_t increased_to_model_radius,
-        const std::function<coord_t(size_t, double)>& getRadius,
-        double diameter_scale_bp_radius,
-        coord_t branch_radius,
-        double diameter_angle_scale_factor);
-
-
-    bool operator==(const TreeSupportElement& other) const
+    /*! \brief Gets the list of parent elements, which are those above the current element */
+    const std::vector<TreeSupportElement::Ptr>& getParents() const
     {
-        return target_position_ == other.target_position_ && target_height_ == other.target_height_;
+        return parents_;
     }
 
-    bool operator<(const TreeSupportElement& other) const // true if me < other
-    {
-        return ! (*this == other) && ! (*this > other);
-    }
+    /*! \brief Adds the given elements to be parents of the current element. Parents will also be properly modified to have the element as a child. */
+    void addParents(const std::vector<TreeSupportElement::Ptr>& new_parents);
 
-    bool operator>(const TreeSupportElement& other) const
+    /*! \brief Gets the child element, which is the one beloe the current element. It could also be null if the element lies on the buildplate or on the model */
+    TreeSupportElement::Ptr getChild() const
     {
-        // Doesn't really have to make sense, only required for ordering in maps to ensure deterministic behavior.
-        if (*this == other)
-        {
-            return false;
-        }
-        if (other.target_height_ != target_height_)
-        {
-            return other.target_height_ < target_height_;
-        }
-        return other.target_position_.X == target_position_.X ? other.target_position_.Y < target_position_.Y : other.target_position_.X < target_position_.X;
+        return child_;
     }
-
-    void AddParents(const std::vector<TreeSupportElement*>& adding);
 
     void RecreateInfluenceLimitArea();
 
@@ -122,6 +94,21 @@ struct TreeSupportElement
      * @param layer_height The layer height at which to extrude the influence area
      */
     void saveToObj(OBJ& obj, const coord_t z, const coord_t layer_height) const;
+
+    static TreeSupportElement::Ptr makeFromElementAbove(const TreeSupportElement::Ptr& element_above);
+
+    static TreeSupportElement::Ptr makeCopy(const TreeSupportElement::Ptr& elem, Shape* newArea = nullptr);
+
+    static TreeSupportElement::Ptr makeMerged(
+        const TreeSupportElement::Ptr& first,
+        const TreeSupportElement::Ptr& second,
+        size_t next_height,
+        Point2LL next_position,
+        coord_t increased_to_model_radius,
+        const std::function<coord_t(size_t, double)>& getRadius,
+        double diameter_scale_bp_radius,
+        coord_t branch_radius,
+        double diameter_angle_scale_factor);
 
     /*!
      * \brief The layer this support elements wants reach
@@ -155,11 +142,6 @@ struct TreeSupportElement
      */
 
     bool to_buildplate_;
-
-    /*!
-     * \brief All elements in the layer above the current one that are supported by this element
-     */
-    std::vector<TreeSupportElement*> parents_;
 
     /*!
      * \brief The amount of layers this element is below the topmost layer of this branch.
@@ -250,21 +232,38 @@ struct TreeSupportElement
      * \brief Additional locations that the tip should reach
      */
     std::vector<Point2LL> additional_ovalization_targets_;
+
+private:
+    /*!
+     * \brief Create a new Element for one layer below the element of the pointer supplied.
+     */
+    explicit TreeSupportElement(const TreeSupportElement::Ptr& element_above);
+
+    TreeSupportElement(const TreeSupportElement::Ptr& elem, Shape* newArea);
+
+    // ONLY to be called in merge as it assumes a few assurances made by it.
+    TreeSupportElement(
+        const TreeSupportElement::Ptr& first,
+        const TreeSupportElement::Ptr& second,
+        size_t next_height,
+        Point2LL next_position,
+        coord_t increased_to_model_radius,
+        const std::function<coord_t(size_t, double)>& getRadius,
+        double diameter_scale_bp_radius,
+        coord_t branch_radius,
+        double diameter_angle_scale_factor);
+
+    /*!
+     * \brief All elements in the layer above the current one that are supported by this element
+     */
+    std::vector<TreeSupportElement::Ptr> parents_;
+
+    /*!
+     * \brief The element in the layer below that is supporting this element
+     */
+    TreeSupportElement::Ptr child_{ nullptr };
 };
 
 } // namespace cura
 
-namespace std
-{
-template<>
-struct hash<cura::TreeSupportElement>
-{
-    size_t operator()(const cura::TreeSupportElement& node) const
-    {
-        size_t hash_node = hash<cura::Point2LL>()(node.target_position_);
-        boost::hash_combine(hash_node, size_t(node.target_height_));
-        return hash_node;
-    }
-};
-} // namespace std
 #endif /* TREESUPPORTELEMENT_H */

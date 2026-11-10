@@ -9,6 +9,7 @@
 #include <stack>
 #include <unordered_set>
 
+#include <range/v3/algorithm/find_if.hpp>
 #include <scripta/logger.h>
 #include <spdlog/spdlog.h>
 
@@ -273,7 +274,8 @@ bool SkeletalTrapezoidation::computePointCellRange(
     vd_t::edge_type*& starting_vd_edge,
     vd_t::edge_type*& ending_vd_edge,
     const std::vector<Point2LL>& points,
-    const std::vector<Segment>& segments)
+    const std::vector<Segment>& segments,
+    const Shape& polys)
 {
     if (cell.incident_edge()->is_infinite())
     {
@@ -283,20 +285,18 @@ bool SkeletalTrapezoidation::computePointCellRange(
     // Copy whole cell into graph or not at all
 
     const Point2LL source_point = VoronoiUtils::getSourcePoint(cell, points, segments);
-    const PolygonsPointIndex source_point_index = VoronoiUtils::getSourcePointIndex(cell, points, segments);
     Point2LL some_point = VoronoiUtils::p(cell.incident_edge()->vertex0());
     if (some_point == source_point)
     {
         some_point = VoronoiUtils::p(cell.incident_edge()->vertex1());
     }
-    // Test if the some_point is even inside the polygon.
-    // The edge leading out of a polygon must have an endpoint that's not in the corner following the contour of the polygon at that vertex.
-    // So if it's inside the corner formed by the polygon vertex, it's all fine.
-    // But if it's outside of the corner, it must be a vertex of the Voronoi diagram that goes outside of the polygon towards infinity.
-    if (! LinearAlg2D::isInsideCorner(source_point_index.prev().p(), source_point_index.p(), source_point_index.next().p(), some_point))
+
+    // Test if the some_point is even inside the polygon. If not, the whole cell is outside the polygon and must not be considered.
+    if (! polys.inside(some_point))
     {
         return false; // Don't copy any part of this cell
     }
+
     vd_t::edge_type* vd_edge = cell.incident_edge();
     do
     {
@@ -430,7 +430,7 @@ void SkeletalTrapezoidation::constructFromPolygons(const Shape& polys)
 
         if (cell.contains_point())
         {
-            const bool keep_going = computePointCellRange(cell, start_source_point, end_source_point, starting_vonoroi_edge, ending_vonoroi_edge, points, segments);
+            const bool keep_going = computePointCellRange(cell, start_source_point, end_source_point, starting_vonoroi_edge, ending_vonoroi_edge, points, segments, polys);
             if (! keep_going)
             {
                 continue;
@@ -2207,9 +2207,38 @@ void SkeletalTrapezoidation::generateLocalMaximaSingleBeads()
         line.junctions_.insert(line.junctions_.end(), circle.begin(), circle.end());
     };
 
-    Point2LL local_maxima_accumulator;
-    coord_t width_accumulator = 0;
-    size_t accumulator_count = 0;
+    struct LocalMaximaPoint
+    {
+        Point2LL p_;
+        coord_t width_;
+        size_t accumulator_;
+
+        LocalMaximaPoint(const Point2LL& p, coord_t width)
+            : p_(p)
+            , width_(width)
+            , accumulator_(1)
+        {
+        }
+
+        void operator+=(const LocalMaximaPoint& other)
+        {
+            p_ += other.p_;
+            width_ += other.width_;
+            accumulator_ += other.accumulator_;
+        }
+
+        Point2LL getAveragePoint() const
+        {
+            return p_ / static_cast<coord_t>(accumulator_);
+        }
+
+        coord_t getAverageWidth() const
+        {
+            return width_ / static_cast<coord_t>(accumulator_);
+        }
+    };
+
+    std::vector<LocalMaximaPoint> local_maxima_points;
 
     for (const auto& node : graph_.nodes_)
     {
@@ -2222,46 +2251,66 @@ void SkeletalTrapezoidation::generateLocalMaximaSingleBeads()
         {
             const size_t inset_index = beading.bead_widths.size() / 2;
             const coord_t width = beading.bead_widths[inset_index];
-            local_maxima_accumulator += node.p_;
-            width_accumulator += width;
-            ++accumulator_count;
             if (! node.isCentral())
             {
                 addCircleToToolpath(node.p_, width, inset_index);
             }
+            else
+            {
+                // lines will be removed if they are wider then they are long, if we detect such lines we don't want to print
+                // nothing since this will leave unpredictable gaps in the print. If we detect such small lines we will instead
+                // replace them with a small circle to fill the gap.
+                const auto max_local_maxima_dist = (beading_strategy_.getOptimalWidth() * 3) / 2;
+                const auto max_local_maxima_dist2 = max_local_maxima_dist * max_local_maxima_dist;
+                const auto it = ranges::find_if(
+                    local_maxima_points,
+                    [&](const LocalMaximaPoint& local_maxima_point)
+                    {
+                        return vSize2(local_maxima_point.p_ - node.p_) < max_local_maxima_dist2;
+                    });
+
+                if (it != local_maxima_points.end())
+                {
+                    *it += (LocalMaximaPoint(node.p_, width));
+                }
+                else
+                {
+                    local_maxima_points.emplace_back(node.p_, width);
+                }
+            }
         }
     }
 
-    if (accumulator_count > 0)
+    bool replace_with_local_maxima = generated_toolpaths.empty() || generated_toolpaths[0].empty();
+    coord_t total_path_length = 0;
+    if (! replace_with_local_maxima)
     {
-        bool replace_with_local_maxima = generated_toolpaths.empty() || generated_toolpaths[0].empty();
-        coord_t total_path_length = 0;
-        if (! replace_with_local_maxima)
+        coord_t min_width = std::numeric_limits<coord_t>::max();
+        for (const auto& line : generated_toolpaths[0])
         {
-            coord_t min_width = std::numeric_limits<coord_t>::max();
-            for (const auto& line : generated_toolpaths[0])
+            total_path_length += line.length();
+            for (const ExtrusionJunction& j : line)
             {
-                total_path_length += line.length();
-                for (const ExtrusionJunction& j : line)
-                {
-                    min_width = std::min(min_width, j.w_);
-                }
+                min_width = std::min(min_width, j.w_);
             }
-            replace_with_local_maxima |= total_path_length <= min_width / 2;
         }
-        if (replace_with_local_maxima)
+        replace_with_local_maxima |= total_path_length <= min_width / 2;
+    }
+
+    if (replace_with_local_maxima)
+    {
+        if (generated_toolpaths.empty())
         {
-            const coord_t width = width_accumulator / accumulator_count;
-            local_maxima_accumulator = local_maxima_accumulator / accumulator_count;
-            if (generated_toolpaths.empty())
-            {
-                generated_toolpaths.emplace_back();
-            }
-            else
-            {
-                generated_toolpaths[0].clear();
-            }
-            addCircleToToolpath(local_maxima_accumulator, width, 0);
+            generated_toolpaths.emplace_back();
+        }
+        else
+        {
+            generated_toolpaths[0].clear();
+        }
+
+        for (const auto& local_maxima_point : local_maxima_points)
+        {
+            addCircleToToolpath(local_maxima_point.getAveragePoint(), local_maxima_point.getAverageWidth(), 0);
         }
     }
 }

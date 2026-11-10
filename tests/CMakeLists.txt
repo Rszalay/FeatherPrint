@@ -11,6 +11,7 @@ set(TESTS_SRC_BASE
         FeatherPrintGeneratorTest
         FffGcodeWriterTest
         GCodeExportTest
+        GCodeTemplateResolverTest
         InfillTest
         LayerPlanTest
         PathOrderOptimizerTest

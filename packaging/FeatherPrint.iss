@@ -1,6 +1,6 @@
 ; =============================================================================
 ; FeatherPrint Installer
-; Engine-only replacement for UltiMaker Cura 5.13.x
+; Engine-only replacement for UltiMaker Cura 5.14.x
 ; =============================================================================
 
 #define MyAppName       "FeatherPrint"
@@ -9,9 +9,9 @@
 #define MyAppURL        "https://github.com/Rszalay/FeatherPrint"
 
 ; The Cura release this engine is built against
-#define TargetCuraVersion "5.13"
+#define TargetCuraVersion "5.14"
 #define TargetCuraMajor   5
-#define TargetCuraMinor   13
+#define TargetCuraMinor   14
 
 ; Release build output directory (relative to this .iss file)
 #define SourceBuildDir "..\build\Release"
@@ -60,15 +60,14 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ;       Cura's pyArcus.pyd is compiled against those exact files; replacing
 ;       them breaks the Cura frontend. Arcus is statically linked into
 ;       CuraEngine.exe so there is no runtime dependency on Arcus.dll.
+;       TBB and hwloc are left alone: Cura 5.14's own copies work with this build.
+;       cura-formulae-engine.dll is required: the engine fails to load against
+;       Cura's copy (0xC0000139), and only the engine imports it.
 ; =============================================================================
 [Files]
 Source: "{#SourceBuildDir}\CuraEngine.exe";             DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
-Source: "{#SourceBuildDir}\cura-formulae-engine.dll";   DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#SourceBuildDir}\tbb12.dll";                  DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#SourceBuildDir}\tbbbind_2_5.dll";            DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#SourceBuildDir}\tbbmalloc.dll";              DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#SourceBuildDir}\tbbmalloc_proxy.dll";        DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#FdmPrinterDef}";                             DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
+Source: "{#SourceBuildDir}\cura-formulae-engine.dll";   DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
+Source: "{#FdmPrinterDef}";                            DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
 Source: "{#QualityChangesGlobal}";                      DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
 Source: "{#QualityChangesExtruder}";                    DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
 Source: "{#FpQualityGlobal}";                           DestDir: "{tmp}\FeatherPrintStaged"; Flags: ignoreversion
@@ -139,7 +138,9 @@ begin
 end;
 
 { --------------------------------------------------------------------------- }
-{ Backup a file to <file>.bak — keeps only one backup                        }
+{ Backup a file to <file>.bak. An existing .bak is the stock original, so it   }
+{ must survive an install over an earlier FeatherPrint: only remove the current }
+{ file in that case, so that it is never mistaken for the original.            }
 { --------------------------------------------------------------------------- }
 procedure BackupFile(FilePath: String);
 var
@@ -149,8 +150,9 @@ begin
   if FileExists(FilePath) then
   begin
     if FileExists(BackupPath) then
-      DeleteFile(BackupPath);
-    RenameFile(FilePath, BackupPath);
+      DeleteFile(FilePath)
+    else
+      RenameFile(FilePath, BackupPath);
   end;
 end;
 
@@ -236,7 +238,7 @@ begin
     'This installer will:' + #13#10 +
     '  1. Back up CuraEngine.exe  ->  CuraEngine.exe.bak' + #13#10 +
     '  2. Replace CuraEngine.exe with FeatherPrint {#MyAppVersion}' + #13#10 +
-    '  3. Copy required runtime DLLs (with .bak backups)' + #13#10 +
+    '  3. Replace cura-formulae-engine.dll (with .bak backup)' + #13#10 +
     '  4. Deploy modified fdmprinter.def.json (with .bak backup)' + #13#10 +
     '  5. Install "FeatherPrint" and "FeatherPrint Corrugated" print profiles' + #13#10 +
     '  6. Clear Cura''s definition cache so the new settings show up' + #13#10 + #13#10 +
@@ -278,14 +280,10 @@ begin
     Exit;
   end;
 
-  { Back up and replace runtime DLLs (NOT Arcus.dll or polyclipping.dll) }
+  { Back up and replace runtime DLLs (NOT Arcus.dll, polyclipping.dll, or TBB/hwloc) }
   FileNames := TStringList.Create;
   try
     FileNames.Add('cura-formulae-engine.dll');
-    FileNames.Add('tbb12.dll');
-    FileNames.Add('tbbbind_2_5.dll');
-    FileNames.Add('tbbmalloc.dll');
-    FileNames.Add('tbbmalloc_proxy.dll');
 
     for i := 0 to FileNames.Count - 1 do
     begin
@@ -369,10 +367,6 @@ begin
   FileNames := TStringList.Create;
   try
     FileNames.Add('cura-formulae-engine.dll');
-    FileNames.Add('tbb12.dll');
-    FileNames.Add('tbbbind_2_5.dll');
-    FileNames.Add('tbbmalloc.dll');
-    FileNames.Add('tbbmalloc_proxy.dll');
 
     for i := 0 to FileNames.Count - 1 do
       RestoreFile(SavedDir + '\' + FileNames[i]);

@@ -22,19 +22,16 @@ if (Get-Process -Name "UltiMaker-Cura" -ErrorAction SilentlyContinue) {
     Read-Host "Close Cura, then press Enter to continue (or Ctrl+C to abort)"
 }
 
-$CuraDir      = "C:\Program Files\UltiMaker Cura 5.13.0"
+$CuraDir      = "C:\Program Files\UltiMaker Cura 5.14.0"
 $BuildDir     = "$PSScriptRoot\..\build\Release"
 $PackagingDir = "$PSScriptRoot\..\packaging"
 $DefsDir      = "$CuraDir\share\cura\resources\definitions"
 
 $BinFiles = @(
     "CuraEngine.exe",
-    # cura-formulae-engine.dll: may be needed if versions differ; deploy if present in build output.
-    "cura-formulae-engine.dll",
-    "tbb12.dll",
-    "tbbbind_2_5.dll",
-    "tbbmalloc.dll",
-    "tbbmalloc_proxy.dll"
+    # Required: the engine fails to load against Cura's own copy (0xC0000139). Only the engine imports it.
+    "cura-formulae-engine.dll"
+    # TBB/hwloc: Cura 5.14's own copies work with this build, so they are left alone.
     # Arcus.dll / polyclipping.dll: permanently excluded - replacing them breaks pyArcus.
 )
 
@@ -101,7 +98,13 @@ if (-not (Deploy-File "$PackagingDir\fdmprinter.def.json" $defSrc)) { $ok = $fal
 
 Write-Host ""
 if ($ok) {
-    Write-Host "Done. Launch Cura and check Print Settings for the Fuselage Slicer category." -ForegroundColor Green
+    # Cura trusts a cached definition that is newer than the source file, and Copy-Item keeps the JSON's old date.
+    $CacheDir = "$env:LOCALAPPDATA\cura\5.14\cache"
+    if (Test-Path $CacheDir) {
+        Remove-Item $CacheDir -Recurse -Force
+        Write-Host "  OK  cleared definition cache"
+    }
+    Write-Host "Done. Launch Cura and check Infill Pattern for FeatherPrint and Corrugated." -ForegroundColor Green
 } else {
     Write-Host "Completed with errors - see FAIL lines above." -ForegroundColor Yellow
 }

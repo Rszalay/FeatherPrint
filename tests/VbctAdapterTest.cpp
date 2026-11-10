@@ -1668,6 +1668,11 @@ namespace
 // InsetOutlineProducesCleanRingAcrossAllLayers's own settings.add pattern above.
 void addCorrugationAnchorSettings(Settings& settings)
 {
+    // Read by SliceMeshStorage's constructor since 5.14 (Mesh::isPrinted / isModelMesh). With no
+    // active slice, a missing setting dereferences a null current_slice_ instead of reporting it.
+    settings.add("cutting_mesh", "False");
+    settings.add("anti_overhang_mesh", "False");
+    settings.add("infill_mesh", "False");
     settings.add("corrugated_vbs_tolerance", "0.3");
     settings.add("corrugated_prune_threshold", "0.8");
     settings.add("corrugated_raw_outline_mode", "False");

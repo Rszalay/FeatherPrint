@@ -7,6 +7,7 @@
 #include <cmath> // sqrt, abs
 #include <numbers>
 
+#include <fmt/chrono.h>
 #include <scripta/logger.h>
 #include <spdlog/spdlog.h>
 
@@ -963,11 +964,11 @@ Slicer::Slicer(
 
     buildSegments(*mesh, zbbox, slicing_tolerance, layers, false_diagonal_edges);
 
-    spdlog::info("Slice of mesh took {:03.3f} seconds", slice_timer.restart());
+    spdlog::info("Slice of mesh took {}", std::chrono::duration<double>(slice_timer.restart()));
 
     makePolygons(*i_mesh, slicing_tolerance, layers);
     scripta::log("sliced_polygons", layers, SectionType::NA);
-    spdlog::info("Make polygons took {:03.3f} seconds", slice_timer.restart());
+    spdlog::info("Make polygons took {}", std::chrono::duration<double>(slice_timer.restart()));
 }
 
 void Slicer::buildSegments(
@@ -1185,8 +1186,7 @@ void Slicer::makePolygons(Mesh& mesh, SlicingTolerance slicing_tolerance, std::v
     }
 
     size_t layer_apply_initial_xy_offset = 0;
-    if (layers.size() > 0 && layers[0].polygons_.size() == 0 && ! mesh.settings_.get<bool>("support_mesh") && ! mesh.settings_.get<bool>("anti_overhang_mesh")
-        && ! mesh.settings_.get<bool>("cutting_mesh") && ! mesh.settings_.get<bool>("infill_mesh"))
+    if (layers.size() > 0 && layers[0].polygons_.size() == 0 && ! mesh.settings_.get<bool>("support_mesh") && mesh.isModelMesh())
     {
         layer_apply_initial_xy_offset = 1;
     }

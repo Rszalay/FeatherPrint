@@ -4,8 +4,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit
 }
 
-$d = "C:\Program Files\UltiMaker Cura 5.13.0"
-foreach ($f in @("cura-formulae-engine.dll","tbb12.dll","tbbbind_2_5.dll","tbbmalloc.dll","tbbmalloc_proxy.dll")) {
+$d = "C:\Program Files\UltiMaker Cura 5.14.0"
+foreach ($f in @("cura-formulae-engine.dll")) {
     $bak = "$d\$f.bak"
     if (Test-Path $bak) {
         Copy-Item $bak "$d\$f" -Force

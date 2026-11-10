@@ -14,7 +14,7 @@ Only one generator runs per mesh, dispatched from the same engine build — pick
 ## Requirements
 
 - Windows 10 or later
-- [UltiMaker Cura 5.13.x](https://ultimaker.com/software/ultimaker-cura) installed
+- [UltiMaker Cura 5.14.x](https://ultimaker.com/software/ultimaker-cura) installed
 
 ---
 
@@ -22,7 +22,7 @@ Only one generator runs per mesh, dispatched from the same engine build — pick
 
 1. Download **FeatherPrint-1.1.1-Windows-x64-Setup.exe** from the [latest release](https://github.com/Rszalay/FeatherPrint/releases/latest)
 2. Run the installer as Administrator
-3. The installer will detect your Cura 5.13.x installation, back up the original engine files, deploy FeatherPrint, and install validated **"FeatherPrint"** and **"FeatherPrint Corrugated"** print profiles (Print Settings → Profiles)
+3. The installer will detect your Cura 5.14.x installation, back up the original engine files, deploy FeatherPrint, and install validated **"FeatherPrint"** and **"FeatherPrint Corrugated"** print profiles (Print Settings → Profiles)
 
 To uninstall, run **Uninstall FeatherPrint** from Windows Add/Remove Programs. All original Cura files are restored from backup automatically.
 
@@ -104,7 +104,7 @@ Not yet built: the Glob fallback, true N-way hub stitching, and the corrugation 
 
 The [`FeatherPrint Spec/`](FeatherPrint%20Spec/) folder in this repo archives past spec snapshots and as-built reports (e.g. [`FeatherPrint_AsBuilt_Report_REV2.4_Jul21_2026.md`](FeatherPrint%20Spec/FeatherPrint_AsBuilt_Report_REV2.4_Jul21_2026.md)). The live, actively-maintained specification is versioned separately and not part of this repo.
 
-The active development branch is [`featherprint-5.13`](https://github.com/Rszalay/FeatherPrint/tree/featherprint-5.13).
+The active development branch is [`featherprint-5.14`](https://github.com/Rszalay/FeatherPrint/tree/featherprint-5.14).
 
 The Corrugated generator vendors the VBCT algorithm library (`src/vbct/`) and the CDT triangulation library it depends on (`include/third_party/CDT/`, MPL-2.0) directly into this repo — see their respective `VENDORED.md` files for provenance.
 

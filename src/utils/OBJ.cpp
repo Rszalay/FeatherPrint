@@ -11,6 +11,7 @@
 
 #include "mesh.h"
 #include "utils/Point3D.h"
+#include "utils/VoxelGrid.h"
 
 namespace cura
 {
@@ -95,8 +96,8 @@ OBJ::~OBJ()
         out_material << "newmtl " << materialName(color) << "\n";
 
         SVG::RgbColor color_rgb = SVG::toRgb(color);
-        out_material << "Kd " << color_rgb.r << color_rgb.g << color_rgb.b << "\n"
-                     << "\n";
+        out_material << "Kd " << static_cast<float>(color_rgb.r) / 256.f << " " << static_cast<float>(color_rgb.g) / 256.f << " " << static_cast<float>(color_rgb.b) / 256.f << "\n"
+                     << "\n"; // Extra newline between materials.
     }
 }
 
@@ -168,6 +169,19 @@ void OBJ::write(const Mesh& mesh, const SVG::Color color)
             face.uv_coordinates_[1],
             face.uv_coordinates_[2]);
     }
+}
+
+void OBJ::write(const VoxelGrid& voxel_grid)
+{
+    const double radius = std::min({ voxel_grid.getResolution().x_, voxel_grid.getResolution().y_, voxel_grid.getResolution().z_ }) / 4.0;
+    std::mutex mutex;
+
+    voxel_grid.visitOccupiedVoxels(
+        [this, &mutex, &voxel_grid, &radius](const auto& voxel)
+        {
+            std::lock_guard lock(mutex);
+            writeSphere(voxel_grid.toGlobalCoordinates(voxel.first), radius, static_cast<SVG::Color>(voxel.second), 2, 4);
+        });
 }
 
 void OBJ::write(const Polyline& polyline, const coord_t z, const coord_t height, const SVG::Color color)

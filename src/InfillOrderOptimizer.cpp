@@ -453,6 +453,7 @@ void InfillOrderOptimizer::addInfillLinesToLayer(
         wipe_dist = 0;
     }
 
+    constexpr OverrideAreas override_areas;
     layer_plan.addLinesByOptimizer(
         lines,
         mesh_config.infill_config[0],
@@ -462,6 +463,7 @@ void InfillOrderOptimizer::addInfillLinesToLayer(
         flow_ratio,
         near_start_location,
         fan_speed,
+        override_areas,
         reverse_print_direction,
         order_requirements,
         start_move_inwards_length,
@@ -482,15 +484,20 @@ void InfillOrderOptimizer::addSkinSupportLinesToLayer(
     const bool enable_travel_optimization,
     const Ratio& flow_ratio) const
 {
-    const auto skin_support_fan_speed = settings.get<double>("skin_support_fan_speed");
+    const auto skin_support_fan_speed = settings.get<bool>("cool_fan_enabled") ? settings.get<double>("skin_support_fan_speed") : GCodePathConfig::FAN_SPEED_DEFAULT;
     constexpr SpaceFillType skin_support_space_fill_type = SpaceFillType::Lines;
     constexpr coord_t skin_support_wipe_dist = 0;
+    constexpr OverrideAreas override_areas;
     const auto skin_support_interlace_lines = settings.get<bool>("skin_support_interlace_lines");
     if (skin_support_interlace_lines)
     {
         const coord_t max_adjacent_distance = skin_support_line_distance * 1.1;
         constexpr coord_t exclude_distance = 0;
         constexpr bool skin_support_interlaced = true;
+
+        // You really want to avoid combing because it adds a backwards travel move that prevents the bridging lines to stick to their anchors
+        const coord_t max_distance_ignore_combing = max_adjacent_distance * 4;
+
         layer_plan.addLinesMonotonic(
             infill_below_skin,
             lines,
@@ -502,7 +509,9 @@ void InfillOrderOptimizer::addSkinSupportLinesToLayer(
             skin_support_wipe_dist,
             flow_ratio,
             skin_support_fan_speed,
-            skin_support_interlaced);
+            skin_support_interlaced,
+            override_areas,
+            max_distance_ignore_combing);
     }
     else
     {
@@ -515,6 +524,7 @@ void InfillOrderOptimizer::addSkinSupportLinesToLayer(
             flow_ratio,
             near_start_location,
             skin_support_fan_speed,
+            override_areas,
             reverse_print_direction);
     }
 }

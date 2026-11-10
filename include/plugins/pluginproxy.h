@@ -10,7 +10,6 @@
 #include <agrpc/asio_grpc.hpp>
 #include <agrpc/client_rpc.hpp>
 #include <agrpc/grpc_context.hpp>
-#include <agrpc/use_awaitable.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -165,6 +164,16 @@ public:
         return *this;
     }
     ~PluginProxy() = default;
+
+    const slot_metadata& slotInfo() const
+    {
+        return slot_info_;
+    }
+
+    const std::optional<plugin_metadata>& pluginInfo() const
+    {
+        return plugin_info_;
+    }
 
     value_type generate(auto&&... args)
     {
