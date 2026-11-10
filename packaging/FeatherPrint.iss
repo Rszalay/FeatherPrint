@@ -4,7 +4,7 @@
 ; =============================================================================
 
 #define MyAppName       "FeatherPrint"
-#define MyAppVersion    "1.1.1"
+#define MyAppVersion    "1.2.0"
 #define MyAppPublisher  "Rick Szalay"
 #define MyAppURL        "https://github.com/Rszalay/FeatherPrint"
 

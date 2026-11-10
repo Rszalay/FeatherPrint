@@ -1,10 +1,10 @@
 # FeatherPrint User Manual
 
-*Manual version 0.3 draft, for FeatherPrint v1.1.1 (spec REV 4.14), 7 October 2026.*
+*Manual version 0.4 draft, for FeatherPrint v1.2.0 (spec REV 4.14), 9 November 2026.*
 
 ## About this manual
 
-This manual shows you how to slice lightweight, hollow prints with FeatherPrint v1.1.1, a modified CuraEngine for UltiMaker Cura 5.13.x on Windows. It is written for makers and designers who model in CAD, export an STL and slice in Cura, so it explains what to do and what to expect rather than how the algorithms work.
+This manual shows you how to slice lightweight, hollow prints with FeatherPrint v1.2.0, a modified CuraEngine for UltiMaker Cura 5.14.x on Windows. It is written for makers and designers who model in CAD, export an STL and slice in Cura, so it explains what to do and what to expect rather than how the algorithms work.
 
 FeatherPrint adds two infill generators, chosen with Cura's Infill Pattern setting. **FeatherPrint** builds a single-line-width skin braced by a helical net of tube-like stringers, for ultralight aerodynamic parts such as drones, model aircraft, wind turbines and hydrodynamic surfaces. **Corrugated** fills the gap between the inner and outer walls of an ordinary shelled part with corrugated support, in place of conventional infill.
 
@@ -27,11 +27,11 @@ If you are unsure, check whether the part has wall thickness you designed in. If
 
 ## Installation and setup
 
-FeatherPrint installs over an existing Cura with one Windows installer, and you can remove it later to restore Cura's original engine. It needs Windows 10 or later and UltiMaker Cura 5.13.x already installed.
+FeatherPrint installs over an existing Cura with one Windows installer, and you can remove it later to restore Cura's original engine. It needs Windows 10 or later and UltiMaker Cura 5.14.x already installed.
 
-1. Download `FeatherPrint-1.1.1-Windows-x64-Setup.exe` from the [v1.1.1 release page](https://github.com/Rszalay/FeatherPrint/releases/tag/v1.1.1).
+1. Download `FeatherPrint-1.2.0-Windows-x64-Setup.exe` from the [v1.2.0 release page](https://github.com/Rszalay/FeatherPrint/releases/tag/v1.2.0).
 2. Right-click the file and choose Run as administrator.
-3. Follow the installer. It finds your Cura 5.13.x installation, backs up the original engine files, deploys FeatherPrint, and installs the bundled "FeatherPrint" and "FeatherPrint Corrugated" print profiles.
+3. Follow the installer. It finds your Cura 5.14.x installation, backs up the original engine files, deploys FeatherPrint, and installs the bundled "FeatherPrint" and "FeatherPrint Corrugated" print profiles.
 4. Start Cura and open the Infill Pattern setting. You should now see FeatherPrint and Corrugated in the list.
 
 ![Cura print settings with the three-bar menu open and All selected, which reveals the FeatherPrint and Corrugated categories](images/featherprint-manual-01.png)
@@ -40,7 +40,9 @@ To uninstall, run Uninstall FeatherPrint from Windows Add or Remove Programs. Yo
 
 ### Upgrading from an earlier version
 
-Run the new installer over the old one. It refreshes the bundled profiles, so reselect them in Cura afterwards. Two changes may affect parts you have already designed or tuned:
+Run the new installer over the old one. It refreshes the bundled profiles, so reselect them in Cura afterwards. These changes may affect you:
+
+- **v1.2.0: FeatherPrint now needs Cura 5.14.** Install UltiMaker Cura 5.14 first, then run the v1.2.0 installer; slicing results are the same as v1.1.1. If an earlier FeatherPrint is still installed on Cura 5.13 and you want that Cura restored to stock, uninstall FeatherPrint before installing v1.2.0: the new installer takes over the Add or Remove Programs entry, so afterwards it only restores Cura 5.14.
 
 - **v1.1.1: FeatherPrint parts print one line width smaller across.** Earlier versions centred the outer wall on the model surface, so half of it hung outside and every part came out one line width oversize. The outer face of the wall now sits on the model surface, the same as Cura's other patterns, so FeatherPrint and Corrugated parts of the same model now match. If you scaled models up or down to compensate, remove that scaling.
 - **v1.1.0: Corrugated uses a new default layout (Medial Axis and Harmonic).** Stringers jump around much less from layer to layer, Glob regions (which print no corrugation) no longer occur, and slicing is about four times faster. To get the old behaviour back, set Corrugated Decomposition to Triangulation and Corrugated Wall Pairing to Arc Length.
@@ -306,11 +308,11 @@ What a good Corrugated slice shows: normal walls, stringers spanning the gap bet
 
 ## Known limitations in this release
 
-These are the gaps to plan around in v1.1.1. Most are deliberate scope boundaries; a few are known faults scheduled for a fix. None is a fault in your model.
+These are the gaps to plan around in v1.2.0. Most are deliberate scope boundaries; a few are known faults scheduled for a fix. None is a fault in your model.
 
 ### All modes
 
-- FeatherPrint runs only on Windows with UltiMaker Cura 5.13.x.
+- FeatherPrint runs only on Windows with UltiMaker Cura 5.14.x.
 - A mesh uses either FeatherPrint or Corrugated, never both.
 
 ### FeatherPrint
@@ -374,3 +376,4 @@ These are the gaps to plan around in v1.1.1. Most are deliberate scope boundarie
 | 18 Sep 2026 | 0.1 draft | FeatherPrint v1.0.0 | First draft. Both workflow charts and all screenshots included |
 | 19 Sep 2026 | 0.2 draft | FeatherPrint v1.0.0; spec REV 4.12 | Brought up to date with REV 4.12: star-convex rule removed, Collar, Punchout, Shore, Splay, Placket and new settings added |
 | 7 Oct 2026 | 0.3 draft | FeatherPrint v1.1.1; spec REV 4.14 | Upgrade notes (parts one line width smaller; new Corrugated defaults); bundled FeatherPrint profile; corrected "set for you" list; setting-proportion guidance; Corrugated Decomposition and Wall Pairing settings; Glob behaviour under Medial Axis; new known limitations |
+| 9 Nov 2026 | 0.4 draft | FeatherPrint v1.2.0; spec REV 4.14 | Retargeted to Cura 5.14; upgrade note on moving from Cura 5.13 |
