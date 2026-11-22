@@ -80,22 +80,35 @@ namespace
 // mesh's own outer silhouette at that Z -- that needs the corresponding Layer's own sliced
 // outline, which doesn't exist yet this early; the caller does that test once
 // SliceMeshStorage/parts are built, later in the same function.
-std::vector<std::pair<Polygon, coord_t>> fpDetectCoplanarInteriorLoops(const Mesh& mesh)
+//
+// Each loop also records which side of it the solid lies on, from the normals of the faces
+// that own its boundary edges (area-weighted): a hole in an upward-facing face (a top cap)
+// has the solid below it, a hole in a downward-facing face (a bottom cap) has it above. The
+// caller uses this to carry the hole into that cap's own skin layers only.
+struct FpCoplanarLoop
 {
-    std::vector<std::pair<Polygon, coord_t>> result;
+    Polygon poly;
+    coord_t z;
+    int solid_side; // +1: solid above (bottom face), -1: solid below (top face), 0: owners not horizontal
+};
+
+std::vector<FpCoplanarLoop> fpDetectCoplanarInteriorLoops(const Mesh& mesh)
+{
+    std::vector<FpCoplanarLoop> result;
 
     // Collect every boundary edge (an edge with no matching neighbor face), directed
-    // consistent with the owning face's own CCW winding.
-    std::unordered_map<uint32_t, uint32_t> next_vertex;
-    for (const MeshFace& face : mesh.faces_)
+    // consistent with the owning face's own CCW winding, with the owning face's index.
+    std::unordered_map<uint32_t, std::pair<uint32_t, size_t>> next_vertex;
+    for (size_t face_idx = 0; face_idx < mesh.faces_.size(); face_idx++)
     {
+        const MeshFace& face = mesh.faces_[face_idx];
         for (int k = 0; k < 3; k++)
         {
             if (face.connected_face_index_[k] == -1)
             {
                 const uint32_t v0 = static_cast<uint32_t>(face.vertex_index_[k]);
                 const uint32_t v1 = static_cast<uint32_t>(face.vertex_index_[(k + 1) % 3]);
-                next_vertex[v0] = v1;
+                next_vertex[v0] = { v1, face_idx };
             }
         }
     }
@@ -111,6 +124,7 @@ std::vector<std::pair<Polygon, coord_t>> fpDetectCoplanarInteriorLoops(const Mes
         if (visited.count(start))
             continue;
         std::vector<uint32_t> loop_verts;
+        std::vector<size_t> owner_faces;
         uint32_t cur = start;
         bool closed = false;
         for (size_t iter = 0; iter < kMaxLoopVerts; iter++)
@@ -125,7 +139,8 @@ std::vector<std::pair<Polygon, coord_t>> fpDetectCoplanarInteriorLoops(const Mes
             auto it = next_vertex.find(cur);
             if (it == next_vertex.end())
                 break; // dead end -- open chain, not a closed loop
-            cur = it->second;
+            owner_faces.push_back(it->second.second);
+            cur = it->second.first;
         }
         if (! closed || loop_verts.size() < 3)
             continue;
@@ -150,10 +165,31 @@ std::vector<std::pair<Polygon, coord_t>> fpDetectCoplanarInteriorLoops(const Mes
         if (! coplanar)
             continue;
 
+        // Which side the solid is on: sum the owning faces' normals (cross product of the CCW
+        // winding, outward by mesh convention; magnitude = twice the face area). Horizontal
+        // owners dominate the Z component; vertical owners (an open-topped wall) leave it ~0.
+        double normal_z = 0.0;
+        double normal_len = 0.0;
+        for (size_t face_idx : owner_faces)
+        {
+            const MeshFace& face = mesh.faces_[face_idx];
+            const Point3LL& a = mesh.vertices_[face.vertex_index_[0]].p_;
+            const Point3LL& b = mesh.vertices_[face.vertex_index_[1]].p_;
+            const Point3LL& c = mesh.vertices_[face.vertex_index_[2]].p_;
+            const double ux = static_cast<double>(b.x_ - a.x_), uy = static_cast<double>(b.y_ - a.y_), uz = static_cast<double>(b.z_ - a.z_);
+            const double vx = static_cast<double>(c.x_ - a.x_), vy = static_cast<double>(c.y_ - a.y_), vz = static_cast<double>(c.z_ - a.z_);
+            const double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+            normal_z += nz;
+            normal_len += std::sqrt(nx * nx + ny * ny + nz * nz);
+        }
+        int solid_side = 0;
+        if (normal_len > 0.0 && std::abs(normal_z) > 0.5 * normal_len)
+            solid_side = (normal_z > 0.0) ? -1 : +1;
+
         Polygon poly2d;
         for (uint32_t vi : loop_verts)
             poly2d.push_back(Point2LL(mesh.vertices_[vi].p_.x_, mesh.vertices_[vi].p_.y_));
-        result.emplace_back(std::move(poly2d), static_cast<coord_t>(std::llround(z_avg)));
+        result.push_back({ std::move(poly2d), static_cast<coord_t>(std::llround(z_avg)), solid_side });
     }
     return result;
 }
@@ -307,7 +343,7 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
     // data fpDetectCoplanarInteriorLoops needs) and consumed further down once
     // SliceMeshStorage/parts/printZ exist to map each loop to its nearest Layer and confirm
     // it's a genuine interior hole (see the second per-mesh loop, below).
-    std::vector<std::vector<std::pair<Polygon, coord_t>>> pending_interior_loops(meshgroup->meshes.size());
+    std::vector<std::vector<FpCoplanarLoop>> pending_interior_loops(meshgroup->meshes.size());
     for (unsigned int mesh_idx = 0; mesh_idx < meshgroup->meshes.size(); mesh_idx++)
     {
         // Check if adaptive layers is populated to prevent accessing a method on NULL
@@ -463,8 +499,8 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
             meshStorage.fp_interior_holes.assign(meshStorage.layers.size(), {});
             for (const auto& loop_entry : pending_interior_loops[meshIdx])
             {
-                const Polygon& loop_poly = loop_entry.first;
-                const coord_t loop_z = loop_entry.second;
+                const Polygon& loop_poly = loop_entry.poly;
+                const coord_t loop_z = loop_entry.z;
                 if (loop_poly.empty())
                     continue;
 
@@ -544,31 +580,46 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
 
                 meshStorage.fp_interior_holes[best_li].push_back(loop_poly);
 
-                // Carry the SAME hole through every Layer adjacent to best_li where it still
-                // reads as a genuine interior hole (same test, re-run per Layer) -- a flat cap
-                // (e.g. initial_bottom_layers worth of solid base) is uniformly this thick with
-                // the same XY footprint throughout, so the hole persists across all of it, not
-                // just the one Layer nearest the loop's own Z. Walking outward in both
-                // directions (rather than hardcoding a specific setting's layer count) means
-                // this generalizes to whatever span the flat region actually turns out to have,
-                // stopping the moment the test fails (the cap ends, or the model's footprint
-                // changes enough that this hole no longer applies).
+                // Carry the SAME hole into the skin layers of the cap the opening is in, and no
+                // further: into the solid side only (below a top face, above a bottom face), for
+                // that cap's own skin layer count (top_layers, plus the Skin Support layer;
+                // bottom_layers, or initial_bottom_layers for a face on the build plate), still stopping early
+                // where the hole stops reading as interior. The opening is in a zero-thickness
+                // sheet, so no other Layer has anything to cut.
+                // (Until 2026-11-21 this walked both ways with no limit while the test passed.
+                // On a hollow part the test passes on every Layer, so a hole in A-40 Tail's top
+                // face reached layer 0 and was cut, offset in XY, into the bottom skin.)
+                // Skin Support prints one layer of fill under top skin; it must leave the opening
+                // clear too, or it lays support lines across a hole that nothing above needs.
+                const size_t top_layers = meshStorage.settings.get<size_t>("top_layers") + (meshStorage.settings.get<bool>("skin_support") ? 1 : 0);
+                const size_t bottom_layers = meshStorage.settings.get<size_t>("bottom_layers");
+                const size_t initial_bottom_layers = meshStorage.settings.get<size_t>("initial_bottom_layers");
+                const size_t bottom_span = std::max(bottom_layers, best_li < initial_bottom_layers ? initial_bottom_layers - best_li : size_t(0));
+                const size_t either_span = std::max(top_layers, bottom_span); // side unknown: either cap
+                // Layers beyond the anchor, each way.
+                const size_t span_up = std::max<size_t>(1, loop_entry.solid_side > 0 ? bottom_span : loop_entry.solid_side < 0 ? 1 : either_span) - 1;
+                const size_t span_down = std::max<size_t>(1, loop_entry.solid_side < 0 ? top_layers : loop_entry.solid_side > 0 ? 1 : either_span) - 1;
                 size_t extend_count = 0;
-                for (size_t li = best_li + 1; li < meshStorage.layers.size(); li++)
+                for (size_t li = best_li + 1; li < meshStorage.layers.size() && li <= best_li + span_up; li++)
                 {
                     if (! testInterior(li))
                         break;
                     meshStorage.fp_interior_holes[li].push_back(loop_poly);
                     extend_count++;
                 }
-                for (size_t li = best_li; li-- > 0;)
+                for (size_t li = best_li; li-- > 0 && li + span_down >= best_li;)
                 {
                     if (! testInterior(li))
                         break;
                     meshStorage.fp_interior_holes[li].push_back(loop_poly);
                     extend_count++;
                 }
-                spdlog::info("FP-DIAG interior hole found: z={} anchor_layer={} spanning {} Layer(s) total", loop_z, best_li, extend_count + 1);
+                spdlog::info(
+                    "FP-DIAG interior hole found: z={} anchor_layer={} solid_side={} spanning {} Layer(s) total",
+                    loop_z,
+                    best_li,
+                    loop_entry.solid_side,
+                    extend_count + 1);
             }
         }
 
