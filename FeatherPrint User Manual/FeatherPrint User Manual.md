@@ -1,10 +1,10 @@
 # FeatherPrint User Manual
 
-*Manual version 0.4 draft, for FeatherPrint v1.2.0 (spec REV 4.14), 9 November 2026.*
+*Manual version 0.5 draft, for FeatherPrint v1.3.0 (spec REV 4.15), 22 November 2026.*
 
 ## About this manual
 
-This manual shows you how to slice lightweight, hollow prints with FeatherPrint v1.2.0, a modified CuraEngine for UltiMaker Cura 5.14.x on Windows. It is written for makers and designers who model in CAD, export an STL and slice in Cura, so it explains what to do and what to expect rather than how the algorithms work.
+This manual shows you how to slice lightweight, hollow prints with FeatherPrint v1.3.0, a modified CuraEngine for UltiMaker Cura 5.14.x on Windows. It is written for makers and designers who model in CAD, export an STL and slice in Cura, so it explains what to do and what to expect rather than how the algorithms work.
 
 FeatherPrint adds two infill generators, chosen with Cura's Infill Pattern setting. **FeatherPrint** builds a single-line-width skin braced by a helical net of tube-like stringers, for ultralight aerodynamic parts such as drones, model aircraft, wind turbines and hydrodynamic surfaces. **Corrugated** fills the gap between the inner and outer walls of an ordinary shelled part with corrugated support, in place of conventional infill.
 
@@ -29,7 +29,7 @@ If you are unsure, check whether the part has wall thickness you designed in. If
 
 FeatherPrint installs over an existing Cura with one Windows installer, and you can remove it later to restore Cura's original engine. It needs Windows 10 or later and UltiMaker Cura 5.14.x already installed.
 
-1. Download `FeatherPrint-1.2.0-Windows-x64-Setup.exe` from the [v1.2.0 release page](https://github.com/Rszalay/FeatherPrint/releases/tag/v1.2.0).
+1. Download `FeatherPrint-1.3.0-Windows-x64-Setup.exe` from the [v1.3.0 release page](https://github.com/Rszalay/FeatherPrint/releases/tag/v1.3.0).
 2. Right-click the file and choose Run as administrator.
 3. Follow the installer. It finds your Cura 5.14.x installation, backs up the original engine files, deploys FeatherPrint, and installs the bundled "FeatherPrint" and "FeatherPrint Corrugated" print profiles.
 4. Start Cura and open the Infill Pattern setting. You should now see FeatherPrint and Corrugated in the list.
@@ -41,6 +41,8 @@ To uninstall, run Uninstall FeatherPrint from Windows Add or Remove Programs. Yo
 ### Upgrading from an earlier version
 
 Run the new installer over the old one. It refreshes the bundled profiles, so reselect them in Cura afterwards. These changes may affect you:
+
+- **v1.3.0: Strip Wall A and B now work with Raw Outline Mode.** The corrugation's linked skin now runs on the line the removed wall would have printed, in either mode, so parts with a stripped wall may come out a fraction of a line width fuller on that side than in v1.2.0. In FeatherPrint mode, a large hole in a flat top or bottom is now left open, and a hole in the top no longer shows up in the bottom skin. Two new experimental Corrugated settings, Corrugated Scarf Length and Corrugated Scarf Start Flow, are off by default.
 
 - **v1.2.0: FeatherPrint now needs Cura 5.14.** Install UltiMaker Cura 5.14 first, then run the v1.2.0 installer; slicing results are the same as v1.1.1. If an earlier FeatherPrint is still installed on Cura 5.13 and you want that Cura restored to stock, uninstall FeatherPrint before installing v1.2.0: the new installer takes over the Add or Remove Programs entry, so afterwards it only restores Cura 5.14.
 
@@ -233,7 +235,7 @@ The shape of a corridor matters more than the exact gap width. Wall gaps of 5 to
 
 ## Corrugated: settings reference
 
-Corrugated adds fourteen settings in their own Corrugated category, all active only when Infill Pattern is Corrugated. Start from the bundled profile; the two settings that most change the result are stringer pitch and crossover pitch.
+Corrugated adds sixteen settings in their own Corrugated category, all active only when Infill Pattern is Corrugated. Start from the bundled profile; the two settings that most change the result are stringer pitch and crossover pitch.
 
 ### Density and twist
 
@@ -251,7 +253,7 @@ Corrugated adds fourteen settings in their own Corrugated category, all active o
 | `corrugated_strip_wall_a` | Off | Removes Cura's own wall on the outer wall (Wall A), letting the corrugation take over its job. Turns on linked skin for that side. |
 | `corrugated_strip_wall_b` | Off | The same for the inner wall (Wall B). |
 
-Stripping a wall does not work together with Raw Outline Mode; turn that off to use either strip setting.
+Since v1.3.0, stripping a wall works in both normal and Raw Outline Mode.
 
 ### Geometry handling
 
@@ -270,6 +272,8 @@ Stripping a wall does not work together with Raw Outline Mode; turn that off to 
 | Setting | Default | What it controls |
 | --- | --- | --- |
 | `corrugated_raw_outline_mode` | On | Corrugates a fixed-width inset of the raw slice outline instead of Cura's generated walls, for parts where wall generation changes shape between layers. May overlap the top and bottom skin. |
+| `corrugated_scarf_length` | 0 mm (off) | Prints each closed run of beads as one continuous extrusion with a flow-only scarf at its seam, so the outer wall is never the first thing printed after a retraction. With one wall stripped, a Chain's kept wall and its linked skin print as one loop with the seam on the skin side. Helps materials that take a long way to recover pressure after a retraction, such as foaming LW-PLA. Keep it no longer than Max Comb Distance With No Retract, or it can add a retraction per layer. |
+| `corrugated_scarf_start_flow_ratio` | 0% | Flow at the very start of the scarf ramp. The closing overprint makes up the rest, so the seam carries one bead in total. |
 | `meshfix_remove_diagonal_artifacts` | Off | A Cura mesh-fix option, not in the Corrugated category. Removes false vertices left by STL tessellation, which can otherwise make a thin trailing edge unstable. Helps every infill pattern. This mainly applies to vertical quads from extrusions in the z axis. |
 
 These defaults are first-pass values that have not yet been tested across a wide range of parts, which is why the bundled profile is the safer starting point.
@@ -299,7 +303,6 @@ What a good Corrugated slice shows: normal walls, stringers spanning the gap bet
 | Stringers changing direction between layers in a disc- or square-shaped region | The region has no clear corridor, so its single Chain follows whichever axis is longest on each layer | Expected in this release. Lengthen the region in one direction if you can |
 | A full-density layer partway up | A transition layer where the number of regions changed | Expected. Turn off `corrugated_transition_layer_enabled` only if you accept the risk |
 | A stringer pattern that looks static or jittery | Crossover pitch too close to the layer height | Raise `corrugated_crossover_pitch_mm` well above half a layer height |
-| Strip Wall A or B has no effect | Raw Outline Mode is on | Turn off `corrugated_raw_outline_mode` |
 | Corrugation overlapping the top or bottom skin | Raw Outline Mode is on | Turn it off |
 | A wobbling or unstable thin trailing edge | STL tessellation artifacts | Turn on `meshfix_remove_diagonal_artifacts` |
 | Short side-arms missing | Prune threshold too large | Lower `corrugated_prune_threshold` |
@@ -308,7 +311,7 @@ What a good Corrugated slice shows: normal walls, stringers spanning the gap bet
 
 ## Known limitations in this release
 
-These are the gaps to plan around in v1.2.0. Most are deliberate scope boundaries; a few are known faults scheduled for a fix. None is a fault in your model.
+These are the gaps to plan around in v1.3.0. Most are deliberate scope boundaries; a few are known faults scheduled for a fix. None is a fault in your model.
 
 ### All modes
 
@@ -334,7 +337,7 @@ These are the gaps to plan around in v1.2.0. Most are deliberate scope boundarie
 - **Stringers are straight.** The planned shaped cross-section, with rising and falling walls between troughs and peaks, is not built yet.
 - **Transition layers are partial.** They trigger when a region appears or the region layout changes, not yet for a large change in area or when a region reaches the top skin.
 - **Wall stripping and transition layers do not combine.** A region with a stripped wall never gets a transition layer.
-- **Experimental settings.** Raw Outline Mode, Transition Layer and De Minimis Hole Area have each been checked on a limited set of parts.
+- **Experimental settings.** Raw Outline Mode, Transition Layer, De Minimis Hole Area and Corrugated Scarf have each been checked on a limited set of parts.
 - **Defaults are first-pass** and not yet validated across a wide range of geometry.
 
 ## Glossary
@@ -377,3 +380,4 @@ These are the gaps to plan around in v1.2.0. Most are deliberate scope boundarie
 | 19 Sep 2026 | 0.2 draft | FeatherPrint v1.0.0; spec REV 4.12 | Brought up to date with REV 4.12: star-convex rule removed, Collar, Punchout, Shore, Splay, Placket and new settings added |
 | 7 Oct 2026 | 0.3 draft | FeatherPrint v1.1.1; spec REV 4.14 | Upgrade notes (parts one line width smaller; new Corrugated defaults); bundled FeatherPrint profile; corrected "set for you" list; setting-proportion guidance; Corrugated Decomposition and Wall Pairing settings; Glob behaviour under Medial Axis; new known limitations |
 | 9 Nov 2026 | 0.4 draft | FeatherPrint v1.2.0; spec REV 4.14 | Retargeted to Cura 5.14; upgrade note on moving from Cura 5.13 |
+| 22 Nov 2026 | 0.5 draft | FeatherPrint v1.3.0; spec REV 4.15, Corrugated REV 3.10 | Upgrade note; Wall Strip works with Raw Outline Mode; Corrugated Scarf settings |
