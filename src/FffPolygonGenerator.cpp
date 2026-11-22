@@ -489,8 +489,16 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
                 // as a small interior hole -- confirmed as a real bug via a real test print,
                 // where such a loop wiped out an entire Layer's inner_area (remaining area 0)
                 // instead of cutting a small hole. A genuine interior hole should remove some
-                // area (the loop must actually overlap the face) but leave most of the surface
-                // intact.
+                // area (the loop must actually overlap the face) and lie strictly inside it.
+                //
+                // "Strictly inside" is tested by containment, not by how much area is left: the
+                // loop must fall within the outer contour inset by half a wall line. A loop that
+                // traces the Layer's own outline crosses that band by definition; a genuine hole,
+                // however large, does not. (Until 2026-11-20 this required more than half the
+                // outline's area to remain, which rejected any hole larger than half the face:
+                // A-40 Tail, a 996 mm2 opening in a 1869 mm2 bottom face, was skinned over while
+                // its 2.4 mm2 screw holes were cut.)
+                const coord_t inside_clearance = meshStorage.settings.get<coord_t>("wall_line_width_0") / 2;
                 auto testInterior = [&](size_t li) -> bool
                 {
                     for (const SliceLayerPart& part : meshStorage.layers[li].parts)
@@ -517,7 +525,15 @@ bool FffPolygonGenerator::sliceModel(MeshGroup* meshgroup, TimeKeeper& timeKeepe
                         for (const Polygon& p : remaining)
                             remaining_area_signed += p.area();
                         const double remaining_area = std::abs(remaining_area_signed);
-                        if (remaining_area > 0.5 * outer_area && remaining_area < outer_area - 1.0)
+                        if (remaining_area <= 0.0 || remaining_area >= outer_area - 1.0)
+                            continue; // removes nothing, or everything
+                        // Containment: the part of the loop outside the inset outer contour must be
+                        // negligible (rounding only).
+                        const double loop_area = std::abs(loop_poly.area());
+                        double outside_area_signed = 0.0;
+                        for (const Polygon& p : hole_shape.difference(outer_shape.offset(-inside_clearance)))
+                            outside_area_signed += p.area();
+                        if (std::abs(outside_area_signed) <= 0.01 * loop_area)
                             return true;
                     }
                     return false;
