@@ -657,9 +657,13 @@ Shape insetOutline(const SliceLayerPart& part, const Settings& settings)
 namespace
 {
 
-Shape expandCorrugationInputForStrippedWalls(const SliceLayerPart& part, const Settings& settings, const bool strip_wall_a, const bool strip_wall_b)
+// `infill` is the corrugation input before Wall Strip: part.infill_area normally, or insetOutline()'s fixed inset in
+// raw outline mode. Either way the stripped side is replaced the same way, so a stripped wall's line is taken over by
+// the skin in both modes. `stripped_inset` is how far inside the outline the stripped side goes: half infill_line_width
+// for the corrugation (its skin's centreline runs on the boundary), zero for a fill that keeps its own lines inside
+// the area it's given (stripWallFillArea).
+Shape expandCorrugationInputForStrippedWalls(const Shape& infill, const SliceLayerPart& part, const coord_t stripped_inset, const bool strip_wall_a, const bool strip_wall_b)
 {
-    const Shape& infill = part.infill_area;
     const Shape& outline = part.outline;
     if (infill.size() != 2 || outline.size() != 2)
     {
@@ -721,13 +725,27 @@ Shape expandCorrugationInputForStrippedWalls(const SliceLayerPart& part, const S
     // contours need *opposite* signs when isolated like this: negative for the outer contour (move
     // inward, into the solid, away from open air), positive for the hole contour (move outward,
     // away from its own center, which is also "into the solid" from the hole's own perspective).
-    const coord_t half_line_width = settings.get<coord_t>("infill_line_width") / 2;
+    const coord_t half_line_width = stripped_inset;
+    // The offset of a lone contour comes back wound as a solid whatever it went in as, so a hole contour has to be
+    // turned back into a hole. Without this the stepped-out hole was a second solid inside the outer one: the
+    // infill_overlap_mm growth (growCorrugationInput) unioned it away, VBCT saw a solid part instead of a Ring, the
+    // layer lost its Ring anchor, the wall was never stripped and the stringers ran straight across the hollow
+    // (Body, 2026-11-20: every Ring layer with Wall B stripped).
     auto insetContour = [](const Polygon& contour, const coord_t signed_offset) -> std::optional<Polygon>
     {
         Shape single;
         single.push_back(contour);
         const Shape result = single.offset(signed_offset);
-        return (result.size() == 1) ? std::make_optional(result[0]) : std::nullopt;
+        if (result.size() != 1)
+        {
+            return std::nullopt;
+        }
+        Polygon inset = result[0];
+        if ((inset.area() < 0.0) != (contour.area() < 0.0))
+        {
+            inset.reverse();
+        }
+        return inset;
     };
 
     Shape result;
@@ -1085,13 +1103,125 @@ bool expandChainContourRange(Shape& corrugation_input, const Shape& outline, con
         {
             return false;
         }
-        for (Point2LL& p : covered_arc)
+        // Corners (2026-11-21). The covered range's ends land a little either side of where the stripped side meets
+        // an un-stripped face (a Chain's flat end, say), differently on every layer. Moving each vertex to its nearest
+        // outline point pushed a corner vertex diagonally, sideways through that face: a 0.2 mm spur on some layers and
+        // a clean corner on others, which VBCT's dead-end handling read as different ends - the linked skin's phase
+        // jumped on irregular layers (FPTF-45 Body slot, ~20% of the wall flipping on a third of layers 200-300). So:
+        // (1) a range end that turns a sharp corner onto another face stops at the corner and leaves that face alone;
+        // (2) each vertex moves only along the stripped side's own normal, never along it. The corner then becomes a
+        // step along the un-stripped face's own line.
+        const auto unit = [](const Point2LL& a, const Point2LL& b) -> std::pair<double, double>
         {
-            const double outline_pos = nearestPolygonPositionAndDistSq(outline_geom, p).first;
-            p = polygonInwardPointAt(outline_geom, outline_pos, outline, half_line_width);
+            const double dx = static_cast<double>(b.X - a.X), dy = static_cast<double>(b.Y - a.Y);
+            const double len = std::hypot(dx, dy);
+            return len > 0.0 ? std::make_pair(dx / len, dy / len) : std::make_pair(0.0, 0.0);
+        };
+        const auto sharpTurn = [&](const Point2LL& a, const Point2LL& b, const Point2LL& c)
+        {
+            const auto [ux, uy] = unit(a, b);
+            const auto [vx, vy] = unit(b, c);
+            constexpr double kCos45 = 0.70710678;
+            return (ux != 0.0 || uy != 0.0) && (vx != 0.0 || vy != 0.0) && ux * vx + uy * vy < kCos45;
+        };
+        // Coverage leaks round a corner by up to about a wall width; a longer run past a corner is a genuinely stripped
+        // stretch of the next face and is kept.
+        constexpr double kMaxCornerLeak = 1000.0; // 1 mm
+        size_t first = 0;
+        size_t last = covered_arc.size() - 1;
+        {
+            double leak = 0.0;
+            for (size_t k = covered_arc.size() - 2; k >= 1 && leak <= kMaxCornerLeak; --k)
+            {
+                leak += std::hypot(static_cast<double>(covered_arc[k + 1].X - covered_arc[k].X), static_cast<double>(covered_arc[k + 1].Y - covered_arc[k].Y));
+                if (leak <= kMaxCornerLeak && sharpTurn(covered_arc[k - 1], covered_arc[k], covered_arc[k + 1]))
+                {
+                    last = k; // covered_arc[last] is the corner; what follows it is the other face
+                    break;
+                }
+            }
+            leak = 0.0;
+            for (size_t k = 1; k + 1 < last && leak <= kMaxCornerLeak; ++k)
+            {
+                leak += std::hypot(static_cast<double>(covered_arc[k].X - covered_arc[k - 1].X), static_cast<double>(covered_arc[k].Y - covered_arc[k - 1].Y));
+                if (leak <= kMaxCornerLeak && sharpTurn(covered_arc[k - 1], covered_arc[k], covered_arc[k + 1]))
+                {
+                    first = k;
+                    break;
+                }
+            }
         }
-        covered_arc.pop_back();
-        rebuilt.insert(rebuilt.end(), covered_arc.begin(), covered_arc.end());
+        std::vector<Point2LL> moved(covered_arc.begin() + first, covered_arc.begin() + last + 1);
+        for (size_t i = 0; i < moved.size(); ++i)
+        {
+            const Point2LL& q = covered_arc[first + i];
+            // Normal of the adjacent covered edge(s), averaged at interior vertices.
+            double tx = 0.0, ty = 0.0;
+            if (i > 0)
+            {
+                const auto [ux, uy] = unit(covered_arc[first + i - 1], q);
+                tx += ux;
+                ty += uy;
+            }
+            if (i + 1 < moved.size())
+            {
+                const auto [ux, uy] = unit(q, covered_arc[first + i + 1]);
+                tx += ux;
+                ty += uy;
+            }
+            const double tlen = std::hypot(tx, ty);
+            const double outline_pos = nearestPolygonPositionAndDistSq(outline_geom, q).first;
+            const Point2LL target = polygonInwardPointAt(outline_geom, outline_pos, outline, half_line_width);
+            if (tlen <= 0.0)
+            {
+                moved[i] = target;
+                continue;
+            }
+            // Outward normal, away from the corrugated region: the right-hand side of the contour's own direction
+            // (outer contours wind counter-clockwise, holes clockwise, so the region is always on the left).
+            const double nx = ty / tlen, ny = -tx / tlen;
+            // Cast along it to the outline, then come back half a line width. Not the nearest outline point: at a
+            // square corner that is a tie between the two faces, and the wrong one leaves the corner where it was.
+            double hit = std::numeric_limits<double>::max();
+            for (const Polygon& outline_poly : outline)
+            {
+                for (size_t e = 0; e < outline_poly.size(); ++e)
+                {
+                    const Point2LL& a = outline_poly[e];
+                    const Point2LL& b = outline_poly[(e + 1) % outline_poly.size()];
+                    const double ex = static_cast<double>(b.X - a.X), ey = static_cast<double>(b.Y - a.Y);
+                    const double denom = nx * ey - ny * ex;
+                    if (std::abs(denom) < 1e-12)
+                    {
+                        continue;
+                    }
+                    const double ax = static_cast<double>(a.X - q.X), ay = static_cast<double>(a.Y - q.Y);
+                    const double t = (ax * ey - ay * ex) / denom; // along the ray
+                    const double s = (ax * ny - ay * nx) / denom; // along the edge
+                    if (t > 0.0 && s >= 0.0 && s <= 1.0 && t < hit)
+                    {
+                        hit = t;
+                    }
+                }
+            }
+            // A hit much further away than the nearest outline point means the ray missed the face this side faces
+            // (a thin or turning section); fall back to the nearest point's component along the normal.
+            const double nearest_dist = std::hypot(static_cast<double>(target.X - q.X), static_cast<double>(target.Y - q.Y)) + static_cast<double>(half_line_width);
+            const double along_normal = (hit < 2.0 * nearest_dist + static_cast<double>(half_line_width))
+                                          ? std::max(0.0, hit - static_cast<double>(half_line_width))
+                                          : std::max(0.0, static_cast<double>(target.X - q.X) * nx + static_cast<double>(target.Y - q.Y) * ny);
+            moved[i] = Point2LL(q.X + static_cast<coord_t>(std::llround(along_normal * nx)), q.Y + static_cast<coord_t>(std::llround(along_normal * ny)));
+        }
+        // Un-moved lead-in on the previous face, up to and including its corner; the moved range; the corner again,
+        // un-moved, and the rest of the next face. The arc's final point is the kept arc's first, so it is dropped.
+        std::vector<Point2LL> piece(covered_arc.begin(), covered_arc.begin() + first + (first > 0 ? 1 : 0));
+        piece.insert(piece.end(), moved.begin(), moved.end());
+        if (last + 1 < covered_arc.size())
+        {
+            piece.insert(piece.end(), covered_arc.begin() + last, covered_arc.end());
+        }
+        piece.pop_back();
+        rebuilt.insert(rebuilt.end(), piece.begin(), piece.end());
         if (std::abs(next_from - to) > 1e-6)
         {
             std::vector<Point2LL> kept_arc = collectPolygonArc(infill_geom, to, next_from);
@@ -1115,33 +1245,33 @@ bool expandChainContourRange(Shape& corrugation_input, const Shape& outline, con
 
 Shape buildCorrugationInput(const SliceLayerPart& part, const Settings& settings)
 {
-    const bool raw_outline_mode = settings.get<bool>("corrugated_raw_outline_mode");
-    if (raw_outline_mode)
-    {
-        // Wall Strip (spec REV 2.6) does not yet reach the raw-outline-mode path - insetOutline
-        // below computes a fixed-width inset of the raw pre-Arachne slice outline with no concept
-        // of a stripped wall at all, unlike the ordinary infill_area path just below, which does
-        // (expandCorrugationInputForStrippedWalls above). Confirmed directly via a real-print
-        // report + diagnostic: with corrugated_raw_outline_mode on, the wall itself was still
-        // stripped correctly (that step, addMeshPartToGCode, doesn't check this setting at all),
-        // but the corrugation's own boundary silently never moved outboard to cover the gap, since
-        // this early return skips expandCorrugationInputForStrippedWalls entirely - not a design
-        // decision to combine gracefully, just an unimplemented combination. Explicitly out of
-        // scope for this pass (see this project's own Wall Strip plan) - if strip settings are on
-        // here too, they're silently ignored for the corrugation boundary (though the wall is
-        // still physically stripped), matching this project's established "fall back to prior,
-        // unmodified behavior for a combination not yet supported" convention rather than guessing
-        // at an interaction rule.
-        return insetOutline(part, settings);
-    }
+    // Raw outline mode corrugates a fixed inset of the slice outline instead of the Arachne infill area. Wall Strip
+    // applies to both the same way (2026-11-20): before this, raw mode returned the fixed inset unchanged, so with a
+    // wall stripped the skin stayed where it runs alongside a printed wall - 0.08 mm inboard of the removed wall's
+    // line at one 0.4 mm wall, a whole line width per extra wall.
+    const Shape base = settings.get<bool>("corrugated_raw_outline_mode") ? insetOutline(part, settings) : part.infill_area;
 
+    const bool strip_wall_a = settings.get<bool>("corrugated_strip_wall_a");
+    const bool strip_wall_b = settings.get<bool>("corrugated_strip_wall_b");
+    if (! strip_wall_a && ! strip_wall_b)
+    {
+        return base;
+    }
+    return expandCorrugationInputForStrippedWalls(base, part, settings.get<coord_t>("infill_line_width") / 2, strip_wall_a, strip_wall_b);
+}
+
+Shape stripWallFillArea(const SliceLayerPart& part, const Settings& settings)
+{
     const bool strip_wall_a = settings.get<bool>("corrugated_strip_wall_a");
     const bool strip_wall_b = settings.get<bool>("corrugated_strip_wall_b");
     if (! strip_wall_a && ! strip_wall_b)
     {
         return part.infill_area;
     }
-    return expandCorrugationInputForStrippedWalls(part, settings, strip_wall_a, strip_wall_b);
+    // Same base as buildCorrugationInput, so a stripped Chain side - located by the caller from VBCT's domain walls,
+    // which are built from that input - matches this area's contour too.
+    const Shape base = settings.get<bool>("corrugated_raw_outline_mode") ? insetOutline(part, settings) : part.infill_area;
+    return expandCorrugationInputForStrippedWalls(base, part, /*stripped_inset=*/0, strip_wall_a, strip_wall_b);
 }
 
 Shape growCorrugationInput(const Shape& corrugation_input, const Settings& settings, const bool chain_strip_active)
@@ -1151,7 +1281,7 @@ Shape growCorrugationInput(const Shape& corrugation_input, const Settings& setti
 
     const bool strip_wall_a = settings.get<bool>("corrugated_strip_wall_a");
     const bool strip_wall_b = settings.get<bool>("corrugated_strip_wall_b");
-    if ((strip_wall_a || strip_wall_b) && ! settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input.size() == 2 && grown.size() == 2)
+    if ((strip_wall_a || strip_wall_b) && corrugation_input.size() == 2 && grown.size() == 2)
     {
         // Done as a post-hoc swap rather than offsetting each contour separately, since Shape::offset() needs an
         // outer contour and its own hole together to grow/shrink each by winding direction.
@@ -1542,18 +1672,12 @@ static bool leftWallIsWallA(const std::vector<vbct::Contour>& contours, const st
     return vbct::assign_wall_ab(left, right, contours, centroid).left_label == vbct::WallLabel::A;
 }
 
-std::vector<ChainWallPoints> findAllChainDomainWalls(
-    const SliceLayerPart& part,
-    const Settings& settings,
-    const std::vector<ChainDomainWallIdentity>& chain_domain_wall_identities,
-    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
-    Stage9Memo* stage9_memo)
+// Wall A and Wall B of every Chain domain on this part, from one VBCT run on the plain corrugation input (not grown,
+// no stripped side stepped out). Shared by findAllChainDomainWalls and expandStrippedChainSides.
+static std::vector<ChainWallPoints>
+    chainDomainWalls(const SliceLayerPart& part, const Settings& settings, const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities, Stage9Memo* stage9_memo)
 {
     std::vector<ChainWallPoints> result;
-    if (chain_domain_wall_identities.empty())
-    {
-        return result;
-    }
 
     // Same per-layer VBCT invocation computeAnchorsForMesh's own pre-pass already performs (see
     // that function's own Chain branch) - deliberately re-derived here rather than shared/cached,
@@ -1595,52 +1719,13 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
     }
     r9.domains = mergeStraightPassThroughChains(std::move(r9.domains), chain_junction_merge_angle_deg);
 
-    auto meanPoint = [](const std::vector<vbct::Point2>& points) -> vbct::Point2
-    {
-        double sum_x = 0.0, sum_y = 0.0;
-        for (const vbct::Point2& p : points)
-        {
-            sum_x += p.x;
-            sum_y += p.y;
-        }
-        const double n = static_cast<double>(std::max<size_t>(points.size(), 1));
-        return { sum_x / n, sum_y / n };
-    };
-
-    // Every Chain domain this layer has, matched back to the caller's own tracked identity list by
-    // nearest identity_point - the same matching computeAnchorsForMesh's own pre-pass already
-    // performed to produce that list in the first place, re-run here since this is a genuinely
-    // separate VBCT invocation with its own freshly-derived domain objects.
+    // Every Chain domain this layer has. (Until 2026-11-21 each was also matched to the caller's tracked identity
+    // list by nearest mean point; with a non-empty list every domain matched, so it only ever acted as an
+    // "any Chain tracked here?" gate, which findAllChainDomainWalls keeps.)
     for (const auto& dom : r9.domains)
     {
         if (dom.kind != "chain" || ! dom.left || ! dom.right || dom.left->points.empty() || dom.right->points.empty())
         {
-            continue;
-        }
-        std::vector<vbct::Point2> combined = dom.left->points;
-        combined.insert(combined.end(), dom.right->points.begin(), dom.right->points.end());
-        const vbct::Point2 identity_point = meanPoint(combined);
-        const Point2LL identity_point_microns = fromVbctMm(identity_point);
-
-        const ChainDomainWallIdentity* matched = nullptr;
-        double best_dist_sq = std::numeric_limits<double>::max();
-        for (const ChainDomainWallIdentity& tracked : chain_domain_wall_identities)
-        {
-            const double dx = static_cast<double>(identity_point_microns.X - tracked.identity_point.X);
-            const double dy = static_cast<double>(identity_point_microns.Y - tracked.identity_point.Y);
-            const double dist_sq = dx * dx + dy * dy;
-            if (dist_sq < best_dist_sq)
-            {
-                best_dist_sq = dist_sq;
-                matched = &tracked;
-            }
-        }
-        if (matched == nullptr)
-        {
-            // No tracked identity for this domain at all (shouldn't normally happen, since this
-            // function's own caller always builds chain_domain_wall_identities from the identical
-            // per-layer domain composition just moments earlier in the same parallel gcode task) -
-            // fail safe by skipping this domain entirely rather than guessing its own Wall A/B.
             continue;
         }
 
@@ -1672,6 +1757,68 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
         result.push_back(std::move(walls));
     }
     return result;
+}
+
+std::vector<ChainWallPoints> findAllChainDomainWalls(
+    const SliceLayerPart& part,
+    const Settings& settings,
+    const std::vector<ChainDomainWallIdentity>& chain_domain_wall_identities,
+    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
+    Stage9Memo* stage9_memo)
+{
+    if (chain_domain_wall_identities.empty())
+    {
+        return {};
+    }
+    return chainDomainWalls(part, settings, suppressed_hole_identities, stage9_memo);
+}
+
+bool expandStrippedChainSides(
+    Shape& area,
+    const SliceLayerPart& part,
+    const Settings& settings,
+    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
+    Stage9Memo* stage9_memo,
+    const coord_t inset)
+{
+    const bool strip_a = settings.get<bool>("corrugated_strip_wall_a");
+    const bool strip_b = settings.get<bool>("corrugated_strip_wall_b");
+    if (! strip_a && ! strip_b)
+    {
+        return false;
+    }
+    bool moved = false;
+    for (const ChainWallPoints& walls : chainDomainWalls(part, settings, suppressed_hole_identities, stage9_memo))
+    {
+        if (strip_a && expandChainContourRange(area, part.outline, walls.wall_a, inset))
+        {
+            moved = true;
+        }
+        if (strip_b && expandChainContourRange(area, part.outline, walls.wall_b, inset))
+        {
+            moved = true;
+        }
+    }
+    return moved;
+}
+
+Shape buildLiveCorrugationInput(
+    const SliceLayerPart& part,
+    const Settings& settings,
+    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
+    Stage9Memo* stage9_memo,
+    bool& chain_strip_active,
+    Shape* before_chain_strip)
+{
+    Shape input = buildCorrugationInput(part, settings);
+    if (before_chain_strip != nullptr)
+    {
+        *before_chain_strip = input;
+    }
+    // Same half-infill_line_width inset the Ring step-out uses: the skin's centreline sits half its own width in
+    // from the model surface, where the stripped wall's centreline would have been.
+    chain_strip_active = expandStrippedChainSides(input, part, settings, suppressed_hole_identities, stage9_memo, settings.get<coord_t>("infill_line_width") / 2);
+    return growCorrugationInput(input, settings, chain_strip_active);
 }
 
 // Per-Chain-domain continuity state (see CorrugationAnchor::chain_domain_tracks): one entry per Chain domain
@@ -1984,7 +2131,6 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
     // a VBCT result - so every layer's input is known before any VBCT run.
     {
         const bool strip_any = mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b");
-        const bool raw_outline = mesh.settings.get<bool>("corrugated_raw_outline_mode");
         for (size_t layer_nr = 0; layer_nr < mesh.layers.size(); ++layer_nr)
         {
             const SliceLayer& layer = mesh.layers[layer_nr];
@@ -2005,10 +2151,11 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
                 // built from identical input: without this, the live wall came out wound the opposite way to
                 // what this pre-pass planned on ~28% of Ring layers, mirroring the stringers there.
                 const Shape corrugation_input_built = buildCorrugationInput(part, mesh.settings);
-                // Chain Wall Strip's boundary expansion only exists for non-Ring, non-raw layers; the live path decides it from the
-                // chain domain it actually finds, which the pre-pass cannot know before running VBCT, so approximate it by shape.
+                // With a wall stripped, the exact input needs a VBCT run (to find the Chain walls to step out), so Phase B
+                // rebuilds it with buildLiveCorrugationInput. Here it only feeds the De Minimis hole decision, which needs
+                // the holes alone; approximate the step-out's effect on the growth by shape.
                 const bool chain_strip_assumed = (mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b"))
-                    && ! mesh.settings.get<bool>("corrugated_raw_outline_mode") && corrugation_input_built.size() != 2;
+                    && corrugation_input_built.size() != 2;
                 const Shape corrugation_input_raw = growCorrugationInput(corrugation_input_built, mesh.settings, chain_strip_assumed);
 
                 // De Minimis Hole Threshold (spec REV 3.0/3.5/5.9): decide, with hysteresis, which of
@@ -2098,7 +2245,7 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             for (size_t part_idx = 1; part_idx < layer.parts.size(); ++part_idx)
             {
                 const Shape built = buildCorrugationInput(layer.parts[part_idx], mesh.settings);
-                const bool chain_strip_assumed = strip_any && ! raw_outline && built.size() != 2;
+                const bool chain_strip_assumed = strip_any && built.size() != 2;
                 const Shape grown = growCorrugationInput(built, mesh.settings, chain_strip_assumed);
                 std::vector<std::vector<Point2LL>> unused_ignored_hole_loops;
                 const Shape filtered = filterDeminimisHoles(grown, result[layer_nr].suppressed_hole_identities, unused_ignored_hole_loops);
@@ -2107,8 +2254,12 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
         }
     }
 
-    // Phase B (parallel): Stages 1-9 for every part of every layer - independent runs on fixed inputs.
+    // Phase B (parallel): Stages 1-9 for every part of every layer - independent runs on fixed inputs. With a wall
+    // stripped, each part's input is first rebuilt exactly as the live path builds it (buildLiveCorrugationInput: the
+    // stripped Chain sides stepped out, which takes a VBCT run of its own), with the live path's fallback to the
+    // un-stepped-out input if VBCT rejects it. The Stage 9 memo then serves the live path's identical runs.
     {
+        const bool strip_any = mesh.settings.get<bool>("corrugated_strip_wall_a") || mesh.settings.get<bool>("corrugated_strip_wall_b");
         std::vector<std::pair<size_t, size_t>> jobs;
         for (size_t layer_nr = 0; layer_nr < part_contours.size(); ++layer_nr)
         {
@@ -2127,8 +2278,40 @@ std::vector<CorrugationAnchor> computeAnchorsForMesh(const SliceMeshStorage& mes
             const auto [layer_nr, part_idx] = jobs[job_idx];
             try
             {
+                std::optional<std::vector<vbct::Contour>> fallback_contours;
+                if (strip_any)
+                {
+                    const std::vector<DeminimisHoleIdentity>& suppressed = result[layer_nr].suppressed_hole_identities;
+                    bool chain_strip_active = false;
+                    Shape before_chain_strip;
+                    const Shape live_input = buildLiveCorrugationInput(
+                        mesh.layers[layer_nr].parts[part_idx],
+                        mesh.settings,
+                        suppressed,
+                        mesh.corrugation_stage9_memo.get(),
+                        chain_strip_active,
+                        &before_chain_strip);
+                    std::vector<std::vector<Point2LL>> unused_ignored_hole_loops;
+                    part_contours[layer_nr][part_idx] = shapeToContours(filterDeminimisHoles(live_input, suppressed, unused_ignored_hole_loops));
+                    if (chain_strip_active)
+                    {
+                        fallback_contours = shapeToContours(filterDeminimisHoles(before_chain_strip, suppressed, unused_ignored_hole_loops));
+                    }
+                }
                 writeSliceDump(layer_nr, part_idx, part_contours[layer_nr][part_idx], x, threshold_mm);
-                part_stage9[layer_nr][part_idx] = runStages1to9(part_contours[layer_nr][part_idx], x, threshold_mm, mesh.corrugation_stage9_memo.get());
+                try
+                {
+                    part_stage9[layer_nr][part_idx] = runStages1to9(part_contours[layer_nr][part_idx], x, threshold_mm, mesh.corrugation_stage9_memo.get());
+                }
+                catch (const std::runtime_error&)
+                {
+                    if (! fallback_contours.has_value())
+                    {
+                        throw;
+                    }
+                    part_contours[layer_nr][part_idx] = std::move(*fallback_contours);
+                    part_stage9[layer_nr][part_idx] = runStages1to9(part_contours[layer_nr][part_idx], x, threshold_mm, mesh.corrugation_stage9_memo.get());
+                }
             }
             catch (const std::runtime_error&)
             {

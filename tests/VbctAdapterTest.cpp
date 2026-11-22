@@ -2679,16 +2679,48 @@ TEST(VbctAdapterTest, BuildCorrugationInputStripWallBMovesInnerContourToHalfLine
 }
 
 /*!
- * Wall Strip: corrugated_raw_outline_mode's own path (insetOutline) has no concept of a stripped
- * wall yet (see buildCorrugationInput's own doc comment) - strip settings must be silently ignored
- * for the corrugation boundary in that mode, not cause a crash or a malformed shape.
+ * Wall Strip: a stepped-out hole must still be a hole. The lone-contour offset that steps it out returns it wound as
+ * a solid; left that way, growCorrugationInput's overlap growth unioned it into the outer contour and the part
+ * reached VBCT with no hole at all (Body, 2026-11-20: Ring layers were classified as solid Chain, the wall was never
+ * stripped and stringers crossed the hollow). Checked in both raw modes, through the growth.
  */
-TEST(VbctAdapterTest, BuildCorrugationInputIgnoresStripSettingsInRawOutlineMode)
+TEST(VbctAdapterTest, StrippedHoleKeepsHoleWindingThroughGrowth)
+{
+    for (const char* raw : { "False", "True" })
+    {
+        const SliceLayerPart part = makeRingPartForWallStripTest(2000);
+        Settings settings = makeWallStripSettings(/*strip_wall_a=*/false, /*strip_wall_b=*/true, 400);
+        settings.add("corrugated_raw_outline_mode", raw);
+        settings.add("wall_line_width_0", "0.4");
+        settings.add("wall_line_width_x", "0.4");
+        settings.add("wall_line_count", "2");
+        settings.add("wall_0_inset", "0");
+        settings.add("infill_overlap_mm", "0.12");
+
+        const Shape built = VbctAdapter::buildCorrugationInput(part, settings);
+        ASSERT_EQ(built.size(), 2u) << "raw=" << raw;
+        const size_t outer_idx = std::abs(built[0].area()) >= std::abs(built[1].area()) ? 0 : 1;
+        EXPECT_NE(built[outer_idx].area() < 0.0, built[1 - outer_idx].area() < 0.0) << "hole must wind opposite the outer contour (raw=" << raw << ")";
+
+        const Shape grown = VbctAdapter::growCorrugationInput(built, settings, /*chain_strip_active=*/false);
+        ASSERT_EQ(grown.size(), 2u) << "the hole must survive the overlap growth (raw=" << raw << ")";
+        const size_t grown_outer = std::abs(grown[0].area()) >= std::abs(grown[1].area()) ? 0 : 1;
+        EXPECT_NEAR(minRadius(grown[1 - grown_outer]), 15000 + 200, 50) << "raw=" << raw;
+    }
+}
+
+/*!
+ * Wall Strip in raw outline mode (2026-11-20): the stripped side must step out to the stripped wall's own line
+ * (outline inset by half infill_line_width), exactly as in normal mode, while the kept side stays at insetOutline's
+ * fixed inset past the full wall stack. Before this, raw mode ignored the strip settings and left the stripped side
+ * a whole wall stack inboard.
+ */
+TEST(VbctAdapterTest, BuildCorrugationInputRawOutlineModeStepsOutStrippedSide)
 {
     SliceLayerPart part = makeRingPartForWallStripTest(2000);
     Settings settings;
     settings.add("corrugated_raw_outline_mode", "True");
-    settings.add("corrugated_strip_wall_a", "True");
+    settings.add("corrugated_strip_wall_a", "False");
     settings.add("corrugated_strip_wall_b", "True");
     settings.add("infill_line_width", "0.4"); // mm - see makeWallStripSettings' own doc comment for why
     settings.add("wall_line_width_0", "0.4");
@@ -2698,7 +2730,13 @@ TEST(VbctAdapterTest, BuildCorrugationInputIgnoresStripSettingsInRawOutlineMode)
 
     const Shape result = VbctAdapter::buildCorrugationInput(part, settings);
 
-    EXPECT_EQ(result.size(), 2u);
+    ASSERT_EQ(result.size(), 2u);
+    const size_t outer_idx = std::abs(result[0].area()) >= std::abs(result[1].area()) ? 0 : 1;
+    const size_t inner_idx = 1 - outer_idx;
+    // Kept Wall A: insetOutline's fixed inset, 0.2 + 0.4 + 0.2 = 0.8 mm for two 0.4 mm walls.
+    EXPECT_NEAR(maxRadius(result[outer_idx]), 30000 - 800, 50);
+    // Stripped Wall B: on the line the stripped wall would have printed on.
+    EXPECT_NEAR(minRadius(result[inner_idx]), 15000 + 200, 50);
 }
 
 namespace
@@ -2825,6 +2863,58 @@ TEST(VbctAdapterTest, ExpandChainContourRangeMovesOnlyTheCoveredSideAndPreserves
     EXPECT_TRUE(any_moved) << "the covered range's own vertices should have moved";
     EXPECT_TRUE(any_reached_outline) << "at least some covered-range vertices should have reached outline's own true surface, inset by half infill_line_width - actual max_y=" << max_y
                                       << " expected~" << expected_max_y;
+}
+
+/*!
+ * expandChainContourRange at a corner (2026-11-21): when the stripped wall's coverage runs a little way round a convex
+ * corner onto an un-stripped face (a Chain's flat end), the corner vertex used to move to its nearest outline point -
+ * diagonally, through that face - leaving a spur on some layers and a clean corner on others, depending on where the
+ * coverage happened to end. VBCT read those as different Chain ends and the linked skin's phase jumped. The stripped
+ * side must move straight out, and the face it meets must stay where it was.
+ */
+TEST(VbctAdapterTest, ExpandChainContourRangeLeavesTheFaceBeyondACornerInPlace)
+{
+    constexpr coord_t kInfillHalfWidth = 8000, kInfillHalfHeight = 1500;
+    constexpr coord_t kWall = 400;
+    constexpr coord_t kHalfLineWidth = 200;
+    Shape corrugation_input;
+    corrugation_input.push_back(makeDenseRectanglePolygon(kInfillHalfWidth, kInfillHalfHeight));
+    Shape outline;
+    outline.push_back(makeDenseRectanglePolygon(kInfillHalfWidth + kWall, kInfillHalfHeight + kWall));
+
+    // Wall B along the top edge, plus two samples just round the top-right corner on the right face.
+    std::vector<Point2LL> domain_wall_points;
+    domain_wall_points.emplace_back(kInfillHalfWidth, kInfillHalfHeight - 400);
+    domain_wall_points.emplace_back(kInfillHalfWidth, kInfillHalfHeight - 200);
+    for (int i = 17; i >= -8; --i)
+    {
+        domain_wall_points.emplace_back(static_cast<coord_t>(i * 450), kInfillHalfHeight);
+    }
+
+    ASSERT_TRUE(VbctAdapter::expandChainContourRange(corrugation_input, outline, domain_wall_points, kHalfLineWidth));
+    ASSERT_EQ(corrugation_input.size(), 1u);
+    const Polygon& result = corrugation_input[0];
+
+    coord_t max_x = std::numeric_limits<coord_t>::min();
+    coord_t max_y = std::numeric_limits<coord_t>::min();
+    for (const Point2LL& p : result)
+    {
+        max_x = std::max(max_x, p.X);
+        max_y = std::max(max_y, p.Y);
+    }
+    EXPECT_LE(max_x, kInfillHalfWidth + 5) << "a vertex was pushed through the un-stripped right face";
+    EXPECT_NEAR(max_y, kInfillHalfHeight + kWall - kHalfLineWidth, 50) << "the stripped top side should move out to the removed wall's line";
+    // The moved top side reaches the corner itself: the right face continues straight up to it.
+    bool corner_at_new_height = false;
+    for (const Point2LL& p : result)
+    {
+        corner_at_new_height |= std::abs(p.X - kInfillHalfWidth) <= 5 && std::abs(p.Y - (kInfillHalfHeight + kWall - kHalfLineWidth)) <= 50;
+    }
+    EXPECT_TRUE(corner_at_new_height) << "expected a clean corner at (right face, moved top side)";
+    for (size_t i = 0; i < result.size(); ++i)
+    {
+        EXPECT_NE(result[i], result[(i + 1) % result.size()]) << "duplicate/zero-length edge at vertex " << i;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3565,24 +3655,18 @@ TEST(VbctAdapterTest, GrowCorrugationInputMatchesLivePathForEveryStripAndRawMode
         EXPECT_LT(g[0], ungrown[0]) << "hole must shrink (raw=" << raw << ")";
     }
 
-    // Raw Outline Mode ignores Wall Strip, so the growth must still be applied in full even with both sides stripped.
+    // A stripped side reverts to its un-grown contour, in either raw mode (raw mode steps the stripped side out too).
+    for (const char* raw : { "True", "False" })
     {
-        const auto g = growth("True", "True", "True", false);
-        EXPECT_GT(g[1], ungrown[1]) << "raw mode + strip: the live path still grows the outer contour";
-        EXPECT_LT(g[0], ungrown[0]) << "raw mode + strip: the live path still shrinks the hole";
-    }
-
-    // Raw mode off: a stripped side reverts to its un-grown contour.
-    {
-        const auto both = growth("False", "True", "True", false);
-        EXPECT_DOUBLE_EQ(both[1], ungrown[1]);
-        EXPECT_DOUBLE_EQ(both[0], ungrown[0]);
-        const auto a_only = growth("False", "True", "False", false);
-        EXPECT_DOUBLE_EQ(a_only[1], ungrown[1]) << "A (the outer contour) is stripped: not grown";
-        EXPECT_LT(a_only[0], ungrown[0]) << "B (the hole) is not stripped: still shrinks";
-        const auto b_only = growth("False", "False", "True", false);
-        EXPECT_GT(b_only[1], ungrown[1]) << "A is not stripped: the outer contour still grows";
-        EXPECT_DOUBLE_EQ(b_only[0], ungrown[0]) << "B (the hole) is stripped: not shrunk";
+        const auto both = growth(raw, "True", "True", false);
+        EXPECT_DOUBLE_EQ(both[1], ungrown[1]) << "raw=" << raw;
+        EXPECT_DOUBLE_EQ(both[0], ungrown[0]) << "raw=" << raw;
+        const auto a_only = growth(raw, "True", "False", false);
+        EXPECT_DOUBLE_EQ(a_only[1], ungrown[1]) << "A (the outer contour) is stripped: not grown (raw=" << raw << ")";
+        EXPECT_LT(a_only[0], ungrown[0]) << "B (the hole) is not stripped: still shrinks (raw=" << raw << ")";
+        const auto b_only = growth(raw, "False", "True", false);
+        EXPECT_GT(b_only[1], ungrown[1]) << "A is not stripped: the outer contour still grows (raw=" << raw << ")";
+        EXPECT_DOUBLE_EQ(b_only[0], ungrown[0]) << "B (the hole) is stripped: not shrunk (raw=" << raw << ")";
     }
 
     // An active Chain Wall Strip expansion skips the growth entirely.

@@ -255,8 +255,10 @@ Shape insetOutline(const SliceLayerPart& part, const Settings& settings);
 
 /*!
  * \brief Build the Shape corrugate() should actually corrugate for one layer part: either
- * insetOutline's raw-outline inset, or \p part's own wall-generated \c infill_area unchanged,
- * chosen by the \c corrugated_raw_outline_mode setting.
+ * insetOutline's raw-outline inset, or \p part's own wall-generated \c infill_area, chosen by the
+ * \c corrugated_raw_outline_mode setting. In both modes a stripped Ring side (Wall Strip) is
+ * replaced by the outline contour inset by half \c infill_line_width - the line the stripped wall
+ * would have printed on.
  *
  * Factored out so FffGcodeWriter::processCorrugatedInfill's per-layer call and
  * computeAnchorsForMesh's cross-layer pre-pass (spec REV 1.4 S:5.3) build the exact same input
@@ -269,14 +271,24 @@ Shape insetOutline(const SliceLayerPart& part, const Settings& settings);
 Shape buildCorrugationInput(const SliceLayerPart& part, const Settings& settings);
 
 /*!
+ * \brief The area a whole-layer Transition Layer's concentric fill should cover when a wall is stripped:
+ * buildCorrugationInput's base area (\c infill_area, or insetOutline in raw outline mode), with each stripped Ring side
+ * replaced by the outline contour itself. With no strip setting on it is \c infill_area, unchanged.
+ *
+ * A concentric fill keeps its outermost line half a line width inside its area, so a boundary on the outline puts
+ * that line on the stripped wall's own line - the same place buildCorrugationInput puts the skin. A stripped Chain
+ * side is moved separately by the caller, with expandChainContourRange at zero inset.
+ */
+Shape stripWallFillArea(const SliceLayerPart& part, const Settings& settings);
+
+/*!
  * rief Grow \p corrugation_input by \c infill_overlap_mm, exactly as FffGcodeWriter::processCorrugatedInfill
  * hands it to VBCT, reverting the growth on a stripped Ring side.
  *
  * Every other infill pattern gets this growth from Infill::generate(), so the corrugation bonds with the wall
  * rather than stopping exactly at the boundary. A stripped side's contour already runs along the true model
  * surface (buildCorrugationInput's own expansion), so there the growth is reverted by swapping that contour
- * back to its un-grown version. The revert is skipped when \p corrugation_input isn't a simple two-contour Ring
- * or Raw Outline Mode is on (buildCorrugationInput ignores strip settings there, so nothing was expanded).
+ * back to its un-grown version. The revert is skipped when \p corrugation_input isn't a simple two-contour Ring.
  *
  * The live per-layer call and computeAnchorsForMesh's pre-pass MUST both build the corrugation input through this
  * one function: the anchors decided in the pre-pass (t0 fractions, winding correction) are only meaningful
@@ -284,7 +296,7 @@ Shape buildCorrugationInput(const SliceLayerPart& part, const Settings& settings
  * + Wall Strip mirrored the stringers on Ring layers).
  *
  * \param corrugation_input The input as built by buildCorrugationInput (plus any Chain boundary expansion).
- * \param settings Read for infill_overlap_mm, corrugated_strip_wall_a/b, corrugated_raw_outline_mode.
+ * \param settings Read for infill_overlap_mm, corrugated_strip_wall_a/b.
  * \param chain_strip_active True when a Chain Wall Strip boundary expansion is in effect - the growth is skipped.
  */
 Shape growCorrugationInput(const Shape& corrugation_input, const Settings& settings, bool chain_strip_active);
@@ -415,6 +427,47 @@ std::vector<ChainWallPoints> findAllChainDomainWalls(
  * \return Whether anything was actually moved.
  */
 bool expandChainContourRange(Shape& corrugation_input, const Shape& outline, const std::vector<Point2LL>& domain_wall_points, coord_t half_line_width);
+
+/*!
+ * \brief Wall Strip (Chain): steps each stripped side of every Chain domain on \p part out to the outline, \p inset
+ * inside it (expandChainContourRange), with the domains' walls found by one VBCT run on the plain corrugation input
+ * (buildCorrugationInput, De Minimis holes filtered, not grown).
+ *
+ * The one implementation of this step: the live per-layer path (corrugation input, inset = half infill_line_width;
+ * Transition Layer fill area, inset = 0) and computeAnchorsForMesh's pre-pass both call it, so the pre-pass plans
+ * each Chain's phase on exactly the geometry the live run corrugates. (Until 2026-11-21 the pre-pass skipped this
+ * step; once raw outline mode began stepping stripped Chain sides out, the planned phase landed on the wrong wall on
+ * whole layers - the linked skin's wall parity flipped on ~10% of A-40 Tail layers 380-482.)
+ *
+ * \return Whether anything moved. False if no wall is stripped, VBCT rejects the input, or there is no Chain domain.
+ */
+bool expandStrippedChainSides(
+    Shape& area,
+    const SliceLayerPart& part,
+    const Settings& settings,
+    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
+    Stage9Memo* stage9_memo,
+    coord_t inset);
+
+/*!
+ * \brief The corrugation input VBCT is given for one part on one ordinary (non-Transition) layer: buildCorrugationInput,
+ * stripped Chain sides stepped out (expandStrippedChainSides, half infill_line_width in from the outline), then
+ * growCorrugationInput. De Minimis holes are not yet filtered (corrugate() does that, as does the pre-pass).
+ *
+ * The live per-layer path and computeAnchorsForMesh's pre-pass both build their input with this, so the pre-pass's
+ * anchors and phase are planned on exactly the geometry the live run corrugates.
+ *
+ * \param chain_strip_active Set to whether a stripped Chain side was stepped out (the overlap growth is then skipped).
+ * \param before_chain_strip If given, receives the input before the step-out: the fallback when VBCT rejects the
+ * stepped-out boundary.
+ */
+Shape buildLiveCorrugationInput(
+    const SliceLayerPart& part,
+    const Settings& settings,
+    const std::vector<DeminimisHoleIdentity>& suppressed_hole_identities,
+    Stage9Memo* stage9_memo,
+    bool& chain_strip_active,
+    Shape* before_chain_strip = nullptr);
 
 /*!
  * \brief Linked corrugation skin: builds one continuous printed toolpath that alternates between
