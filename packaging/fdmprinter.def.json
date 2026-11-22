@@ -3102,6 +3102,32 @@
                     "enabled": "infill_pattern == 'corrugated'",
                     "settable_per_mesh": true,
                     "settable_globally": true
+                },
+                "corrugated_scarf_length":
+                {
+                    "label": "Corrugated Scarf Length",
+                    "description": "Experimental. Prints each closed run of beads as one continuous extrusion with a flow-only scarf at its seam: flow ramps up over this length, and at the end of the loop the nozzle runs on over the same length while flow ramps back down, so the seam carries one bead in total. A Ring's walls and its linked skin each get their own scarf. A Chain with exactly one wall stripped prints its kept wall and its linked skin as one loop, with the scarf on the skin side, so the outer wall is never the first thing printed after a retraction. Helps materials that take a long distance to recover pressure after a retraction, such as foaming LW-PLA. Layers that do not form a clean loop print as before. Keep this no longer than Max Comb Distance With No Retract: where a part used to print straight on from the layer below with no retraction, a longer scarf adds one retraction per layer. 0 disables this.",
+                    "type": "float",
+                    "unit": "mm",
+                    "default_value": 0,
+                    "minimum_value": "0",
+                    "maximum_value_warning": "50",
+                    "enabled": "infill_pattern == 'corrugated'",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
+                },
+                "corrugated_scarf_start_flow_ratio":
+                {
+                    "label": "Corrugated Scarf Start Flow",
+                    "description": "Experimental. Flow at the very start of the Corrugated Scarf ramp, as a percentage of the normal flow. The closing overprint ramps from the remainder down to zero, so every point of the seam totals one bead.",
+                    "type": "float",
+                    "unit": "%",
+                    "default_value": 0,
+                    "minimum_value": "0",
+                    "maximum_value": "100",
+                    "enabled": "infill_pattern == 'corrugated' and corrugated_scarf_length > 0",
+                    "settable_per_mesh": true,
+                    "settable_globally": true
                 }
             }
         },

@@ -30,6 +30,7 @@
 #include "WallToolPaths.h"
 #include "bridge/bridge.h"
 #include "communication/Communication.h" //To send layer view data.
+#include "corrugated/BeadLoop.h"
 #include "corrugated/VbctAdapter.h"
 #include "corrugated/WallStrip.h"
 #include "geometry/LinesSet.h"
@@ -2111,9 +2112,48 @@ void FffGcodeWriter::addMeshPartToGCode(
     }
     const OverrideAreas overhang_areas = makeLayerMasks(storage, gcode_layer, mesh, mesh_config, part);
 
+    // Bead Loop Scarf (Corrugated spec REV 3.9, Sections 3.8 / 5.12): compute this part's corrugation now,
+    // after Wall Strip and before the walls are pre-processed, so the wall and skin that form a Bead Loop
+    // can be taken out and printed as one continuous extrusion with a flow scarf at its seam. The
+    // corrugation computed here is then also what gets emitted as infill (never computed twice).
+    std::optional<CorrugatedInfillPaths> corrugated_paths;
+    CorrugatedBeadPlan bead_plan;
+    const coord_t corrugated_scarf_length = mesh.settings.get<EFillMethod>("infill_pattern") == EFillMethod::CORRUGATED ? mesh.settings.get<coord_t>("corrugated_scarf_length") : 0;
+    if (corrugated_scarf_length > 0 && gcode_layer.getLayerNr() > 0 && extruder_nr == mesh.settings.get<ExtruderTrain&>("infill_extruder_nr").extruder_nr_)
+    {
+        corrugated_paths = computeCorrugatedInfill(gcode_layer.getLayerNr(), mesh, part);
+        bead_plan = planCorrugatedBeadLoops(mesh, part, *corrugated_paths);
+    }
+
     // Pre-process the insets without actually adding them, so that we know where they are going to start printing
     std::optional<InsetsPreprocessResult> insets_preprocess_result = preProcessInsets(storage, gcode_layer, mesh, extruder_nr, mesh_config, part, end_infill_close_to_seam);
     bool infill_added = false;
+    std::optional<Point2LL> wall_seam;
+    if (insets_preprocess_result.has_value() && insets_preprocess_result->walls_optimizer)
+    {
+        wall_seam = insets_preprocess_result->walls_optimizer->getStartPosition();
+    }
+
+    const auto add_infill = [&](const std::optional<Point2LL>& near_end_location) -> bool
+    {
+        if (! corrugated_paths.has_value())
+        {
+            return processInfill(storage, gcode_layer, mesh, extruder_nr, mesh_config, part, near_end_location);
+        }
+        // Same as processInfill, with the corrugation already computed above.
+        const bool multi_layer_added = processMultiLayerInfill(
+            gcode_layer,
+            mesh,
+            extruder_nr,
+            mesh_config,
+            part,
+            mesh.settings.get<coord_t>("infill_start_move_inwards_length"),
+            mesh.settings.get<coord_t>("infill_end_move_inwards_length"),
+            near_end_location);
+        const bool loops_added = addCorrugatedBeadLoops(gcode_layer, mesh, mesh_config, bead_plan, overhang_areas, /*walls_slot=*/false, wall_seam);
+        const bool corrugation_added = emitCorrugatedInfill(storage, gcode_layer, mesh, extruder_nr, mesh_config, part, *corrugated_paths);
+        return multi_layer_added || loops_added || corrugation_added;
+    };
 
     if (infill_before_walls)
     {
@@ -2123,16 +2163,23 @@ void FffGcodeWriter::addMeshPartToGCode(
             near_end_location = insets_preprocess_result->walls_optimizer->getStartPosition();
         }
 
-        infill_added = processInfill(storage, gcode_layer, mesh, extruder_nr, mesh_config, part, near_end_location);
+        infill_added = add_infill(near_end_location);
         added_something = added_something | infill_added;
     }
 
+    // Bead Loop Scarf, Chain case: the wall+skin loop takes the walls' place in the print order.
+    added_something |= addCorrugatedBeadLoops(gcode_layer, mesh, mesh_config, bead_plan, overhang_areas, /*walls_slot=*/true, std::nullopt);
+    if (bead_plan.closed_wall_flow_scarf)
+    {
+        gcode_layer.setFlowScarf(LayerPlan::FlowScarf{ corrugated_scarf_length, mesh.settings.get<Ratio>("corrugated_scarf_start_flow_ratio") });
+    }
     added_something |= insets_preprocess_result.has_value()
                     && endProcessInsets(*insets_preprocess_result, overhang_areas, storage, gcode_layer, mesh, extruder_nr, mesh_config, part, infill_added);
+    gcode_layer.setFlowScarf(std::nullopt);
 
     if (! infill_before_walls)
     {
-        added_something = added_something | processInfill(storage, gcode_layer, mesh, extruder_nr, mesh_config, part);
+        added_something = added_something | add_infill(std::nullopt);
     }
 
     added_something = added_something | processSkin(storage, gcode_layer, mesh, extruder_nr, mesh_config, part);
@@ -2696,6 +2743,25 @@ bool FffGcodeWriter::processCorrugatedInfill(
     const MeshPathConfigs& mesh_config,
     const SliceLayerPart& part) const
 {
+    return emitCorrugatedInfill(storage, gcode_layer, mesh, extruder_nr, mesh_config, part, computeCorrugatedInfill(gcode_layer.getLayerNr(), mesh, part));
+}
+
+// Wall Strip (Chain): move each stripped side of every Chain domain on this layer out to the outline, `inset` inside
+// it. Shared by the corrugation input (inset = half infill_line_width) and the whole-layer Transition Layer's fill area
+// (inset = 0), so both put the stripped wall's replacement on the same line. Returns whether anything moved. Not gated
+// on the layer's tracked Chain identities: the pre-pass calls the same VbctAdapter function before those exist.
+static bool expandStrippedChainSides(Shape& area, const SliceMeshStorage& mesh, const SliceLayerPart& part, const LayerIndex layer_nr, const coord_t inset)
+{
+    if (layer_nr < 0 || static_cast<size_t>(layer_nr) >= mesh.corrugation_anchors.size())
+    {
+        return false;
+    }
+    return VbctAdapter::expandStrippedChainSides(area, part, mesh.settings, mesh.corrugation_anchors[layer_nr].suppressed_hole_identities, mesh.corrugation_stage9_memo.get(), inset);
+}
+
+FffGcodeWriter::CorrugatedInfillPaths FffGcodeWriter::computeCorrugatedInfill(const LayerIndex layer_index, const SliceMeshStorage& mesh, const SliceLayerPart& part) const
+{
+    CorrugatedInfillPaths result;
     // VBCT (see src/vbct/VENDORED.md) is this project's real wall-correspondence + corrugation
     // engine: it takes the infill area's own contours, builds a constrained Delaunay
     // triangulation, classifies Ring/Chain/Glob domains via its own skeleton, and emits straight
@@ -2705,7 +2771,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // - spec Section 5.1's original direction to expose every tuning constant.
     const double vbct_x = mesh.settings.get<double>("corrugated_vbs_tolerance");
     const coord_t vbct_threshold = mesh.settings.get<coord_t>("corrugated_prune_threshold");
-    const LayerIndex corrugation_input_layer_nr = gcode_layer.getLayerNr();
+    const LayerIndex corrugation_input_layer_nr = layer_index;
 
     // Transition Layer (2026-09-15 full-layer redesign): when this exact layer's own total domain
     // count changed relative to the previous layer (CorrugationAnchor::transition_layer_triggered,
@@ -2721,28 +2787,12 @@ bool FffGcodeWriter::processCorrugatedInfill(
         && corrugation_input_layer_nr >= 0 && static_cast<size_t>(corrugation_input_layer_nr) < mesh.corrugation_anchors.size()
         && mesh.corrugation_anchors[corrugation_input_layer_nr].transition_layer_triggered)
     {
-        bool added_something = false;
-        const AngleDegrees transition_angle = 45;
-        constexpr coord_t transition_skin_overlap = 0;
-        constexpr Ratio transition_skin_density = 1.0_r;
-        processSkinPrintFeature(
-            storage,
-            gcode_layer,
-            mesh,
-            extruder_nr,
-            part.infill_area,
-            mesh_config.infill_config[0],
-            /*bridge_config=*/nullptr,
-            EFillMethod::CONCENTRIC,
-            transition_angle,
-            transition_skin_overlap,
-            transition_skin_density,
-            LinesOrderingMethod::Basic,
-            /*is_roofing_flooring=*/false,
-            added_something,
-            GCodePathConfig::FAN_SPEED_DEFAULT,
-            std::nullopt);
-        return added_something;
+        result.whole_layer_transition = true; // emitCorrugatedInfill fills the part concentrically.
+        // A wall stripped on this layer is replaced by the fill's outer loop, so its stripped side is stepped out the
+        // same way the corrugation's is (2026-11-20: it filled the un-stepped infill_area, leaving a wall-width gap).
+        result.whole_layer_transition_area = VbctAdapter::stripWallFillArea(part, mesh.settings);
+        expandStrippedChainSides(result.whole_layer_transition_area, mesh, part, corrugation_input_layer_nr, /*inset=*/0);
+        return result;
     }
 
     // Experimental: corrugate a simple, fixed-width inset of the raw slice outline (this layer's
@@ -2753,7 +2803,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // top/bottom skin area (corrugation may overlap skin at the first/last few layers when
     // enabled) - deliberately out of scope for this pass. buildCorrugationInput is the same
     // helper computeCorrugationAnchors' pre-pass used for this exact layer, so both stay in sync.
-    Shape corrugation_input = VbctAdapter::buildCorrugationInput(part, mesh.settings);
+    // Built below by VbctAdapter::buildLiveCorrugationInput, the same function computeAnchorsForMesh's pre-pass uses.
     // Grow corrugation_input by infill_overlap_mm, exactly matching Infill::generate()'s own
     // convention (src/infill.cpp: "inner_contour_ = inner_contour_.offset(infill_overlap_)") -
     // every *other* infill pattern gets this same growth before generating its own lines, so its
@@ -2793,66 +2843,24 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // side) in a simple loop is safe without any batching - it only ever displaces existing
     // vertices in place, never opens the contour it operates on, so a later call (a different
     // domain, or this same domain's other side) can still find and match it normally.
+    // Wall Strip (Chain) and overlap growth: VbctAdapter::buildLiveCorrugationInput steps each stripped side of every
+    // Chain domain out to the outline (expandStrippedChainSides; displaces the input's own vertices, so a Chain wall that
+    // is only part of a shared contour is handled), then grows the input by infill_overlap_mm (Infill::generate()'s own
+    // convention, so the skin bonds with the walls), skipping the growth when a Chain side moved. computeAnchorsForMesh's
+    // pre-pass builds its input with the same function: until 2026-11-21 it skipped the Chain step-out, and once raw
+    // outline mode began stepping out, the phase it planned landed on the wrong wall on whole layers.
     bool chain_strip_active = false;
-    // Backup of corrugation_input as it stood before any Chain boundary expansion - used as a
-    // fallback below if the expanded geometry turns out to make VBCT reject the whole layer (see
-    // that fallback's own comment for why detecting this ahead of time isn't reliable, and why
-    // retrying against VBCT's own real self-intersection check is used instead).
-    const Shape corrugation_input_before_chain_strip = corrugation_input;
-    if (corrugation_input_has_chain && (vbct_strip_wall_a || vbct_strip_wall_b) && ! mesh.settings.get<bool>("corrugated_raw_outline_mode"))
-    {
-        const std::vector<VbctAdapter::ChainWallPoints> all_chain_walls = VbctAdapter::findAllChainDomainWalls(
-            part,
-            mesh.settings,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].chain_domain_wall_identities,
-            mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities,
-            mesh.corrugation_stage9_memo.get());
-        // Same half-infill_line_width inset convention expandCorrugationInputForStrippedWalls uses
-        // for Ring, computed the same way (VbctAdapter.cpp) - the corrugation's own centerline
-        // prints at infill_line_width, not zero width, so it needs to sit half that width in from
-        // outline's own true surface to stay flush with it rather than hang half a line width past
-        // it (confirmed directly by the user on a real print, reproducing Ring's own identical bug).
-        const coord_t chain_half_line_width = mesh.settings.get<coord_t>("infill_line_width") / 2;
-        for (const VbctAdapter::ChainWallPoints& chain_walls : all_chain_walls)
-        {
-            if (! chain_walls.found)
-            {
-                continue;
-            }
-            if (vbct_strip_wall_a && VbctAdapter::expandChainContourRange(corrugation_input, part.outline, chain_walls.wall_a, chain_half_line_width))
-            {
-                chain_strip_active = true;
-            }
-            if (vbct_strip_wall_b && VbctAdapter::expandChainContourRange(corrugation_input, part.outline, chain_walls.wall_b, chain_half_line_width))
-            {
-                chain_strip_active = true;
-            }
-        }
-    }
-
-    // Grow corrugation_input by infill_overlap_mm, exactly matching Infill::generate()'s own
-    // convention (src/infill.cpp: "inner_contour_ = inner_contour_.offset(infill_overlap_)") -
-    // every *other* infill pattern gets this same growth before generating its own lines, so its
-    // output physically overlaps/bonds with the wall rather than stopping exactly at
-    // part.infill_area's own raw boundary. This project's own corrugated code path never went
-    // through Infill::generate() at all (EFillMethod::CORRUGATED's own case there is a no-op - see
-    // its own comment), so it never got this growth - confirmed via direct user report (a real,
-    // visible gap between the printed wall and the corrugation, absent for every normal pattern on
-    // the same model/settings) and a diagnostic ruling out every other candidate cause first
-    // (this project's own inboard offset, corrugated_raw_outline_mode, and VBCT's own Stages 1-9
-    // wall reconstruction - all confirmed to introduce zero extra inset). A positive offset on a
-    // Shape with holes grows the outer boundary outward *and* shrinks each hole inward by the same
-    // amount - exactly the "bond with whichever wall is on each side" behavior wanted here, for
-    // both the outer wall and (for a Ring domain) the inner wall's own cavity.
-    //
-    // Wall Strip (Chain increment): skipped entirely for this domain when chain_strip_active - a
-    // partial-contour revert (only the grafted sub-range's own growth undone, not the rest of the
-    // same shared contour) isn't attempted yet, unlike Ring's own whole-contour revert below; a
-    // known simplification, to refine via real-print testing the same way Ring's own inset/revert
-    // fixes were found, rather than guessing at the right partial treatment blind.
-    // Overlap growth and the stripped-Ring-side revert live in one shared helper so the cross-layer pre-pass
-    // (computeAnchorsForMesh) builds exactly the same input - see VbctAdapter::growCorrugationInput.
-    corrugation_input = VbctAdapter::growCorrugationInput(corrugation_input, mesh.settings, chain_strip_active);
+    // The input before the step-out: the fallback below if VBCT rejects the stepped-out boundary (detecting that ahead
+    // of time isn't reliable; retrying against VBCT's own self-intersection check is).
+    Shape corrugation_input_before_chain_strip;
+    static const std::vector<DeminimisHoleIdentity> no_suppressed_holes;
+    Shape corrugation_input = VbctAdapter::buildLiveCorrugationInput(
+        part,
+        mesh.settings,
+        corrugation_input_have_anchor ? mesh.corrugation_anchors[corrugation_input_layer_nr].suppressed_hole_identities : no_suppressed_holes,
+        mesh.corrugation_stage9_memo.get(),
+        chain_strip_active,
+        &corrugation_input_before_chain_strip);
 
     // Stringer pitch is now the user-facing setting directly - a target arc-length spacing along
     // a domain's own governing (longer) wall, VBCT Stage 10's own native tunable, with no
@@ -2908,7 +2916,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // doc comment in VbctAdapter.cpp for what this controls.
     const double vbct_chain_junction_merge_angle = mesh.settings.get<double>("corrugated_chain_junction_merge_angle");
 
-    const LayerIndex layer_nr = gcode_layer.getLayerNr();
+    const LayerIndex layer_nr = layer_index;
     const coord_t layer_z = (layer_nr >= 0 && static_cast<size_t>(layer_nr) < mesh.layers.size()) ? mesh.layers[layer_nr].printZ : 0;
 
     // Cross-layer anchor continuity (spec REV 1.4 S:5.3): computeCorrugationAnchors already
@@ -3102,7 +3110,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
     }
     if (! stringer_lines.has_value())
     {
-        return false;
+        return result; // Nothing to print (stringer_lines stays empty).
     }
 
     // Transition Layer, per-domain solid-fill substitution (spec REV 3.3/3.6/5.10):
@@ -3184,6 +3192,52 @@ bool FffGcodeWriter::processCorrugatedInfill(
         }
     }
 
+    result.stringer_lines = std::move(stringer_lines);
+    result.linked_skin = stringer_lines_are_linked_skin;
+    result.transition_lines = std::move(transition_lines);
+    return result;
+}
+
+bool FffGcodeWriter::emitCorrugatedInfill(
+    const SliceDataStorage& storage,
+    LayerPlan& gcode_layer,
+    const SliceMeshStorage& mesh,
+    const size_t extruder_nr,
+    const MeshPathConfigs& mesh_config,
+    const SliceLayerPart& part,
+    const CorrugatedInfillPaths& paths) const
+{
+    if (paths.whole_layer_transition)
+    {
+        bool added_something = false;
+        const AngleDegrees transition_angle = 45;
+        constexpr coord_t transition_skin_overlap = 0;
+        constexpr Ratio transition_skin_density = 1.0_r;
+        processSkinPrintFeature(
+            storage,
+            gcode_layer,
+            mesh,
+            extruder_nr,
+            paths.whole_layer_transition_area,
+            mesh_config.infill_config[0],
+            /*bridge_config=*/nullptr,
+            EFillMethod::CONCENTRIC,
+            transition_angle,
+            transition_skin_overlap,
+            transition_skin_density,
+            LinesOrderingMethod::Basic,
+            /*is_roofing_flooring=*/false,
+            added_something,
+            GCodePathConfig::FAN_SPEED_DEFAULT,
+            std::nullopt);
+        return added_something;
+    }
+    if (! paths.stringer_lines.has_value())
+    {
+        return false;
+    }
+    const OpenLinesSet& transition_lines = paths.transition_lines;
+
     // Transition Layer, per-domain solid-fill substitution (spec REV 3.3/3.6/5.10): emit the
     // transitioned domain(s)' own full-density lines with Cura's own native bridging print
     // settings (speed, flow, fan), separately from the ordinary corrugation below - a Transition
@@ -3223,7 +3277,7 @@ bool FffGcodeWriter::processCorrugatedInfill(
     }
 
     InfillOrderOptimizer optimizer;
-    OpenLinesSet lines = *stringer_lines;
+    OpenLinesSet lines = *paths.stringer_lines;
     optimizer.addPart(InfillOrderOptimizer::InfillPartArea::Infill, lines);
     optimizer.optimize(false, std::nullopt);
 
@@ -3246,6 +3300,279 @@ bool FffGcodeWriter::processCorrugatedInfill(
     // transitioned can have an empty ordinary `lines` set (ordinary_added false) while still
     // having genuinely added real geometry via the bridging path.
     return ordinary_added || ! transition_lines.empty();
+}
+
+FffGcodeWriter::CorrugatedBeadPlan FffGcodeWriter::planCorrugatedBeadLoops(const SliceMeshStorage& mesh, SliceLayerPart& part, CorrugatedInfillPaths& paths) const
+{
+    // Bead Loop Scarf (Corrugated spec REV 3.9, Sections 3.8 / 5.12). Anything that is not one of the
+    // two clean cases below keeps today's emission (spec 5.12.2, Fallback).
+    CorrugatedBeadPlan plan;
+    if (paths.whole_layer_transition || ! paths.stringer_lines.has_value() || ! paths.linked_skin || ! paths.transition_lines.empty()
+        || paths.stringer_lines->empty())
+    {
+        return plan;
+    }
+
+    size_t closed_walls = 0;
+    std::vector<std::pair<size_t, size_t>> open_walls; // (inset bin, index)
+    // Leftovers of Wall Strip's cut: open pieces shorter than one bead (A-40: zero-length; Right Wing:
+    // 0.2 mm stubs). They only add a blob and a travel.
+    std::vector<std::pair<size_t, size_t>> degenerate_walls;
+    const coord_t degenerate_length = mesh.settings.get<coord_t>("wall_line_width_0");
+    for (size_t inset = 0; inset < part.wall_toolpaths.size(); ++inset)
+    {
+        for (size_t i = 0; i < part.wall_toolpaths[inset].size(); ++i)
+        {
+            const ExtrusionLine& line = part.wall_toolpaths[inset][i];
+            if (line.junctions_.empty())
+            {
+                continue;
+            }
+            if (! line.is_closed_ && line.length() < degenerate_length)
+            {
+                // Prints nothing, but would still pull a travel to it after the Bead Loop.
+                degenerate_walls.emplace_back(inset, i);
+                continue;
+            }
+            if (line.is_closed_)
+            {
+                ++closed_walls;
+            }
+            else
+            {
+                open_walls.emplace_back(inset, i);
+            }
+        }
+    }
+
+    OpenLinesSet& skins = *paths.stringer_lines;
+    constexpr coord_t closed_tolerance = 10; // µm: a Ring's Linked Skin ends where it starts.
+    const auto is_closed_skin = [&](const OpenPolyline& line)
+    {
+        return line.size() >= 3 && vSize(line.front() - line.back()) <= closed_tolerance;
+    };
+
+    // Case 2: Ring, any configuration. Every wall is a closed loop and every Linked Skin polyline is a
+    // closed loop. The walls get the flow scarf in LayerPlan::addWall; the skin loops are printed here.
+    if (open_walls.empty() && closed_walls > 0 && std::all_of(skins.begin(), skins.end(), is_closed_skin))
+    {
+        plan.closed_wall_flow_scarf = true;
+        for (const OpenPolyline& skin : skins)
+        {
+            plan.skin_loops.emplace_back(skin.begin(), skin.end());
+        }
+        skins.clear();
+        return plan;
+    }
+
+    // Case 1: one Chain domain with exactly one wall stripped. The single kept (open) wall and the
+    // single Linked Skin polyline form one loop. Closed walls beside it (a walled hole inside the
+    // domain, e.g. a wing's spar hole) are loops of their own and get the closed-wall flow scarf.
+    const bool strip_a = mesh.settings.get<bool>("corrugated_strip_wall_a");
+    const bool strip_b = mesh.settings.get<bool>("corrugated_strip_wall_b");
+    if (strip_a == strip_b || open_walls.size() != 1 || skins.size() != 1 || is_closed_skin(skins[0]))
+    {
+        return plan;
+    }
+    const auto [inset, index] = open_walls.front();
+    const ExtrusionLine& wall_line = part.wall_toolpaths[inset][index];
+    std::vector<Point2LL> wall_points;
+    wall_points.reserve(wall_line.size());
+    for (const ExtrusionJunction& junction : wall_line.junctions_)
+    {
+        wall_points.push_back(junction.p_);
+    }
+    const coord_t infill_line_width = mesh.settings.get<coord_t>("infill_line_width");
+    const coord_t wall_line_width = mesh.settings.get<coord_t>("wall_line_width_0");
+    const coord_t stringer_pitch = mesh.settings.get<coord_t>("corrugated_stringer_pitch");
+    // join: the existing end connector's own reach (processCorrugatedInfill). on-wall: the skin's
+    // centreline lies within half a bead of each line from the wall's. A cap gap or rerouted run longer
+    // than one stringer pitch is not the end-face case this rule was written for, so fall back.
+    const std::optional<ChainBeadLoop> loop = buildChainBeadLoop(
+        wall_points,
+        std::vector<Point2LL>(skins[0].begin(), skins[0].end()),
+        /*join_tolerance=*/infill_line_width * 4,
+        /*on_wall_tolerance=*/(wall_line_width + infill_line_width) / 2,
+        /*max_cap_gap=*/stringer_pitch,
+        /*max_reroute_run=*/stringer_pitch);
+    if (! loop.has_value())
+    {
+        return plan;
+    }
+    plan.chain_wall = wall_line;
+    plan.chain_wall_reversed = loop->wall_reversed;
+    plan.chain_skin = loop->skin;
+    plan.closed_wall_flow_scarf = closed_walls > 0;
+    // Take the kept wall and any degenerate leftovers out of the ordinary wall emission, highest index
+    // first so the remaining indices stay valid.
+    std::vector<std::pair<size_t, size_t>> to_remove = degenerate_walls;
+    to_remove.emplace_back(inset, index);
+    std::sort(to_remove.begin(), to_remove.end(), std::greater<>());
+    for (const auto& [bin, i] : to_remove)
+    {
+        part.wall_toolpaths[bin].erase(part.wall_toolpaths[bin].begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    skins.clear();
+    return plan;
+}
+
+bool FffGcodeWriter::addCorrugatedBeadLoops(
+    LayerPlan& gcode_layer,
+    const SliceMeshStorage& mesh,
+    const MeshPathConfigs& mesh_config,
+    const CorrugatedBeadPlan& plan,
+    const OverrideAreas& override_areas,
+    const bool walls_slot,
+    const std::optional<Point2LL>& seam_hint) const
+{
+    const coord_t scarf_length = mesh.settings.get<coord_t>("corrugated_scarf_length");
+    const double start_ratio = mesh.settings.get<Ratio>("corrugated_scarf_start_flow_ratio");
+    const coord_t step = mesh.settings.get<coord_t>("scarf_split_distance");
+    const GCodePathConfig& skin_config = mesh_config.infill_config[0];
+
+    const auto extrude_ramp = [&](const std::vector<Point2LL>& span, const bool closure)
+    {
+        for (const ScarfRampSegment& segment : scarfRampSegments(span, step, start_ratio, closure))
+        {
+            gcode_layer.addExtrusionMove(segment.to, skin_config, SpaceFillType::Lines, segment.flow_factor);
+        }
+    };
+    const auto extrude_full = [&](const std::vector<Point2LL>& path)
+    {
+        for (size_t i = 1; i < path.size(); ++i)
+        {
+            gcode_layer.addExtrusionMove(path[i], skin_config, SpaceFillType::Lines);
+        }
+    };
+
+    bool added = false;
+    if (walls_slot && plan.chain_wall.has_value())
+    {
+        // Case 1. Seam at the printed wall's start; the scarf lies on the skin's tail (the inner face), so
+        // the outer wall is never the first thing extruded after a restart:
+        //   ramp up over the skin's last x -> wall -> skin up to that span -> overprint it, ramping down.
+        const std::vector<Point2LL>& skin = plan.chain_skin;
+        const coord_t skin_length = polylineLength(skin);
+        // No restart, no scarf: when the nozzle already sits at the seam (too close to retract), the bead
+        // just continues. Only knowable within a layer; across layers see corrugated_scarf_length's note on
+        // retraction_combing_max_distance.
+        const bool continuous = gcode_layer.isLastPlannedPositionNear(skin.back(), mesh.settings.get<coord_t>("retraction_min_travel"));
+        const coord_t x = continuous ? 0 : std::min(scarf_length, skin_length / 2);
+        const std::vector<Point2LL> seam_span = polylineSpan(skin, skin_length - x, skin_length);
+        if (skin.size() >= 2)
+        {
+            gcode_layer.setIsInside(true);
+            if (seam_span.size() >= 2)
+            {
+                gcode_layer.addTravel(seam_span.front(), ForceRetract::AUTOMATIC);
+                extrude_ramp(seam_span, /*closure=*/false);
+            }
+            const ExtrusionLine& wall = *plan.chain_wall;
+            gcode_layer.addWall(
+                wall,
+                plan.chain_wall_reversed ? wall.size() - 1 : 0,
+                mesh.settings,
+                mesh_config.inset0_config,
+                mesh_config.inset0_roofing_config,
+                mesh_config.inset0_flooring_config,
+                mesh_config.bridge_inset0_config,
+                /*wall_0_wipe_dist=*/0,
+                /*flow_ratio=*/1.0,
+                ForceRetract::AUTOMATIC,
+                /*is_closed=*/false,
+                plan.chain_wall_reversed,
+                /*is_linked_path=*/true,
+                /*scarf_seam=*/false,
+                /*smooth_speed=*/true,
+                override_areas);
+            extrude_full(polylineSpan(skin, 0, skin_length - x));
+            if (seam_span.size() >= 2)
+            {
+                extrude_ramp(seam_span, /*closure=*/true);
+            }
+            added = true;
+        }
+    }
+    if (! walls_slot)
+    {
+        // Case 2, Linked Skin loops: ramp up over the first x, the rest at full flow, then run on over the
+        // first x again ramping down. (The part's closed walls get the same scarf in LayerPlan::addWall.)
+        for (const std::vector<Point2LL>& planned_loop : plan.skin_loops)
+        {
+            // A closed loop can start at any vertex, in either direction, and finishes x past its start.
+            // Choose the start and direction that minimise the longer of (travel from the nozzle to the
+            // start) and (distance from the finish to the wall seam). Without a scarf, wall, skin and the next layer's start all
+            // sit at the seam and a ring layer needs no retraction; the wall's overrun leaves the nozzle x
+            // past the seam, so the skin's finish has to bring it back within Cura's combing distance
+            // (A-40/Body ring layers otherwise gained one retraction each).
+            const Point2LL nozzle = gcode_layer.getLastPlannedPositionOrStartingPosition();
+            const Point2LL seam = seam_hint.value_or(nozzle);
+            const std::vector<Point2LL> ring(planned_loop.begin(), planned_loop.end() - 1); // drop the closing duplicate
+            const size_t n = ring.size();
+            const coord_t lead_length = std::min(scarf_length, polylineLength(planned_loop) / 2);
+            size_t best_start = 0;
+            bool best_reverse = false;
+            coord_t best_score = std::numeric_limits<coord_t>::max();
+            for (const bool reverse : { false, true })
+            {
+                for (size_t start = 0; start < n; ++start)
+                {
+                    // Walk lead_length along the loop from this start to find where the closure finishes.
+                    const auto at = [&](size_t k)
+                    {
+                        return ring[reverse ? (start + n - k % n) % n : (start + k) % n];
+                    };
+                    coord_t walked = 0;
+                    Point2LL finish = at(0);
+                    for (size_t k = 1; k <= n && walked < lead_length; ++k)
+                    {
+                        const Point2LL a = at(k - 1);
+                        const Point2LL b = at(k);
+                        const coord_t seg = vSize(b - a);
+                        if (walked + seg >= lead_length && seg > 0)
+                        {
+                            finish = a + (b - a) * (lead_length - walked) / seg;
+                        }
+                        else
+                        {
+                            finish = b;
+                        }
+                        walked += seg;
+                    }
+                    // Each hop retracts once it passes Cura's combing distance, so keep the longer one short.
+                    const coord_t score = std::max(vSize(at(0) - nozzle), vSize(finish - seam));
+                    if (score < best_score)
+                    {
+                        best_score = score;
+                        best_start = start;
+                        best_reverse = reverse;
+                    }
+                }
+            }
+            std::vector<Point2LL> best = ring;
+            if (best_reverse)
+            {
+                std::reverse(best.begin(), best.end());
+                best_start = n - 1 - best_start;
+            }
+            std::rotate(best.begin(), best.begin() + static_cast<std::ptrdiff_t>(best_start), best.end());
+            best.push_back(best.front());
+            const std::vector<Point2LL>& loop = best;
+            const coord_t loop_length = polylineLength(loop);
+            const coord_t x = std::min(scarf_length, loop_length / 2);
+            const std::vector<Point2LL> seam_span = polylineSpan(loop, 0, x);
+            if (seam_span.size() < 2)
+            {
+                continue;
+            }
+            gcode_layer.addTravel(seam_span.front(), ForceRetract::AUTOMATIC);
+            extrude_ramp(seam_span, /*closure=*/false);
+            extrude_full(polylineSpan(loop, x, loop_length));
+            extrude_ramp(seam_span, /*closure=*/true);
+            added = true;
+        }
+    }
+    return added;
 }
 
 void FffGcodeWriter::getCombinedSkinForSkinSupport(Shape& skin_combined, const SliceMeshStorage& mesh, const SliceLayerPart& part, int skin_layer_nr)

@@ -453,6 +453,73 @@ private:
         const SliceLayerPart& part) const;
 
     /*!
+     * One layer part's Corrugated infill geometry, computed but not yet added to the layer plan.
+     * processCorrugatedInfill is computeCorrugatedInfill followed by emitCorrugatedInfill; the
+     * Bead Loop Scarf (addCorrugatedBeadLoops) computes first so it can take the wall and skin
+     * that form a Bead Loop out before the rest is emitted.
+     */
+    struct CorrugatedInfillPaths
+    {
+        //! The whole part gets one concentric Transition Layer instead (no corrugation).
+        bool whole_layer_transition = false;
+        //! The area that concentric Transition Layer fills: infill_area with any stripped wall's side moved out to
+        //! the outline, so its outer loop lands on the stripped wall's line (VbctAdapter::stripWallFillArea).
+        Shape whole_layer_transition_area;
+        //! The corrugation (Linked Skin polylines, or unlinked stringers); empty if VBCT rejected the layer.
+        std::optional<OpenLinesSet> stringer_lines;
+        //! stringer_lines came from corrugateLinkedSkin (one polyline per domain).
+        bool linked_skin = false;
+        //! Per-domain Transition Layer solid fill.
+        OpenLinesSet transition_lines;
+    };
+
+    CorrugatedInfillPaths computeCorrugatedInfill(const LayerIndex layer_index, const SliceMeshStorage& mesh, const SliceLayerPart& part) const;
+
+    bool emitCorrugatedInfill(
+        const SliceDataStorage& storage,
+        LayerPlan& gcode_layer,
+        const SliceMeshStorage& mesh,
+        const size_t extruder_nr,
+        const MeshPathConfigs& mesh_config,
+        const SliceLayerPart& part,
+        const CorrugatedInfillPaths& paths) const;
+
+    /*!
+     * Bead Loop Scarf (Corrugated spec REV 3.9, Sections 3.8 / 5.12) for one layer part, called by
+     * addMeshPartToGCode before the part's walls are pre-processed. Takes the walls and skin lines
+     * that form Bead Loops out of \p part / \p paths and records how to print them in \p plan;
+     * anything else is left for the ordinary emission.
+     */
+    struct CorrugatedBeadPlan
+    {
+        //! Case 1: the kept Chain wall (removed from part.wall_toolpaths) and its loop.
+        std::optional<ExtrusionLine> chain_wall;
+        bool chain_wall_reversed = false;
+        std::vector<Point2LL> chain_skin;
+        //! Case 2: closed Linked Skin loops (removed from paths.stringer_lines).
+        std::vector<std::vector<Point2LL>> skin_loops;
+        //! The part's closed walls (a Ring's walls, or hole walls next to a Case 1 Chain loop) get the
+        //! flow scarf in LayerPlan::addWall.
+        bool closed_wall_flow_scarf = false;
+    };
+    CorrugatedBeadPlan planCorrugatedBeadLoops(const SliceMeshStorage& mesh, SliceLayerPart& part, CorrugatedInfillPaths& paths) const;
+
+    /*!
+     * Print the Bead Loops planned by planCorrugatedBeadLoops. \p walls_slot: the Chain wall+skin loop,
+     * printed where the part's walls would be; otherwise the Ring Linked Skin loops, printed where its
+     * infill would be. A Ring's closed walls get their scarf in LayerPlan::addWall (setFlowScarf).
+     * \p seam_hint: where the part's walls start (their seam), so a skin loop can finish back there.
+     */
+    bool addCorrugatedBeadLoops(
+        LayerPlan& gcode_layer,
+        const SliceMeshStorage& mesh,
+        const MeshPathConfigs& mesh_config,
+        const CorrugatedBeadPlan& plan,
+        const OverrideAreas& override_areas,
+        const bool walls_slot,
+        const std::optional<Point2LL>& seam_hint) const;
+
+    /*!
      * Generate the insets for the walls of a given layer part, without inserting them to the layer plan
      * \param[in] storage where the slice data is stored.
      * \param gcodeLayer The initial planning of the gcode of the layer.

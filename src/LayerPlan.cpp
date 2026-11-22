@@ -27,6 +27,7 @@
 #include "bridge/bridge.h"
 #include "communication/Communication.h"
 #include "geometry/ClosedLinesSet.h"
+#include "corrugated/BeadLoop.h"
 #include "geometry/OpenPolyline.h"
 #include "geometry/conversions/Point2D_Point2LL.h"
 #include "gradual_flow/Processor.h"
@@ -1443,6 +1444,7 @@ std::tuple<size_t, Point2LL> LayerPlan::addSplitWall(
     const Ratio end_speed_ratio,
     const coord_t decelerate_length,
     const bool is_scarf_closure,
+    const double flow_scarf_start_ratio,
     const bool compute_distance_to_bridge_start,
     const AddExtrusionSegmentFunction<PathType>& func_add_segment)
 {
@@ -1623,6 +1625,13 @@ std::tuple<size_t, Point2LL> LayerPlan::addSplitWall(
                         decelerate_speed_factor = std::lerp(1.0, end_speed_ratio, decelerate_factor_average);
                     }
 
+                    // FeatherPrint Corrugated Bead Loop Scarf: flow-only ramp over the scarf span (Z offset is 0 here).
+                    double segment_flow_ratio = flow_ratio;
+                    if (flow_scarf_start_ratio >= 0.0 && process_scarf)
+                    {
+                        segment_flow_ratio *= scarfFlowFactor((scarf_factor_origin + scarf_factor_destination) / 2.0, flow_scarf_start_ratio, is_scarf_closure);
+                    }
+
                     // now add the (sub-)segment
                     const bool travel_to_z = wall_processed_distance == 0; // Travel to Z for first sub-segment, but only this one
                     const size_t pt_idx = point_index(wall, actual_point_index - 1);
@@ -1631,7 +1640,7 @@ std::tuple<size_t, Point2LL> LayerPlan::addSplitWall(
                         split_origin,
                         split_destination,
                         accelerate_speed_factor * decelerate_speed_factor,
-                        flow_ratio,
+                        segment_flow_ratio,
                         line_width_ratio,
                         distance_to_bridge_start.value_or(0),
                         travel_to_z);
@@ -2098,8 +2107,18 @@ std::tuple<size_t, Point2LL> LayerPlan::addWallWithScarfSeam(
     const int direction = is_reversed ? -1 : 1;
     const size_t max_index = is_closed ? wall.size() + 1 : wall.size();
 
-    const coord_t scarf_seam_length = std::min(wall_length, actual_scarf_seam ? settings.get<coord_t>("scarf_joint_seam_length") : 0);
-    const auto scarf_seam_start_ratio = actual_scarf_seam ? settings.get<Ratio>("scarf_joint_seam_start_height_ratio") : 1.0_r;
+    // FeatherPrint Corrugated Bead Loop Scarf (Corrugated spec REV 3.9, Section 5.12): a flow-only scarf on
+    // a qualifying Ring part's closed walls, replacing Cura's own Z scarf there. Not on small features,
+    // whose first pass skips the scarf split and would leave the closing overprint unbalanced.
+    // No restart, no scarf: if the nozzle is already at the wall's start (too close to retract), the bead
+    // continues from whatever was printed before.
+    const bool flow_scarf = flow_scarf_.has_value() && flow_scarf_->length > 0 && is_closed && layer_nr_ > 0 && ! is_small_feature
+                         && ! isLastPlannedPositionNear(wall.pointAt(start_idx), settings.get<coord_t>("retraction_min_travel"));
+    const double flow_scarf_start_ratio = flow_scarf ? flow_scarf_->start_ratio : -1.0;
+
+    const coord_t scarf_seam_length = flow_scarf ? std::min(wall_length, flow_scarf_->length)
+                                                 : std::min(wall_length, actual_scarf_seam ? settings.get<coord_t>("scarf_joint_seam_length") : 0);
+    const auto scarf_seam_start_ratio = (actual_scarf_seam && ! flow_scarf) ? settings.get<Ratio>("scarf_joint_seam_start_height_ratio") : 1.0_r;
     const auto scarf_split_distance = settings.get<coord_t>("scarf_split_distance");
     const coord_t scarf_max_z_offset = static_cast<coord_t>(-(1.0 - scarf_seam_start_ratio) * static_cast<double>(layer_thickness_));
 
@@ -2145,6 +2164,7 @@ std::tuple<size_t, Point2LL> LayerPlan::addWallWithScarfSeam(
             end_speed_ratio,
             decelerate_length,
             is_scarf_closure,
+            flow_scarf_start_ratio,
             compute_distance_to_bridge_start,
             func_add_segment);
     };

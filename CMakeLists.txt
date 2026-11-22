@@ -239,6 +239,7 @@ set(engine_SRCS # Except main.cpp.
         src/vbct/vbs.cpp
         src/vbct/wall_ab_assignment.cpp
 
+        src/corrugated/BeadLoop.cpp
         src/corrugated/VbctAdapter.cpp
         src/corrugated/WallStrip.cpp
 )

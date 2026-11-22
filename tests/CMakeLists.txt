@@ -6,6 +6,7 @@ include(GoogleTest)
 
 set(TESTS_SRC_BASE
         AntiOozeAmountsTest
+        BeadLoopTest
         ClipperTest
         ExtruderPlanTest
         FeatherPrintGeneratorTest

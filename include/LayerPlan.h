@@ -262,6 +262,17 @@ public:
     Point2LL getLastPlannedPositionOrStartingPosition() const;
 
     /*!
+     * Whether the nozzle is known to be within \p distance of \p p: something has been planned on this
+     * layer and the last planned position is that close. At the start of a layer the real position (the
+     * previous layer's end) is unknown, since layers are planned in parallel, so this is false there.
+     * Used by the FeatherPrint Corrugated Bead Loop Scarf to skip the scarf when there is no restart.
+     */
+    bool isLastPlannedPositionNear(const Point2LL& p, const coord_t distance) const
+    {
+        return last_planned_position_.has_value() && vSize(last_planned_position_->toPoint2LL() - p) <= distance;
+    }
+
+    /*!
      * return whether the last position planned was inside the mesh (used in combing)
      */
     bool getIsInsideMesh() const;
@@ -639,6 +650,22 @@ public:
         const OverrideAreas& override_areas = {});
 
     /*!
+     * FeatherPrint Corrugated Bead Loop Scarf (Corrugated spec REV 3.9, Section 5.12), Ring case:
+     * while set, every closed wall added with addWall gets a flow-only scarf of this length instead
+     * of Cura's own Z scarf. Set by FffGcodeWriter around a qualifying part's wall emission only,
+     * and cleared right after.
+     */
+    struct FlowScarf
+    {
+        coord_t length;
+        double start_ratio;
+    };
+    void setFlowScarf(const std::optional<FlowScarf>& flow_scarf)
+    {
+        flow_scarf_ = flow_scarf;
+    }
+
+    /*!
      * Add a wall to the g-code starting at vertex \p start_idx
      * \param wall The vertices of the wall to add.
      * \param start_idx The index of the starting vertex to start at.
@@ -944,6 +971,9 @@ public:
     const bool empty() const;
 
 private:
+    //! See setFlowScarf.
+    std::optional<FlowScarf> flow_scarf_;
+
     struct PartialExtrusionSegment
     {
         Point3LL p1;
@@ -1128,6 +1158,8 @@ private:
      * \param end_speed_ratio The ratio of the top speed to be applied when finishing a segment
      * \param decelerate_length The pre-calculated length of the deceleration phase
      * \param is_scarf_closure Indicates whether this function is called to make the scarf closure (overlap over the first scarf pass) or the normal first pass of the wall
+     * \param flow_scarf_start_ratio FeatherPrint Corrugated Bead Loop Scarf: when >= 0, the scarf ramps flow
+     *                               (scarfFlowFactor, corrugated/BeadLoop.h) instead of Z; negative for Cura's own Z scarf
      * \param compute_distance_to_bridge_start Whether we should compute the distance to start of bridge. This is
      *                                         possible only if PathType is ExtrusionLine and will be ignored otherwise.
      * \param func_add_segment The function to be called to actually add an extrusion segment with the given parameters
@@ -1160,6 +1192,7 @@ private:
         const Ratio end_speed_ratio,
         const coord_t decelerate_length,
         const bool is_scarf_closure,
+        const double flow_scarf_start_ratio,
         const bool compute_distance_to_bridge_start,
         const AddExtrusionSegmentFunction<PathType>& func_add_segment);
 
