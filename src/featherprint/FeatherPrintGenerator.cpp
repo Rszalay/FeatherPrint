@@ -1075,6 +1075,25 @@ void sortInnermostFirst(std::vector<SelfEvent>& events)
     });
 }
 
+// Shortest open arc (in the same units as w_d) on which a Whip Terminal can be drawn at BOTH
+// ends -- the combined-fit guard shared by generateOpen() and the Cuff/Miter outer-Wall blocks
+// in generateFormerOpen()/generateFlangeOpen(). W, R1 and the Splay widths are in w-units.
+//
+// Each Terminal's hook occupies max(W + L, R1) of arc length from its own endpoint (Line2/Arc3
+// reach x = W + L; Arc1 reaches x = R1), and the two hooks need one line width of clearance
+// between them. The plain walk between them runs from (W + L_start) to s_end - (R1 + L_end), so
+// it also needs that much. The guard is the larger of the two.
+//
+// This replaces (W + R1) * 2 + 1 (2.6 mm at the 0.4 mm defaults), which doubled the per-end span
+// and dropped both Terminals on arcs that had room for them (A-40 Tail, 2026-11-20: 1.65-2.5 mm
+// arcs either side of the bottom slot printed with no Terminals for eight layers).
+double terminalPairMinSpan(double W, double R1, double L_start, double L_end, double w_d)
+{
+    const double hooks = std::max(W + L_start, R1) + std::max(W + L_end, R1) + 1.0;
+    const double walk = (W + L_start) + (R1 + L_end);
+    return std::max(hooks, walk) * w_d;
+}
+
 } // namespace
 
 FeatherPrintGenerator::PruneResult FeatherPrintGenerator::pruneSelfIntersectionsSignedArea(const std::vector<Point2LL>& pts_in, bool ccw_ref, coord_t w)
@@ -2315,8 +2334,8 @@ VariableWidthLines FeatherPrintGenerator::generateFormerOpen(
             // short band-meets-Whip arc, drawing both Terminals unconditionally let them walk
             // past each other and overlap. Suppress both together when they wouldn't fit,
             // falling back to a plain walk instead (same fallback the buried-middle-Wall case
-            // below already uses).
-            const double min_terminal_span = (stringer_W + stringer_R1) * w_d * 2.0 + w_d;
+            // below already uses). Span: terminalPairMinSpan().
+            const double min_terminal_span = terminalPairMinSpan(stringer_W, stringer_R1, 0.0, 0.0, w_d);
             if (s_end >= min_terminal_span)
             {
                 {
@@ -2674,7 +2693,8 @@ VariableWidthLines FeatherPrintGenerator::generateFlangeOpen(
             // short Miter arc, drawing both Terminals unconditionally let them walk past each
             // other and overlap. Suppress both together when they wouldn't fit, falling back
             // to a plain walk instead (same fallback the buried-middle-Wall case below uses).
-            const double min_terminal_span = (stringer_W + stringer_R1) * w_d * 2.0 + w_d;
+            // Span: terminalPairMinSpan().
+            const double min_terminal_span = terminalPairMinSpan(stringer_W, stringer_R1, 0.0, 0.0, w_d);
             if (s_end >= min_terminal_span)
             {
                 {
@@ -3590,7 +3610,7 @@ VariableWidthLines FeatherPrintGenerator::generateOpen(
     // min_terminal_span/draw_terminals guard (see that function's comment) rather than
     // deciding each end in isolation. Suppress BOTH terminals together when they wouldn't fit;
     // the existing plain-walk appendPolySegment calls below already cover the fallback.
-    const double min_both_terminal_span = (stringer_W + stringer_R1 + start_splay_L + end_splay_L) * w_d * 2.0 + w_d;
+    const double min_both_terminal_span = terminalPairMinSpan(stringer_W, stringer_R1, start_splay_L, end_splay_L, w_d);
     if (s_end < min_both_terminal_span)
     {
         draw_start_terminal = false;
